@@ -1,0 +1,4 @@
+/.env
+/rag个人知识库/parsed_files/
+/rag个人知识库/resources/
+/.venv/
