@@ -4,10 +4,6 @@ from zipfile import ZipFile
 
 from docx import Document as DocxDocument
 from lxml import etree
-from langchain_community.document_loaders import UnstructuredWordDocumentLoader
-from langchain_core.documents import Document
-
-from 尚硅谷.RAG.rag个人知识库.mineru_pdf import upload_files, download_files
 
 
 # ── 复杂度阈值：得分超过此值则认为文档复杂，需要走 MineRU 解析 ──
@@ -139,56 +135,3 @@ def word_complicatedness(file_path: str) -> int:
     print(f"  [WordChecker] 文档复杂度得分：{score}")
     return score
 
-
-def load_word(file_path: str) -> Optional[List[Document]]:
-    """
-    加载 Word 文档。
-
-    流程：
-      1. 调用 word_complicatedness 评估文档复杂度
-      2. 简单文档 → UnstructuredWordDocumentLoader 直接解析
-      3. 复杂文档 → 上传 MineRU 解析，读取返回的 markdown
-    """
-    print(f"正在分析 Word 文档复杂度：{file_path}")
-    score = word_complicatedness(file_path)
-
-    if score < COMPLEXITY_THRESHOLD:
-        # ── 简单文档：直接用 UnstructuredWordDocumentLoader ──
-        print("复杂度较低，使用 UnstructuredWordDocumentLoader 直接解析")
-        loader = UnstructuredWordDocumentLoader(
-            file_path=file_path,
-            mode="single",
-        )
-        documents = loader.load()
-        print(f"成功加载文档：{file_path}")
-        total_len = sum(len(d.page_content) for d in documents)
-        print(f"文档信息：共 {len(documents)} 段，总字符数：{total_len}")
-        return documents
-    else:
-        return None
-        # # ── 复杂文档：走 MineRU 解析 ──
-        # print("复杂度较高，使用 MineRU 进行解析")
-        # batch_id = upload_files([file_path])
-        # print(f"上传文件成功，batch_id: {batch_id}")
-        # if not batch_id:
-        #     return None
-        #
-        # parsed_files = download_files(batch_id)
-        # all_documents = []
-        #
-        # for parsed_dir in parsed_files:
-        #     md_path = parsed_dir + "/full.md"
-        #     if not os.path.exists(md_path):
-        #         print(f"未找到解析结果：{md_path}")
-        #         return None
-        #
-        #     print(f"读取解析结果：{md_path}")
-        #     # 延迟导入，避免与 load_file 循环引用
-        #     from 尚硅谷.RAG.rag个人知识库.load_file import load_markdown
-        #     documents = load_markdown(md_path)
-        #     print(f"成功加载文档：{md_path}")
-        #     all_documents.append(documents)
-        #
-        # if len(all_documents) == 0:
-        #     return None
-        # return all_documents[0]

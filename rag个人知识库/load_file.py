@@ -1,19 +1,82 @@
 import inspect
 import os
-from typing import Optional, List, Iterable
+from typing import Optional, List
 
 from langchain_community.document_loaders import (
-    PyPDFLoader,
-    UnstructuredExcelLoader,
     UnstructuredWordDocumentLoader,
     UnstructuredMarkdownLoader,
     TextLoader)
 from langchain_core.documents import Document
 
-from 尚硅谷.RAG.rag个人知识库.mineru_pdf import upload_files, download_files
-from 尚硅谷.RAG.rag个人知识库.parser.document_validation_exception import DocumentValidationErrorType, \
+from rag个人知识库.resources.mineru_demo import minerU_files
+from rag个人知识库.parser.document_validation_exception import DocumentValidationErrorType, \
     DocumentValidationError
-from 尚硅谷.RAG.rag个人知识库.parser.word_parser import load_word
+from rag个人知识库.parser.word_parser import word_complicatedness, COMPLEXITY_THRESHOLD
+
+# 文件大小阈值（单位：字节），超过此值使用 lazy_load 避免内存溢出
+# 默认 10MB
+LARGE_FILE_THRESHOLD = 5 * 1024 * 1024
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+
+def smart_load(loader, file_path: str) -> List[Document]:
+    """
+    根据文件大小智能选择加载方式：
+      - 文件 <= LARGE_FILE_THRESHOLD：使用 load()，一次性返回 List[Document]
+      - 文件 > LARGE_FILE_THRESHOLD：使用 lazy_load()，返回 Iterator[Document]，逐条处理不占内存
+    """
+    file_size = os.path.getsize(file_path)
+    if file_size > LARGE_FILE_THRESHOLD:
+        print(f"[smart_load] 文件较大({file_size / 1024 / 1024:.1f}MB)，使用 lazy_load 逐条加载: {file_path}")
+        documents = [document for document in loader.lazy_load()]
+        return documents
+    else:
+        print(f"[smart_load] 文件大小正常({file_size / 1024:.1f}KB)，使用 load 直接加载: {file_path}")
+        return loader.load()
+
+def load_word(file_path: str) -> Optional[List[Document]]:
+    """
+    加载 Word 文档。
+
+    流程：
+      1. 调用 word_complicatedness 评估文档复杂度
+      2. 简单文档 → UnstructuredWordDocumentLoader 直接解析（快、免费、离线）
+      3. 复杂文档 → 上传 MinerU 解析（图片/公式/图表本地解析易丢失），读产物 full.md
+    """
+    print(f"正在分析 Word 文档复杂度：{file_path}")
+    score = word_complicatedness(file_path)
+
+    if score < COMPLEXITY_THRESHOLD:
+        # ── 简单文档：docx 本身结构化，本地解析可靠且不消耗解析额度 ──
+        print("复杂度较低，使用 UnstructuredWordDocumentLoader 直接解析")
+        loader = UnstructuredWordDocumentLoader(
+            file_path=file_path,
+            mode="single",
+        )
+        documents = loader.load()
+        print(f"成功加载文档：{file_path}")
+        total_len = sum(len(d.page_content) for d in documents)
+        print(f"文档信息：共 {len(documents)} 段，总字符数：{total_len}")
+        return documents
+
+    # ── 复杂文档：走 MinerU 解析 ──
+    print("复杂度较高，使用 MinerU 进行解析")
+    # minerU_files 接收路径列表，返回以原始路径为 key 的结构化结果
+    results = minerU_files([file_path])
+    result = results.get(file_path)
+    if result is None or result["status"] != "success":
+        error = result["error"] if result else "未返回解析结果"
+        print(f"MinerU 解析失败：{file_path}，原因：{error}")
+        return None
+    md_path = result["md_path"]
+    if not os.path.exists(md_path):
+        print(f"未找到解析结果：{md_path}")
+        return None
+    print(f"读取解析结果：{md_path}")
+    # 产物是 Markdown，按元素切分加载为 Document
+    documents = Loader.load_md(md_path)
+    print(f"成功加载文档：{md_path}")
+    return documents
 
 
 class Loader:
@@ -22,12 +85,12 @@ class Loader:
     @staticmethod
     def load_doc(file_path):  # Word 文件加载器
         documents = load_word(file_path)
-        return None
+        return documents
 
     @staticmethod
     def load_docx(file_path):  # Word 文件加载器
         documents = load_word(file_path)
-        return None
+        return documents
 
     @staticmethod
     def load_md(file_path, mode : str = "elements", strategy : str= "fast")-> Optional[List[Document]]:
@@ -43,47 +106,28 @@ class Loader:
             #   "hi_res" 高分辨率模式
             strategy=strategy
         )
-        documents = loader.load()
-        return documents
+        return smart_load(loader, file_path)
 
     @staticmethod
     def load_pdf(file_path) -> Optional[List[Document]]:
         # PDF 文件加载器
-        """上传 PDF 到 MineRU 解析，解析完成后读取 full.md 返回 Document"""
-        batch_id = upload_files([file_path])
-        print(f"上传文件成功，batch_id: {batch_id}")
-        if not batch_id:
+        """上传 PDF 到 MinerU 解析，解析完成后读取 full.md 返回 Document 列表"""
+        # minerU_files 接收路径列表，单文件包成单元素列表传入
+        results = minerU_files([file_path])
+        # 返回值以原始路径为 key，直接取当前文件的结果
+        result = results.get(file_path)
+        if result is None or result["status"] != "success":
+            error = result["error"] if result else "未返回解析结果"
+            print(f"PDF 解析失败：{file_path}，原因：{error}")
             return None
-
-        parsed_files = download_files(batch_id)
-        all_documents = []
-
-        for file in parsed_files:
-            # 查找解析后释放的 full.md 文件
-            # file_name = os.path.splitext(os.path.basename(file_path))[0]
-            # parsed_dir = f"parsed_files/{file_name}_{i}"
-            md_path = file+"/full.md"
-
-            if not os.path.exists(md_path):
-                print(f"未找到解析结果：{md_path}")
-                return None
-
-            print(f"读取解析结果：{md_path}")
-
-            # loader = UnstructuredMarkdownLoader(md_path, mode="single", strategy="fast")
-            # documents = loader.load()
-            #
-            documents = Loader.load_md(md_path)
-
-            print(f"成功加载文档：{md_path}")
-            # total_len = sum(len(d.page_content) for d in documents)
-            # print(f"文档信息：共 {len(documents)} 段，总字符数：{total_len}")
-            ## TODO
-            all_documents.append(documents)
-        if len(all_documents) == 0:
+        # md_path 由 minerU_files 直接给出，无需自己拼产物目录结构
+        md_path = result["md_path"]
+        if not os.path.exists(md_path):
+            print(f"未找到解析结果：{md_path}")
             return None
-        else :
-            return all_documents[0]
+        print(f"读取解析结果：{md_path}")
+        # 解析产物是 Markdown，复用 load_md 加载为 Document
+        return Loader.load_md(md_path)
 
 
     @staticmethod
@@ -94,8 +138,7 @@ class Loader:
         except UnicodeDecodeError:
             loader = TextLoader(file_path, encoding="gbk")
 
-        documents = loader.load()
-        return documents
+        return smart_load(loader, file_path)
 
 
 
@@ -109,51 +152,26 @@ def load_documents(file_path_list) -> Optional[List[Document]]:
     for file_path in file_path_list:
         # 根据文件后缀获取加载方法
         load_func = "load_" + file_path.split(".")[-1].lower()
-        # 校验文件是否存在，如果不存在则返回 None
+        # 校验文件是否存在，如果不存在则返回
         if not os.path.exists(file_path):
             print(f"{DocumentValidationErrorType.NOT_FOUND_FILE}")
             load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.NOT_FOUND_FILE))
             continue
-        # 校验是否支持该文件类型，如果不存在则返回 None
+        # 校验是否支持该文件类型，如果不存在则返回
         if load_func not in load_map:
             print(f"{DocumentValidationErrorType.UNSUPPORTED_FORMAT}")
             print(f"支持格式:{valid_file_types}")
             load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.UNSUPPORTED_FORMAT))
             continue
+        # 校验文件大小，如果超过 MAX_FILE_SIZE 则返回
+        if os.path.getsize(file_path) > MAX_FILE_SIZE:
+            print(f"{DocumentValidationErrorType.FILE_TOO_LARGE}")
+            load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.FILE_TOO_LARGE))
+            continue
         try:
             # 调用加载方法
             print(f"调用加载方法：{load_func}")
             load_files.append(load_map[load_func](file_path))
-
-            # if file_path.endswith('.pdf'):
-            #     print("检测到 PDF 文件")
-            #     return Loader.load_pdf(file_path)
-            # elif file_path.endswith(('.docx', '.doc')):
-            #     print("检测到 Word 文件")
-            #     return load_word(file_path)
-            # # elif file_path.endswith('.xlsx'):
-            # #     print("检测到 Excel 文件")
-            # #     loader = UnstructuredExcelLoader(file_path)
-            # elif file_path.endswith('.md'):
-            #     print("检测到 Markdown 文件")
-            #     return Loader.load_md(file_path)
-            # elif file_path.endswith('.txt'):
-            #     print("检测到 TXT 文件")
-            #     try:
-            #         loader = TextLoader(file_path, encoding="utf-8")
-            #     except UnicodeDecodeError:
-            #         loader = TextLoader(file_path, encoding="gbk")
-            # else:
-            #     print(DocumentValidationErrorType.UNSUPPORTED_FORMAT)
-            #     print(f"支持格式:{document_type}")
-            #     return None
-
-            # documents = loader.load()
-            # print(f"成功加载文档：{file_path}")
-            # total_len = sum(len(d.page_content) for d in documents)
-            # print(f"文档信息：共 {len(documents)} 页/段，总字符数：{total_len}")
-            # return documents
-
         except Exception as e:
             print(f"加载文档失败：{str(e)}")
             load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.LOAD_FAILED))

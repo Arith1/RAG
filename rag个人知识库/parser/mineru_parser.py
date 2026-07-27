@@ -1,0 +1,188 @@
+"""
+MinerU PDF 批量解析：调用 minerU_files(file_paths) 传入本地文件路径列表，全流程：
+1. 申请上传链接（一个 batch 提交多个文件，拿到 batch_id 和 OSS 预签名上传 URL 列表）
+2. 逐个上传本地文件到 OSS
+3. 用 batch_id 轮询解析结果，直到所有文件状态变为 done/failed
+4. 下载各文件结果 zip 并解压（产物含 full.md、content_list.json、images/ 等）
+
+提交（submit_batch）与轮询下载（poll + download）已拆分，
+调用方可先提交 batch，利用服务端解析的等待期并行处理其他本地文档。
+"""
+import os
+import time
+import zipfile
+import io
+
+import requests
+from dotenv import load_dotenv
+
+
+def _build_header() -> dict:
+    """加载 .env 并构造带鉴权的请求头"""
+    load_dotenv()
+    # token 为空时请求头会变成 "Bearer None" 导致 401，这里提前拦截
+    token = os.getenv("MINERU_API_TOKEN")
+    if not token:
+        raise RuntimeError("MINERU_API_TOKEN 未配置，请在项目根目录的 .env 中填写有效 token")
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"  # token 不带 Bearer 前缀，由这里统一拼接
+    }
+
+
+def poll_batch_result(batch_id, header, interval=5, timeout=600):
+    """轮询批量解析结果，全部完成后返回 extract_result 列表"""
+    result_url = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
+    # flush=True 强制刷新缓冲区，保证非终端环境（如 uv run）下能实时看到进度
+    print('start polling batch:{} ...'.format(batch_id), flush=True)
+    start = time.time()
+    # 在 timeout 时限内每隔 interval 秒查一次，避免无限等待
+    while time.time() - start < timeout:
+        res = requests.get(result_url, headers=header)
+        if res.status_code != 200:
+            # 接口偶发非 200 不直接退出，休眠后继续重试
+            print('poll failed. status:{}'.format(res.status_code), flush=True)
+            time.sleep(interval)
+            continue
+        extract_results = res.json()["data"]["extract_result"]
+        # state 取值：waiting-file / pending / running / done / failed
+        states = [item["state"] for item in extract_results]
+        print('current states:{}'.format(states), flush=True)
+        # 所有文件都到达终态（done/failed）才结束轮询，部分失败不阻塞其他文件
+        if all(s in ("done", "failed") for s in states):
+            return extract_results
+        time.sleep(interval)
+    raise TimeoutError(f"batch {batch_id} 解析超时")
+
+
+def download_zip(zip_url, retries=3):
+    """下载结果 zip，失败时重试，最后一次尝试绕过系统代理"""
+    for attempt in range(1, retries + 1):
+        try:
+            if attempt < retries:
+                # 前几次正常请求（走系统代理），应对 CDN 偶发抖动
+                return requests.get(zip_url, timeout=60).content
+            # 最后一次重试：绕过系统代理直连（本地代理常导致 SSL EOF）
+            session = requests.Session()
+            session.trust_env = False  # 忽略 HTTP_PROXY/HTTPS_PROXY 等环境变量
+            return session.get(zip_url, timeout=60).content
+        except requests.exceptions.RequestException as e:
+            print('download attempt {} failed:{}'.format(attempt, e), flush=True)
+            time.sleep(2)
+    raise RuntimeError(f"zip 下载失败，已重试 {retries} 次: {zip_url}")
+
+
+def download_and_extract(extract_results, output_root, file_paths) -> dict:
+    """下载解析结果 zip 并解压到 output_root，返回以原始路径为 key 的结构化结果。
+
+    每个文件的结果为 {"status", "output_dir", "md_path", "error"}，
+    通过 data_id（提交时写入的下标）把服务端结果映射回 file_paths 中的原始路径，
+    避免不同目录下同名文件用 file_name 做 key 时互相覆盖。
+    """
+    results = {}
+    for item in extract_results:
+        # data_id 存的是提交时的下标，据此回溯原始输入路径
+        src_path = file_paths[int(item["data_id"])]
+        # 解析失败的记录原因后跳过（单文件失败不阻塞整批）
+        if item["state"] != "done":
+            err_msg = item.get("err_msg") or "解析失败"
+            print('{} 解析失败，原因:{}'.format(item["file_name"], err_msg), flush=True)
+            results[src_path] = {"status": "failed", "output_dir": None, "md_path": None, "error": err_msg}
+            continue
+        # full_zip_url 有时效性，拿到后尽快下载
+        zip_content = download_zip(item["full_zip_url"])
+        # 用 data_id 作目录后缀，同名文件产物也不会互相覆盖
+        # output_dir = os.path.join(output_root, "{}_{}".format(item["file_name"], item["data_id"]))
+        output_dir = os.path.join(output_root, "{}".format(item["file_name"]))
+        os.makedirs(output_dir, exist_ok=True)
+        # 内存流直接解压，不落盘临时 zip 文件
+        with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
+            zf.extractall(output_dir)
+        print('{} 解析结果已解压到:{}'.format(item["file_name"], output_dir), flush=True)
+        # md_path 直接给到 full.md，下游无需感知产物目录结构
+        results[src_path] = {
+            "status": "success",
+            "output_dir": output_dir,
+            "md_path": os.path.join(output_dir, "full.md"),
+            "error": None
+        }
+    return results
+
+
+def submit_batch(file_paths: list, header: dict) -> str:
+    """申请上传链接并上传所有文件，返回 batch_id（不等待解析，便于调用方并行处理其他任务）"""
+    url = "https://mineru.net/api/v4/file-urls/batch"
+    data = {
+        "files": [
+            # name 决定结果目录名；data_id 用下标便于业务侧回溯到原始路径
+            {"name": os.path.basename(p), "data_id": str(i)}
+            for i, p in enumerate(file_paths)
+        ],
+        "model_version": "vlm"  # 使用 VLM 模型解析（支持公式/表格/多语言）
+    }
+    # 第 1 步：申请上传链接，成功后返回 batch_id 和预签名上传 URL 列表
+    response = requests.post(url, headers=header, json=data)
+    if response.status_code != 200:
+        raise RuntimeError(f"申请上传链接失败 status:{response.status_code}")
+    result = response.json()
+    # code == 0 表示业务层成功（HTTP 200 不代表申请成功）
+    if result["code"] != 0:
+        raise RuntimeError('申请上传链接失败，原因:{}'.format(result["msg"]))
+    batch_id = result["data"]["batch_id"]
+    urls = result["data"]["file_urls"]
+    print('batch_id:{}'.format(batch_id), flush=True)
+    # 第 2 步：把本地文件 PUT 到预签名 URL（直传 OSS，无需再带 token）
+    # file_urls 与 data["files"] 顺序一一对应，按下标对齐上传
+    for i, upload_url in enumerate(urls):
+        with open(file_paths[i], 'rb') as f:
+            res_upload = requests.put(upload_url, data=f)
+        file_name = os.path.basename(file_paths[i])
+        if res_upload.status_code == 200:
+            print(f"{file_name} upload success", flush=True)
+        else:
+            print(f"{file_name} upload failed. status:{res_upload.status_code}", flush=True)
+    return batch_id
+
+
+def minerU_files(file_paths: list, output_root: str | None = None) -> dict:
+    """批量上传 PDF 到 MinerU 解析，解析完成后下载并解压产物。
+
+    :param file_paths: 本地 PDF 路径列表（单个 batch 上限 200 个文件）
+    :param output_root: 产物根目录，默认为第一个文件所在目录下的 mineru_results
+    :return: {原始文件路径: {"status": "success"/"failed"/"skipped",
+                              "output_dir": 解压目录,
+                              "md_path": full.md 路径,
+                              "error": 失败原因}}
+    """
+    results = {}
+    # 先过滤不存在的文件，避免上传阶段中途报错浪费整批额度
+    valid_paths = []
+    for p in file_paths:
+        if os.path.isfile(p):
+            valid_paths.append(p)
+        else:
+            print(f"文件不存在，跳过:{p}", flush=True)
+            results[p] = {"status": "skipped", "output_dir": None, "md_path": None, "error": "文件不存在"}
+    if not valid_paths:
+        print("没有可上传的有效文件", flush=True)
+        return results
+    # 默认产物目录跟随第一个文件所在目录
+    if output_root is None:
+        output_root = os.path.join(os.path.dirname(os.path.abspath(valid_paths[0])), "mineru_results")
+
+    header = _build_header()
+    # 提交 batch（申请链接 + 上传）→ 轮询直到全部终态 → 下载解压产物
+    batch_id = submit_batch(valid_paths, header)
+    extract_results = poll_batch_result(batch_id, header)
+    results.update(download_and_extract(extract_results, output_root, valid_paths))
+    return results
+
+
+if __name__ == "__main__":
+    # 示例：批量解析 resources 目录下的 PDF
+    demo_files = [
+        # os.path.join(os.path.dirname(__file__), "04.sample-multilingual-text.pdf"),
+        # os.path.join(os.path.dirname(__file__), "丝网重量计算公式.pdf"),
+        # "F:\\PracticeProject\\RAG\\rag_project\\rag个人知识库\\resources\\05.sample2.docx"
+    ]
+    print(minerU_files(demo_files))
