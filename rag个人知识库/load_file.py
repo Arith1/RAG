@@ -4,7 +4,6 @@ from typing import Optional, List
 
 from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
-    UnstructuredMarkdownLoader,
     TextLoader)
 from langchain_core.documents import Document
 
@@ -73,8 +72,13 @@ def load_word(file_path: str) -> Optional[List[Document]]:
         print(f"未找到解析结果：{md_path}")
         return None
     print(f"读取解析结果：{md_path}")
-    # 产物是 Markdown，按元素切分加载为 Document
+    # 产物是 Markdown，按原文读入，切分交给切分层
     documents = Loader.load_md(md_path)
+    if documents:
+        for doc in documents:
+            # source 指回原始 Word 文件便于溯源，解析产物路径另存 md_path
+            doc.metadata["source"] = file_path
+            doc.metadata["md_path"] = md_path
     print(f"成功加载文档：{md_path}")
     return documents
 
@@ -93,20 +97,21 @@ class Loader:
         return documents
 
     @staticmethod
-    def load_md(file_path, mode : str = "elements", strategy : str= "fast")-> Optional[List[Document]]:
+    def load_md(file_path)-> Optional[List[Document]]:
         # Markdown 文件加载器
-        loader = UnstructuredMarkdownLoader(
-            file_path=file_path,
-            # 加载模式:
-            #   single 返回单个Document对象
-            #   elements 按标题等元素切分文档
-            mode=mode,
-            # 解析策略：
-            #   "fast"（快速模式），它会以最快的速度提取文本，不进行复杂的版面分析
-            #   "hi_res" 高分辨率模式
-            strategy=strategy
-        )
-        return smart_load(loader, file_path)
+        # 不用 UnstructuredMarkdownLoader：它会剥掉 # 等 Markdown 语法（single 模式也一样），
+        # 导致切分层的 MarkdownHeaderTextSplitter 识别不到标题层级。
+        # 直接按原文读入，保留完整 Markdown 结构，切分职责完全交给切分层
+        try:
+            loader = TextLoader(file_path, encoding="utf-8")
+            documents = smart_load(loader, file_path)
+        except UnicodeDecodeError:
+            loader = TextLoader(file_path, encoding="gbk")
+            documents = smart_load(loader, file_path)
+        # 打上 doc_type 标记，切分入口 split_documents 据此分发结构感知切分策略
+        for doc in documents:
+            doc.metadata["doc_type"] = "markdown"
+        return documents
 
     @staticmethod
     def load_pdf(file_path) -> Optional[List[Document]]:
@@ -126,8 +131,14 @@ class Loader:
             print(f"未找到解析结果：{md_path}")
             return None
         print(f"读取解析结果：{md_path}")
-        # 解析产物是 Markdown，复用 load_md 加载为 Document
-        return Loader.load_md(md_path)
+        # 解析产物是 Markdown，复用 load_md 按原文加载为 Document
+        documents = Loader.load_md(md_path)
+        if documents:
+            for doc in documents:
+                # source 指回原始 PDF 便于溯源，解析产物路径另存 md_path
+                doc.metadata["source"] = file_path
+                doc.metadata["md_path"] = md_path
+        return documents
 
 
     @staticmethod
