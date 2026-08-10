@@ -1,10 +1,9 @@
 """
-向量化存储与查询旧接口
+向量化存储与查询接口（MySQL 指纹 与 Milvus 主键共用同一口径）
 """
-import hashlib
 import os
 from functools import lru_cache
-from typing import List
+from typing import List, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -12,6 +11,8 @@ from langchain_core.documents import Document
 from langchain_milvus import BM25BuiltInFunction, Milvus
 from langchain_openai import OpenAIEmbeddings
 from pymilvus import Function, FunctionType
+
+from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint
 
 load_dotenv()
 
@@ -97,14 +98,26 @@ def _normalize_metadata(metadata: dict) -> dict:
 
 
 def _chunk_id(chunk: Document) -> str:
-    """由 source + 正文内容生成确定性主键：同一 chunk 反复入库 ID 不变"""
-    raw = f"{chunk.metadata.get('source', '')}|{chunk.page_content}"
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    """由 source + 正文内容生成确定性主键：与 MySQL chunk_fingerprint 同口径（SHA256）"""
+    return compute_chunk_fingerprint(chunk.page_content, chunk.metadata.get("source", ""))
 
 
-def save_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
-    """
-    把 chunk 列表向量化并写入 Milvus，返回写入的主键列表。
+def _dedup_chunks(chunks: List[Document]) -> Tuple[List[Document], List[str]]:
+    """批内去重 + metadata 键名规范化，返回 (去重后的 chunk, 对应的确定性主键)"""
+    unique_chunks, ids, seen = [], [], set()
+    for chunk in chunks:
+        chunk.metadata = _normalize_metadata(chunk.metadata)
+        cid = _chunk_id(chunk)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        unique_chunks.append(chunk)
+        ids.append(cid)
+    return unique_chunks, ids
+
+
+def add_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
+    """把 chunk 向量化写入 Milvus，返回写入的主键列表。
 
     幂等策略：先按确定性 ID 删除旧数据再插入（Milvus 的 insert 不校验主键唯一，
     直接重复插入会产生冗余向量，必须先删后插）。
@@ -116,18 +129,7 @@ def save_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
         print("[VectorStore] 没有需要入库的 chunk，跳过")
         return []
 
-    # 批内去重：完全相同的 chunk（如重复段落）只保留一份，避免同批主键冲突
-    unique_chunks, ids, seen = [], [], set()
-    for chunk in chunks:
-        # 规范化 metadata 键名（"Header 1" → "Header_1"），避免 Milvus 1100 报错
-        chunk.metadata = _normalize_metadata(chunk.metadata)
-        cid = _chunk_id(chunk)
-        if cid in seen:
-            continue
-        seen.add(cid)
-        unique_chunks.append(chunk)
-        ids.append(cid)
-
+    unique_chunks, ids = _dedup_chunks(chunks)
     vector_store = get_vector_store()
     # 集合已存在时先删除同 ID 旧数据（首次运行集合尚未创建，col 为 None，直接插入）
     if vector_store.col is not None:
@@ -140,6 +142,25 @@ def save_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
         inserted.extend(vector_store.add_documents(batch, ids=batch_ids))
     print(f"[VectorStore] 成功写入 {len(inserted)} 个 chunk（原始 {len(chunks)} 个，批内去重 {len(chunks) - len(unique_chunks)} 个）")
     return inserted
+
+
+def save_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
+    """兼容旧入口：等价于 add_chunks"""
+    return add_chunks(chunks, batch_size=batch_size)
+
+
+def delete_chunks_by_ids(ids: List[str], batch_size: int = 64) -> None:
+    """按确定性主键删除 Milvus 中的旧 chunk（更新流程中已消失的 chunk）"""
+    if not ids:
+        print("[VectorStore] 没有需要删除的 chunk ID，跳过")
+        return
+    vector_store = get_vector_store()
+    if vector_store.col is None:
+        print("[VectorStore] 集合尚未创建，无需删除")
+        return
+    for start in range(0, len(ids), batch_size):
+        vector_store.delete(ids=ids[start:start + batch_size])
+    print(f"[VectorStore] 已删除 {len(ids)} 个旧 chunk")
 
 
 # RRF 融合器：按各路排名倒数 1/(k+rank) 加总打分，与两路分数量纲无关，无需调权重；

@@ -1,5 +1,7 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
+from rag个人知识库.models.vector import Base
+
 # 数据库url
 ASYNC_DATABASE_URL = "mysql+aiomysql://root:root@localhost:3306/rag_demo?charset=utf8"
 # 1.创建异步引擎
@@ -31,3 +33,9 @@ async def get_db():
         finally:
             await session.close()
         # 因为有with所以不try except也可以
+
+
+async def init_db():
+    """建表（幂等）：首次运行或表结构变更后执行，已存在的表不会重复创建"""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)

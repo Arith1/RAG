@@ -152,42 +152,51 @@ class Loader:
         return smart_load(loader, file_path)
 
 
-
-
-def load_documents(file_path_list) -> Optional[List[Document]]:
+def validate_file(file_path: str) -> Optional[DocumentValidationError]:
+    """基础校验：存在性 / 格式支持 / 大小限制。返回 None 表示校验通过。"""
     # 获取所有方法名, 生成 {方法名: 绑定方法} 的映射,静态方法要用isfunction
     load_map = dict(inspect.getmembers(Loader, predicate=inspect.isfunction))
-    # 获取所有方法名，生成支持的文件类型列表
     valid_file_types = [s.split("_")[-1] for s in list(load_map.keys())]
+    # 根据文件后缀获取加载方法
+    load_func = "load_" + file_path.split(".")[-1].lower()
+    # 校验文件是否存在，如果不存在则返回
+    if not os.path.exists(file_path):
+        print(f"{DocumentValidationErrorType.NOT_FOUND_FILE}")
+        return DocumentValidationError(file_path, DocumentValidationErrorType.NOT_FOUND_FILE)
+    # 校验是否支持该文件类型，如果不存在则返回
+    if load_func not in load_map:
+        print(f"{DocumentValidationErrorType.UNSUPPORTED_FORMAT}")
+        print(f"支持格式:{valid_file_types}")
+        return DocumentValidationError(file_path, DocumentValidationErrorType.UNSUPPORTED_FORMAT)
+    # 校验文件大小，如果超过 MAX_FILE_SIZE 则返回
+    if os.path.getsize(file_path) > MAX_FILE_SIZE:
+        print(f"{DocumentValidationErrorType.FILE_TOO_LARGE}")
+        return DocumentValidationError(file_path, DocumentValidationErrorType.FILE_TOO_LARGE)
+    return None
+
+
+def load_single(file_path: str) -> Optional[List[Document]]:
+    """按文件后缀分发到对应加载器（不做基础校验，由调用方先 validate_file）"""
+    load_map = dict(inspect.getmembers(Loader, predicate=inspect.isfunction))
+    load_func = "load_" + file_path.split(".")[-1].lower()
+    print(f"调用加载方法：{load_func}")
+    return load_map[load_func](file_path)
+
+
+def load_documents(file_path_list) -> List[Optional[List[Document]]]:
+    """批量加载（保留旧入口）：先基础校验，再按后缀分发加载"""
     load_files=[]
     for file_path in file_path_list:
-        # 根据文件后缀获取加载方法
-        load_func = "load_" + file_path.split(".")[-1].lower()
-        # 校验文件是否存在，如果不存在则返回
-        if not os.path.exists(file_path):
-            print(f"{DocumentValidationErrorType.NOT_FOUND_FILE}")
-            load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.NOT_FOUND_FILE))
-            continue
-        # 校验是否支持该文件类型，如果不存在则返回
-        if load_func not in load_map:
-            print(f"{DocumentValidationErrorType.UNSUPPORTED_FORMAT}")
-            print(f"支持格式:{valid_file_types}")
-            load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.UNSUPPORTED_FORMAT))
-            continue
-        # 校验文件大小，如果超过 MAX_FILE_SIZE 则返回
-        if os.path.getsize(file_path) > MAX_FILE_SIZE:
-            print(f"{DocumentValidationErrorType.FILE_TOO_LARGE}")
-            load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.FILE_TOO_LARGE))
+        error = validate_file(file_path)
+        if error is not None:
+            load_files.append(error)
             continue
         try:
             # 调用加载方法
-            print(f"调用加载方法：{load_func}")
-            load_files.append(load_map[load_func](file_path))
+            load_files.append(load_single(file_path))
         except Exception as e:
             print(f"加载文档失败：{str(e)}")
             load_files.append(DocumentValidationError(file_path,DocumentValidationErrorType.LOAD_FAILED))
             continue
 
     return load_files
-
-
