@@ -1,13 +1,14 @@
 # splitter/formula_splitter.py
 
 import re
+from langchain_core.documents import Document
 
 
 class FormulaSplitter():
 
     def split(self, document):
 
-        text = document.content
+        text = document.page_content
 
         # 按编号切块
         pattern = r'(?=\n?\d+\.\s*)'
@@ -34,12 +35,12 @@ class FormulaSplitter():
             content = "\n".join(lines[1:]).strip()
 
             chunks.append(
-                Chunk(
-                    title=title,
-                    content=content,
+                Document(
+                    page_content=content,
                     metadata={
                         "type": "formula",
-                        "source": document.filename
+                        "source": document.metadata.get("source"),
+                        "title": title
                     }
                 )
             )
