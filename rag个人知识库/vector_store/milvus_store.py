@@ -82,7 +82,7 @@ def get_vector_store() -> Milvus:
         # dense 用 HNSW+余弦，sparse 用稀疏倒排+BM25 打分
         index_params=[
             {"index_type": "HNSW", "metric_type": "COSINE"},
-            {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "IP"},
+            {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25"},
         ],
     )
 

@@ -1,18 +1,14 @@
 """
 文件指纹入库编排：MySQL 元数据表 + Milvus 向量库配合，按指纹做增量同步。
 
-单文件处理流程：
-  1. 基础校验（存在性 / 格式 / 大小）
-  2. 预检（文件加载前）：计算文件内容 hash，按 file_name+source 查 vector_files
-     - 命中且 hash 相同 → 直接跳过，不触发加载/解析（省 MinerU 解析额度）
-     - 命中且 hash 不同 → 加载后走更新流程
-     - 未命中 → 加载后走全新入库流程
-  3. 更新流程（内容已变）：
-     - 先更新文件表版本号（+0.1）与内容 hash
-     - 新旧 chunk 指纹做差集/交集
-       - 交集（内容未变）：chunk 只刷版本号，向量库不动
-       - 新增：写入 MySQL + Milvus
-       - 消失：删除 MySQL + Milvus
+跨库一致性设计（MySQL 先落库，Milvus 后同步，状态机记录）：
+  1. 基础校验 → 加载前预检（命中、内容未变且已同步 → 跳过）
+  2. 阶段一（MySQL）：把"期望状态"落库并提交（sync_status=pending）。
+     该阶段失败则回滚，Milvus 完全未被改动，不会产生孤儿向量。
+  3. 阶段二（Milvus）：按期望状态幂等同步（确定性 ID 先删后插），
+     成功置 in_sync；失败置 failed + last_error，期望状态仍在 MySQL。
+  4. 重试：文件 status 为 pending/failed 且内容未变时，precheck 返回 retry，
+     重新同步 Milvus（幂等重放），成功后置 in_sync。
 """
 import os
 from decimal import Decimal
@@ -22,11 +18,14 @@ from langchain_core.documents import Document
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.crud.vector import (
+    SYNC_FAILED,
+    SYNC_IN_SYNC,
     delete_chunks_by_fingerprints,
     get_chunks_by_file_id,
     get_file_by_identity,
     insert_chunks,
     insert_file,
+    set_sync_status,
     update_chunk_count,
     update_chunk_version,
     update_file_version,
@@ -53,8 +52,9 @@ async def precheck(
     """加载前预检：只读文件字节算 hash + 查库，不做任何解析。
 
     返回 (action, content_hash, record)：
-      - action: "skip"（命中且内容未变）/ "update"（命中且内容已变）/ "insert"（未命中）
-      - content_hash: 本次文件内容哈希，供入库/更新复用，避免重复计算
+      - action: "skip"（内容未变且已同步）/ "retry"（内容未变但上次同步失败，重放 Milvus）
+                / "update"（内容已变）/ "insert"（未命中）
+      - content_hash: 本次文件内容哈希，供入库/更新复用
       - record: 命中的 VectorFile 或 None
     """
     file_name = os.path.basename(file_path)
@@ -62,9 +62,11 @@ async def precheck(
     record = await get_file_by_identity(db, file_name, file_path)
     if record is None:
         return "insert", content_hash, None
-    if record.file_content_hash == content_hash:
+    if record.file_content_hash != content_hash:
+        return "update", content_hash, record
+    if record.sync_status == SYNC_IN_SYNC:
         return "skip", content_hash, record
-    return "update", content_hash, record
+    return "retry", content_hash, record
 
 
 def _unique_fingerprints(chunks: List[Document], source: str) -> List[str]:
@@ -79,46 +81,52 @@ def _unique_fingerprints(chunks: List[Document], source: str) -> List[str]:
     return fingerprints
 
 
-async def _ingest_new(
+async def _stage_insert(
     db: AsyncSession,
     file_path: str,
     content_hash: str,
     chunks: List[Document],
-) -> Tuple[Decimal, Dict[str, int]]:
-    """全新入库：文件 v1.0 + 全部 chunk 写入 MySQL 与 Milvus"""
+) -> Tuple[int, Decimal, Dict[str, int]]:
+    """阶段一（仅 MySQL）：全新入库，落库期望状态（status=pending）。
+
+    返回 (file_id, version, summary)。Milvus 写入由调用方在阶段二执行。
+    """
     file_name = os.path.basename(file_path)
     source = file_path
 
     file = await insert_file(db, file_name, source, content_hash, version=INITIAL_VERSION)
     fingerprints = _unique_fingerprints(chunks, source)
-    # 先写 Milvus（幂等），成功后再落 MySQL，失败由调用方回滚
-    add_chunks(chunks)
     await insert_chunks(db, file.id, fingerprints, INITIAL_VERSION)
     await update_chunk_count(db, file.id)
 
+    summary = {"added": len(fingerprints), "unchanged": 0, "removed": 0}
     print(f"[Ingest] 全新入库 v{INITIAL_VERSION}：{file_path}，chunk 数 {len(fingerprints)}")
-    return INITIAL_VERSION, {"added": len(fingerprints), "unchanged": 0, "removed": 0}
+    return file.id, INITIAL_VERSION, summary
 
 
-async def _update_existing(
+async def _stage_update(
     db: AsyncSession,
     record: VectorFile,
     content_hash: str,
     chunks: List[Document],
-) -> Tuple[Decimal, Dict[str, int]]:
-    """内容已变：先升文件版本号，再做 chunk 指纹差集同步"""
+) -> Tuple[int, Decimal, List[Document], List[str], Dict[str, int]]:
+    """阶段一（仅 MySQL）：内容已变，先升文件版本，再按指纹差集更新 chunk 记录。
+
+    返回 (file_id, new_version, added_chunks, removed_ids, summary)。
+    Milvus 写入/删除由调用方在阶段二执行。
+    """
     source = record.source
     file_id = record.id
     new_version = _next_version(record.version)
 
-    # 1. 先更新文件表版本号 + 内容哈希
+    # 1. 先更新文件表版本号 + 内容哈希（置 pending，表示期望状态已变更）
     await update_file_version(db, file_id, new_version, content_hash)
 
     # 2. 取旧 chunk 指纹集合（MySQL 是 chunk 清单的权威来源）
     old_records = await get_chunks_by_file_id(db, file_id)
     old_fps = {r.chunk_fingerprint for r in old_records}
 
-    # 3. 新 chunk 指纹（去重），并建立 指纹 -> chunk 映射供向量化入库
+    # 3. 新 chunk 指纹（去重），并建立 指纹 -> chunk 映射供阶段二向量化入库
     fp_to_chunk: Dict[str, Document] = {}
     for chunk in chunks:
         fp = compute_chunk_fingerprint(chunk.page_content, source)
@@ -131,13 +139,7 @@ async def _update_existing(
     added = [fp for fp in new_fps if fp not in old_fps]
     removed = [fp for fp in old_fps if fp not in new_fp_set]
 
-    # 5. 先做向量库操作（新增写入、删除消失项），成功后再落 MySQL chunk 变更
-    if added:
-        add_chunks([fp_to_chunk[fp] for fp in added])
-    if removed:
-        delete_chunks_by_ids(removed)
-
-    # 6. MySQL chunk 变更：交集只刷版本号，新增插入，消失删除
+    # 5. MySQL chunk 变更：交集只刷版本号，新增插入，消失删除（Milvus 放到阶段二）
     if unchanged:
         await update_chunk_version(db, file_id, unchanged, new_version)
     if added:
@@ -145,7 +147,7 @@ async def _update_existing(
     if removed:
         await delete_chunks_by_fingerprints(db, removed)
 
-    # 7. 刷新 chunk_count
+    # 6. 刷新 chunk_count
     await update_chunk_count(db, file_id)
 
     summary = {"added": len(added), "unchanged": len(unchanged), "removed": len(removed)}
@@ -153,27 +155,51 @@ async def _update_existing(
         f"[Ingest] 更新完成 v{record.version} -> v{new_version}："
         f"新增 {len(added)}，未变 {len(unchanged)}，删除 {len(removed)}"
     )
-    return new_version, summary
+    return file_id, new_version, [fp_to_chunk[fp] for fp in added], removed, summary
+
+
+async def _sync_milvus(
+    db: AsyncSession,
+    file_id: int,
+    added_chunks: List[Document],
+    removed_ids: List[str],
+) -> None:
+    """阶段二：同步 Milvus（幂等可重放）。成功置 in_sync，失败置 failed + last_error。"""
+    try:
+        if added_chunks:
+            add_chunks(added_chunks)
+        if removed_ids:
+            delete_chunks_by_ids(removed_ids)
+        await set_sync_status(db, file_id, SYNC_IN_SYNC)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        try:
+            await set_sync_status(db, file_id, SYNC_FAILED, str(e))
+            await db.commit()
+        except Exception as e2:
+            print(f"[Ingest] 标记同步失败状态出错：{e2}")
+        raise RuntimeError(f"Milvus 同步失败（已标记 failed，可重跑恢复）：{e}") from e
 
 
 async def process_file(db: AsyncSession, file_path: str) -> dict:
-    """单文件完整流程：校验 → 预检 → 按需加载/切分 → 入库/更新/跳过。"""
+    """单文件完整流程：校验 → 预检 → 按需加载/切分 → MySQL 落期望状态 → 同步 Milvus。"""
     # 1. 基础校验
     error = validate_file(file_path)
     if error is not None:
         return {"file_path": file_path, "status": "error", "message": error.error_msg}
 
-    # 2. 预检（加载前）：命中且内容未变 → 直接跳过该文档，继续下一个
+    # 2. 预检（加载前）：内容未变且已同步 → 直接跳过
     action, content_hash, record = await precheck(db, file_path)
     if action == "skip":
-        print(f"[Ingest] {file_path} 内容未变化，跳过加载与入库")
+        print(f"[Ingest] {file_path} 内容未变化且已同步，跳过加载与入库")
         return {
             "file_path": file_path,
             "status": "skipped",
             "version": record.version,
         }
 
-    # 3. 只有预检未命中或内容已变才加载（避免对未变化文档做无谓解析）
+    # 3. 只有非 skip 才加载（避免对未变化文档做无谓解析）
     try:
         docs = load_single(file_path)
     except Exception as e:
@@ -191,21 +217,44 @@ async def process_file(db: AsyncSession, file_path: str) -> dict:
     if not chunks:
         return {"file_path": file_path, "status": "error", "message": "切分结果为空"}
 
-    # 5. 入库 / 更新（Milvus 失败时回滚 MySQL，避免半更新状态）
+    # 5. 阶段一：MySQL 落库期望状态（status=pending）。提交前 Milvus 完全未改动
+    if action == "retry":
+        # 期望状态已在 MySQL（上次同步失败），只做 Milvus 重放，不动版本号
+        file_id, version = record.id, record.version
+        added_chunks: List[Document] = chunks
+        removed_ids: List[str] = []
+        summary = {"added": len(chunks), "unchanged": 0, "removed": 0}
+    else:
+        try:
+            if action == "insert":
+                file_id, version, summary = await _stage_insert(
+                    db, file_path, content_hash, chunks
+                )
+                added_chunks = chunks
+                removed_ids = []
+            else:
+                file_id, version, added_chunks, removed_ids, summary = await _stage_update(
+                    db, record, content_hash, chunks
+                )
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            print(f"[Ingest] {file_path} 元数据落库失败，已回滚（Milvus 未改动）：{e}")
+            return {"file_path": file_path, "status": "error", "message": f"元数据落库失败：{e}"}
+
+    # 6. 阶段二：同步 Milvus
     try:
-        if action == "insert":
-            version, summary = await _ingest_new(db, file_path, content_hash, chunks)
-        else:
-            version, summary = await _update_existing(db, record, content_hash, chunks)
-        await db.commit()
+        await _sync_milvus(db, file_id, added_chunks, removed_ids)
         print(f"[Ingest] {file_path} 处理完成：{summary}")
         return {
             "file_path": file_path,
-            "status": "inserted" if action == "insert" else "updated",
+            "status": {
+                "insert": "inserted",
+                "update": "updated",
+                "retry": "retried",
+            }[action],
             "version": version,
             **summary,
         }
-    except Exception as e:
-        await db.rollback()
-        print(f"[Ingest] {file_path} 入库/更新失败，已回滚 MySQL：{e}")
-        return {"file_path": file_path, "status": "error", "message": str(e)}
+    except RuntimeError as e:
+        return {"file_path": file_path, "status": "error", "message": str(e), "retryable": True}

@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import DateTime, Integer, String, Index, Text, ForeignKey, BigInteger, \
     Numeric, func
@@ -67,6 +67,18 @@ class VectorFile(Base):
         default=0,
         server_default="0",
         comment='该文件的 chunk 总数'
+    )
+    sync_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+        comment="Milvus 同步状态: pending(待同步)/in_sync(一致)/failed(失败可重试)"
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="最近一次 Milvus 同步失败原因"
     )
 
     # 关系定义

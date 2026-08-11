@@ -39,6 +39,7 @@ async def main():
             label = {
                 "inserted": "全新入库",
                 "updated": "内容变更，已更新",
+                "retried": "上次同步失败，已重放",
                 "skipped": "内容未变，已跳过",
             }[result["status"]]
             line = f"  {result['file_path']} -> {label}，版本 v{result['version']}"

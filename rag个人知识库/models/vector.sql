@@ -10,6 +10,8 @@ CREATE TABLE `vector_files` (
     `file_content_hash` CHAR(64) NOT NULL COMMENT '整个文件内容的 SHA256,用来判断文件内容是否修改',
     `version` DECIMAL(5,1) NOT NULL DEFAULT 1.0 COMMENT '当前版本号（如 1.0, 2.0）',
     `chunk_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该文件的 chunk 总数',
+    `sync_status` VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT 'Milvus 同步状态: pending(待同步)/in_sync(一致)/failed(失败可重试)',
+    `last_error` TEXT COMMENT '最近一次 Milvus 同步失败原因',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 

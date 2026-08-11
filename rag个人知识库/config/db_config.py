@@ -36,6 +36,31 @@ async def get_db():
 
 
 async def init_db():
-    """建表（幂等）：首次运行或表结构变更后执行，已存在的表不会重复创建"""
+    """建表（幂等）+ 增量列迁移：首次运行或表结构变更后执行"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_columns)
+
+
+def _migrate_columns(conn):
+    """为已存在的旧表补充新增列（create_all 不会修改已存在的表）"""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(conn)
+    cols = (
+        {c["name"] for c in inspector.get_columns("vector_files")}
+        if inspector.has_table("vector_files") else set()
+    )
+
+    def add_col(column: str, ddl: str) -> None:
+        if column not in cols:
+            conn.execute(text(f"ALTER TABLE vector_files ADD COLUMN {ddl}"))
+
+    add_col(
+        "sync_status",
+        "sync_status VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT 'Milvus同步状态'",
+    )
+    add_col(
+        "last_error",
+        "last_error TEXT NULL COMMENT '最近一次Milvus同步失败原因'",
+    )

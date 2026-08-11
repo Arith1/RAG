@@ -7,6 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag个人知识库.models.vector import ChunkRecord, VectorFile
 from rag个人知识库.utils.hash_utils import compute_identity_hash
 
+# Milvus 同步状态机：pending(期望状态已落库，待同步) / in_sync(一致) / failed(同步失败可重试)
+SYNC_PENDING = "pending"
+SYNC_IN_SYNC = "in_sync"
+SYNC_FAILED = "failed"
+
 
 async def get_file_by_identity(
     db: AsyncSession,
@@ -36,6 +41,7 @@ async def insert_file(
         file_content_hash=content_hash,
         version=Decimal(version),
         chunk_count=0,
+        sync_status=SYNC_PENDING,
     )
     db.add(file)
     await db.flush()
@@ -48,12 +54,32 @@ async def update_file_version(
     new_version: Decimal,
     new_content_hash: str,
 ) -> None:
-    """更新文件版本号与内容哈希（更新流程的第一步）"""
+    """更新文件版本号与内容哈希，并置为 pending（期望状态已变更，待同步 Milvus）"""
     await db.execute(
         update(VectorFile)
         .where(VectorFile.id == file_id)
-        .values(version=new_version, file_content_hash=new_content_hash)
+        .values(
+            version=new_version,
+            file_content_hash=new_content_hash,
+            sync_status=SYNC_PENDING,
+            last_error=None,
+        )
     )
+
+
+async def set_sync_status(
+    db: AsyncSession,
+    file_id: int,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    """更新文件 Milvus 同步状态（in_sync / failed 等），error 为 None 时清空 last_error"""
+    values = {"sync_status": status}
+    if error is None:
+        values["last_error"] = None
+    else:
+        values["last_error"] = error
+    await db.execute(update(VectorFile).where(VectorFile.id == file_id).values(**values))
 
 
 async def get_chunks_by_file_id(db: AsyncSession, file_id: int) -> Sequence[ChunkRecord]:

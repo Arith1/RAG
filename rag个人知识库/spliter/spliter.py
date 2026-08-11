@@ -26,7 +26,7 @@ HEADERS_TO_SPLIT_ON = [
 ]
 
 # 中文场景默认 chunk 参数：bge 系 embedding 有效窗口约 512 token
-DEFAULT_CHUNK_SIZE = 800
+DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
 
 # 块级公式：$$...$$（跨行）
