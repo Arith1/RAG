@@ -1,16 +1,17 @@
-"""RAG 知识库命令行入口：入库 / 检索两个子命令。
+"""RAG 知识库命令行入口：入库 / 检索两个子命令（业务逻辑在 service 层，前端可复用）。
 
 用法：
-  python rag个人知识库/main.py ingest               # 入库/增量同步
-  python rag个人知识库/main.py search "查询词" -k 3  # 双路召回 + rerank 精排检索
+  python -m rag个人知识库.main ingest                    # 入库/增量同步
+  python -m rag个人知识库.main search --list             # 列出已入库文档
+  python -m rag个人知识库.main search "查询词" -k 3       # 全库检索
+  python -m rag个人知识库.main search "查询词" --source "路径"  # 指定文档内检索
 """
 
 import argparse
 import asyncio
 
-from rag个人知识库.config.db_config import AsyncSession, engine, init_db
-from rag个人知识库.ingest import process_file
-from rag个人知识库.vector_store.milvus_store import asearch_with_rerank
+from rag个人知识库.config.db_config import engine
+from rag个人知识库.service.service import ingest_files, list_documents, search_documents
 
 file_path_list = [
     # "F:\\PracticeProject\\RAG\\rag_project\\rag个人知识库\\resources\\01.simple_word.docx",
@@ -25,16 +26,8 @@ file_path_list = [
 
 
 async def run_ingest(_args) -> None:
-    """入库入口：建表 → 逐文件预检（加载前判断）→ 按需加载 → 切分 → 入库/更新/跳过 → 汇总"""
-    await init_db()
-
-    results = []
-    async with AsyncSession() as db:
-        for i, file_path in enumerate(file_path_list, start=1):
-            print("=" * 30)
-            print(f"第{i}个文档：{file_path}")
-            results.append(await process_file(db, file_path))
-            print("=" * 30)
+    """入库入口：逐文件预检 → 按需加载 → 入库/更新/跳过 → 打印汇总"""
+    results = await ingest_files(file_path_list)
 
     print("\n[入库汇总]")
     for result in results:
@@ -57,16 +50,33 @@ async def run_ingest(_args) -> None:
 
 
 async def run_search(args) -> None:
-    """查询入口：双路召回 Top recall_k → bge-reranker 精排 → 阈值过滤取 Top k"""
-    await init_db()
+    """查询入口：列出已入库文档，或按指定文档检索（双路召回 + rerank 精排）"""
+    if args.list:
+        await _print_documents()
+        return
+    if not args.query:
+        print('请提供查询词，例如：python -m rag个人知识库.main search "LangChain 是什么"')
+        return
     print(f"\n[检索] 查询：{args.query}")
-    hits = await asearch_with_rerank(args.query, k=args.top_k)
+    hits = await search_documents(args.query, k=args.top_k, expr=args.expr, source=args.source)
     if not hits:
         print("  未检索到相关结果")
         return
     for rank, hit in enumerate(hits, start=1):
-        print(f"Top{rank}（精排分 {hit.metadata.get('rerank_score')}）: {hit.page_content[:120]}...")
-        print(f"  来源：{hit.metadata.get('source')}")
+        print(f"Top{rank}（精排分 {hit['score']}）: {hit['content'][:120]}...")
+        print(f"  来源：{hit['source']}")
+
+
+async def _print_documents() -> None:
+    """打印已入库文档清单"""
+    files = await list_documents()
+    if not files:
+        print("  知识库中暂无已入库文档")
+        return
+    print(f"\n[已入库文档] 共 {len(files)} 个：")
+    for i, f in enumerate(files, start=1):
+        print(f"  {i}. {f['file_name']}  v{f['version']}")
+        print(f"     source: {f['source']}")
 
 
 async def main() -> None:
@@ -77,8 +87,11 @@ async def main() -> None:
     ingest_parser.set_defaults(handler=run_ingest)
 
     search_parser = subparsers.add_parser("search", help="语义检索（向量召回 + rerank 精排）")
-    search_parser.add_argument("query", help="查询词")
+    search_parser.add_argument("query", nargs="?", help="查询词（--list 时可不填）")
     search_parser.add_argument("-k", "--top-k", type=int, default=3, help="返回条数（默认 3）")
+    search_parser.add_argument("--list", action="store_true", help="只列出已入库文档，不检索")
+    search_parser.add_argument("--source", help="只在该文档（source）内检索，需与入库 source 一致")
+    search_parser.add_argument("--expr", help="原生 Milvus 过滤表达式（与 --source 二选一，同时传以 --source 为准）")
     search_parser.set_defaults(handler=run_search)
 
     args = parser.parse_args()

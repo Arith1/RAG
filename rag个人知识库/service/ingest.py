@@ -30,7 +30,7 @@ from rag个人知识库.crud.vector import (
     update_chunk_version,
     update_file_version,
 )
-from rag个人知识库.load_file import load_single, validate_file
+from rag个人知识库.loader.load_file import load_single, validate_file
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.spliter.spliter import split_documents
 from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint, compute_file_hash

@@ -18,7 +18,7 @@ CREATE TABLE `vector_files` (
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_identity_hash` (`identity_hash`) COMMENT '同一文件名+来源唯一',
     KEY `idx_updated_at` (`updated_at`) COMMENT '按更新时间排序'
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='向量文件元数据';
 
 -- ============================================
 -- 2. Chunk 记录表 (chunk_records)
@@ -32,7 +32,7 @@ CREATE TABLE `chunk_records` (
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
     PRIMARY KEY (`id`),
-    KEY `uk_chunk_fingerprint` (`chunk_fingerprint`) COMMENT 'chunk指纹普通索引，用于内容级去重查询',
+    UNIQUE KEY `uk_chunk_fingerprint` (`chunk_fingerprint`) COMMENT 'chunk指纹唯一索引（同时是 Milvus 主键，与模型 unique=True 一致）',
     KEY `idx_file_version` (`file_id`, `version`) COMMENT '创建索引加快查找速度',
     CONSTRAINT `fk_chunk_records_file_id` FOREIGN KEY (`file_id`) REFERENCES `vector_files` (`id`) ON DELETE CASCADE
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文件分块指纹记录';

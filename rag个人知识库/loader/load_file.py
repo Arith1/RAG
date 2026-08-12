@@ -7,10 +7,11 @@ from langchain_community.document_loaders import (
     TextLoader)
 from langchain_core.documents import Document
 
-from rag个人知识库.resources.mineru_demo import minerU_files
-from rag个人知识库.parser.document_validation_exception import DocumentValidationErrorType, \
+# from rag个人知识库.demo.mineru_demo import minerU_files
+from rag个人知识库.loader.parser.document_validation_exception import DocumentValidationErrorType, \
     DocumentValidationError
-from rag个人知识库.parser.word_parser import word_complicatedness, COMPLEXITY_THRESHOLD
+from rag个人知识库.loader.parser.mineru_parser import minerU_files
+from rag个人知识库.loader.parser.word_parser import word_complicatedness, COMPLEXITY_THRESHOLD
 
 # 文件大小阈值（单位：字节），超过此值使用 lazy_load 避免内存溢出
 # 默认 10MB
