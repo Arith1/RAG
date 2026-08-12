@@ -80,7 +80,7 @@ docker run -d --name milvus \
 ### 安装
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Arith1/RAG-.git
 cd rag_project
 
 # 推荐使用 uv
@@ -88,6 +88,7 @@ uv sync
 
 # 复制环境变量模板并填写密钥
 cp .env.example .env
+# Windows: copy .env.example .env
 ```
 
 `.env` 必需配置项：
@@ -146,12 +147,10 @@ rag_project/
 │  ├─ spliter/               # 结构感知切分
 │  ├─ vector_store/          # Milvus 存取 + 双路召回 + rerank 精排
 │  ├─ crud/                  # MySQL 数据访问
-│  ├─ models/                # SQLAlchemy 模型 + 建表 SQL
+│  ├─ models/                # SQLAlchemy 模型 + 建表 SQL（models/vector.sql）
 │  ├─ config/                # 数据库引擎与会话
 │  └─ utils/                 # 指纹哈希
-├─ models/vector.sql 的说明见上
-├─ docs/
-└─ .env.example
+└─ .env.example              # 环境变量模板
 ```
 
 ## 核心设计

@@ -4,3 +4,9 @@
 /.venv/
 /uv.lock
 /rag个人知识库/demo/
+
+# Python 缓存与 IDE
+__pycache__/
+*.pyc
+.idea/
+.DS_Store
