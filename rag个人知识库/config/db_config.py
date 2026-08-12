@@ -1,16 +1,22 @@
+import os
+
+from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 from rag个人知识库.models.vector import Base
 
+load_dotenv()
+
 # 数据库url
-ASYNC_DATABASE_URL = "mysql+aiomysql://root:root@localhost:3306/rag_demo?charset=utf8"
+ASYNC_DATABASE_URL = os.getenv("ASYNC_DATABASE_URL", "mysql+aiomysql://root:root@localhost:3306/rag_demo?charset=utf8")
+# 是否输出 SQL 日志（调试用）：.env 里 DB_ECHO=true 开启，默认关闭
+DB_ECHO = os.getenv("DB_ECHO", "false").strip().lower() in ("1", "true", "yes", "on")
 # 1.创建异步引擎
 engine = create_async_engine(
     ASYNC_DATABASE_URL,
-    echo =  True, # 输出日志
-    pool_size = 10, # 连接池大小
-    max_overflow = 20, # 溢出连接池大小
-
+    echo=DB_ECHO,  # 输出 SQL 日志（受 DB_ECHO 控制）
+    pool_size=10,  # 连接池大小
+    max_overflow=20,  # 溢出连接池大小
 )
 # 2.创建异步会话工厂，用于创建会话对象
 AsyncSession = async_sessionmaker(

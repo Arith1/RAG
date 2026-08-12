@@ -143,13 +143,14 @@ class Loader:
 
     @staticmethod
     def load_txt(file_path)-> Optional[List[Document]]:
-        # TXT 文件加载器
+        # TXT 文件加载器：解码发生在 smart_load 的 load() 阶段，try 必须包住 smart_load
         try:
             loader = TextLoader(file_path, encoding="utf-8")
+            documents = smart_load(loader, file_path)
         except UnicodeDecodeError:
             loader = TextLoader(file_path, encoding="gbk")
-
-        return smart_load(loader, file_path)
+            documents = smart_load(loader, file_path)
+        return documents
 
 
 def validate_file(file_path: str) -> Optional[DocumentValidationError]:

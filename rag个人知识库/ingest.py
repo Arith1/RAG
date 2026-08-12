@@ -34,7 +34,11 @@ from rag个人知识库.load_file import load_single, validate_file
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.spliter.spliter import split_documents
 from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint, compute_file_hash
-from rag个人知识库.vector_store.milvus_store import add_chunks, delete_chunks_by_ids
+from rag个人知识库.vector_store.milvus_store import (
+    aadd_chunks,
+    adelete_chunks_by_ids,
+    adelete_chunks_by_source,
+)
 
 # 版本号步进：1.0 -> 1.1 -> ... -> 1.9 -> 2.0（Numeric(5,1) 保留一位小数）
 VERSION_STEP = Decimal("0.1")
@@ -163,13 +167,20 @@ async def _sync_milvus(
     file_id: int,
     added_chunks: List[Document],
     removed_ids: List[str],
+    rebuild_source: Optional[str] = None,
 ) -> None:
-    """阶段二：同步 Milvus（幂等可重放）。成功置 in_sync，失败置 failed + last_error。"""
+    """阶段二：同步 Milvus（幂等可重放）。成功置 in_sync，失败置 failed + last_error。
+
+    rebuild_source: 非 None 时先按 source 删除该文件全部向量再全量插入
+    （retry 重建用，清理上次更新失败残留的旧 chunk 孤儿向量）。
+    """
     try:
+        if rebuild_source:
+            await adelete_chunks_by_source(rebuild_source)
         if added_chunks:
-            add_chunks(added_chunks)
+            await aadd_chunks(added_chunks)
         if removed_ids:
-            delete_chunks_by_ids(removed_ids)
+            await adelete_chunks_by_ids(removed_ids)
         await set_sync_status(db, file_id, SYNC_IN_SYNC)
         await db.commit()
     except Exception as e:
@@ -208,9 +219,10 @@ async def process_file(db: AsyncSession, file_path: str) -> dict:
     if not docs:
         return {"file_path": file_path, "status": "error", "message": "加载结果为空"}
 
-    # 保证 metadata.source 与入库 source 一致，避免 MySQL 指纹与 Milvus 主键口径不一致
+    # 保证 metadata.source 与入库 source 一致：强制覆盖 loader 可能设置的任何 source，
+    # 确保 MySQL 指纹与 Milvus 主键（chunk ID）口径完全一致
     for doc in docs:
-        doc.metadata.setdefault("source", file_path)
+        doc.metadata["source"] = file_path
 
     # 4. 切分
     chunks = split_documents(docs)
@@ -219,12 +231,15 @@ async def process_file(db: AsyncSession, file_path: str) -> dict:
 
     # 5. 阶段一：MySQL 落库期望状态（status=pending）。提交前 Milvus 完全未改动
     if action == "retry":
-        # 期望状态已在 MySQL（上次同步失败），只做 Milvus 重放，不动版本号
+        # 期望状态已在 MySQL（上次同步失败）：先按 source 清掉该文件旧向量，
+        # 再全量重放（幂等），同时清理上次更新失败残留的孤儿 chunk
         file_id, version = record.id, record.version
         added_chunks: List[Document] = chunks
         removed_ids: List[str] = []
         summary = {"added": len(chunks), "unchanged": 0, "removed": 0}
+        rebuild_source = record.source
     else:
+        rebuild_source = None
         try:
             if action == "insert":
                 file_id, version, summary = await _stage_insert(
@@ -244,7 +259,7 @@ async def process_file(db: AsyncSession, file_path: str) -> dict:
 
     # 6. 阶段二：同步 Milvus
     try:
-        await _sync_milvus(db, file_id, added_chunks, removed_ids)
+        await _sync_milvus(db, file_id, added_chunks, removed_ids, rebuild_source)
         print(f"[Ingest] {file_path} 处理完成：{summary}")
         return {
             "file_path": file_path,

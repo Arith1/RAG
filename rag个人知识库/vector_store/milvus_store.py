@@ -1,9 +1,10 @@
 """
 向量化存储与查询接口（MySQL 指纹 与 Milvus 主键共用同一口径）
 """
+import asyncio
 import os
 from functools import lru_cache
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -24,8 +25,9 @@ COLLECTION_NAME = "rag_knowledge_base"
 EMBEDDING_MODEL = "BAAI/bge-m3"
 # 重排序模型：与 bge-m3 同源，语义对齐，专门用于小批量候选的精排打分
 RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
-# 精排分阈值：reranker 输出的 relevance_score 区分度高，低于此值视为不相关直接丢弃
-RERANK_SCORE_THRESHOLD = 0.3
+# 精排分阈值：reranker 输出的 relevance_score 区分度高，低于此值视为不相关直接丢弃；
+# 可通过环境变量 RERANK_SCORE_THRESHOLD 调整（默认 0.3）
+RERANK_SCORE_THRESHOLD = float(os.getenv("RERANK_SCORE_THRESHOLD", "0.3"))
 # 双路召回的两个向量字段：dense 存 bge-m3 语义向量，sparse 存 BM25 词频稀疏向量
 DENSE_FIELD = "dense"
 SPARSE_FIELD = "sparse"
@@ -163,6 +165,23 @@ def delete_chunks_by_ids(ids: List[str], batch_size: int = 64) -> None:
     print(f"[VectorStore] 已删除 {len(ids)} 个旧 chunk")
 
 
+def _source_expr(source: str) -> str:
+    """构造按 source 过滤的 Milvus 表达式（转义反斜杠与双引号）"""
+    escaped = source.replace("\\", "\\\\").replace('"', '\\"')
+    return f'source == "{escaped}"'
+
+
+def delete_chunks_by_source(source: str) -> None:
+    """按 source 删除该文件在 Milvus 的全部向量（retry 重建用，先清后插避免残留孤儿向量）"""
+    vector_store = get_vector_store()
+    if vector_store.col is None:
+        print("[VectorStore] 集合尚未创建，无需删除")
+        return
+    ok = vector_store.delete(expr=_source_expr(source))
+    if not ok:
+        raise RuntimeError(f"按 source 删除 Milvus 向量失败：{source}")
+    print(f"[VectorStore] 已按 source 删除该文件全部向量：{source}")
+
 # RRF 融合器：按各路排名倒数 1/(k+rank) 加总打分，与两路分数量纲无关，无需调权重；
 # 无状态对象，模块级定义一次处处复用
 _RRF_RANKER = Function(
@@ -173,16 +192,27 @@ _RRF_RANKER = Function(
 )
 
 
-def search(query: str, k: int = 3) -> List[Document]:
-    """双路召回：dense 语义 + BM25 关键词两路各取候选，RRF 融合后返回 Top k"""
+def search(
+    query: str,
+    k: int = 3,
+    expr: Optional[str] = None,
+    source: Optional[str] = None,
+) -> List[Document]:
+    """双路召回：dense 语义 + BM25 关键词两路各取候选，RRF 融合后返回 Top k。
+
+    expr: 原生 Milvus 过滤表达式（如 'file_name == "a.docx"'）；
+    source: 便捷的按来源过滤，与 expr 二选一，同时提供时以 source 为准。
+    """
     vector_store = get_vector_store()
-    return vector_store.similarity_search(
-        query,
-        k=k,
+    filter_expr = _source_expr(source) if source is not None else expr
+    kwargs: dict = {
         # 每路各自预取 k 条再融合（库内默认只预取 4 条，必须显式放大）
-        fetch_k=k,
-        reranker=_RRF_RANKER,
-    )
+        "fetch_k": k,
+        "reranker": _RRF_RANKER,
+    }
+    if filter_expr:
+        kwargs["expr"] = filter_expr
+    return vector_store.similarity_search(query, k=k, **kwargs)
 
 
 def _rerank(query: str, documents: List[str], top_n: int) -> List[dict]:
@@ -207,6 +237,8 @@ def search_with_rerank(
     k: int = 5,
     recall_k: int = 20,
     score_threshold: float = RERANK_SCORE_THRESHOLD,
+    expr: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> List[Document]:
     """
     双路召回 + 精排：dense/BM25 双路召回 Top recall_k → reranker 精排 → 阈值过滤后取 Top k。
@@ -215,7 +247,7 @@ def search_with_rerank(
     精排分写入 metadata 的 rerank_score，便于下游观察区分度；
     rerank 接口故障时降级返回召回 Top k，不让精排环节成为单点故障。
     """
-    candidates = search(query, k=recall_k)
+    candidates = search(query, k=recall_k, expr=expr, source=source)
     if not candidates:
         return []
 
@@ -237,3 +269,33 @@ def search_with_rerank(
         reranked.append(doc)
     print(f"[Rerank] 召回 {len(candidates)} 条，精排后保留 {len(reranked)} 条（阈值 {score_threshold}）")
     return reranked
+
+
+# ── 异步包装：把阻塞型同步调用放进线程池执行，避免卡住事件循环（便于将来接入 FastAPI 等服务）──
+async def aadd_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
+    """add_chunks 的异步版本：线程池中执行 embedding + Milvus 写入"""
+    return await asyncio.to_thread(add_chunks, chunks, batch_size)
+
+
+async def adelete_chunks_by_ids(ids: List[str], batch_size: int = 64) -> None:
+    """delete_chunks_by_ids 的异步版本：线程池中执行 Milvus 删除"""
+    await asyncio.to_thread(delete_chunks_by_ids, ids, batch_size)
+
+
+async def adelete_chunks_by_source(source: str) -> None:
+    """delete_chunks_by_source 的异步版本：线程池中执行按 source 删除"""
+    await asyncio.to_thread(delete_chunks_by_source, source)
+
+
+async def asearch_with_rerank(
+    query: str,
+    k: int = 5,
+    recall_k: int = 20,
+    score_threshold: float = RERANK_SCORE_THRESHOLD,
+    expr: Optional[str] = None,
+    source: Optional[str] = None,
+) -> List[Document]:
+    """search_with_rerank 的异步版本：线程池中执行召回 + 精排"""
+    return await asyncio.to_thread(
+        search_with_rerank, query, k, recall_k, score_threshold, expr, source
+    )
