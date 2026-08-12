@@ -34,6 +34,41 @@ def smart_load(loader, file_path: str) -> List[Document]:
         print(f"[smart_load] 文件大小正常({file_size / 1024:.1f}KB)，使用 load 直接加载: {file_path}")
         return loader.load()
 
+def load_mineru_md(file_path: str, doc_type_label: str) -> Optional[List[Document]]:
+    """
+    调用 MinerU 解析文件，并读取解析产物 Markdown 为 Document 列表。
+
+    流程：
+      1. 调用 minerU_files 解析，失败或产物缺失直接返回 None
+      2. 产物是 Markdown，按原文读入，切分交给切分层
+      3. 给每个 Document 打上 source（原始文件）与 md_path（解析产物）元数据便于溯源
+
+    doc_type_label 用于日志提示，如 "Word" / "PDF"。
+    """
+    # minerU_files 接收路径列表，返回以原始路径为 key 的结构化结果
+    results = minerU_files([file_path])
+    result = results.get(file_path)
+    if result is None or result["status"] != "success":
+        error = result["error"] if result else "未返回解析结果"
+        print(f"{doc_type_label} 解析失败：{file_path}，原因：{error}")
+        return None
+    # md_path 由 minerU_files 直接给出，无需自己拼产物目录结构
+    md_path = result["md_path"]
+    if not os.path.exists(md_path):
+        print(f"未找到解析结果：{md_path}")
+        return None
+    print(f"读取解析结果：{md_path}")
+    # 产物是 Markdown，按原文读入，切分交给切分层
+    documents = Loader.load_md(md_path)
+    if documents:
+        for doc in documents:
+            # source 指回原始文件便于溯源，解析产物路径另存 md_path
+            doc.metadata["source"] = file_path
+            doc.metadata["md_path"] = md_path
+    print(f"成功加载文档：{md_path}")
+    return documents
+
+
 def load_word(file_path: str) -> Optional[List[Document]]:
     """
     加载 Word 文档。
@@ -61,27 +96,7 @@ def load_word(file_path: str) -> Optional[List[Document]]:
 
     # ── 复杂文档：走 MinerU 解析 ──
     print("复杂度较高，使用 MinerU 进行解析")
-    # minerU_files 接收路径列表，返回以原始路径为 key 的结构化结果
-    results = minerU_files([file_path])
-    result = results.get(file_path)
-    if result is None or result["status"] != "success":
-        error = result["error"] if result else "未返回解析结果"
-        print(f"MinerU 解析失败：{file_path}，原因：{error}")
-        return None
-    md_path = result["md_path"]
-    if not os.path.exists(md_path):
-        print(f"未找到解析结果：{md_path}")
-        return None
-    print(f"读取解析结果：{md_path}")
-    # 产物是 Markdown，按原文读入，切分交给切分层
-    documents = Loader.load_md(md_path)
-    if documents:
-        for doc in documents:
-            # source 指回原始 Word 文件便于溯源，解析产物路径另存 md_path
-            doc.metadata["source"] = file_path
-            doc.metadata["md_path"] = md_path
-    print(f"成功加载文档：{md_path}")
-    return documents
+    return load_mineru_md(file_path, "Word")
 
 
 class Loader:
@@ -118,28 +133,7 @@ class Loader:
     def load_pdf(file_path) -> Optional[List[Document]]:
         # PDF 文件加载器
         """上传 PDF 到 MinerU 解析，解析完成后读取 full.md 返回 Document 列表"""
-        # minerU_files 接收路径列表，单文件包成单元素列表传入
-        results = minerU_files([file_path])
-        # 返回值以原始路径为 key，直接取当前文件的结果
-        result = results.get(file_path)
-        if result is None or result["status"] != "success":
-            error = result["error"] if result else "未返回解析结果"
-            print(f"PDF 解析失败：{file_path}，原因：{error}")
-            return None
-        # md_path 由 minerU_files 直接给出，无需自己拼产物目录结构
-        md_path = result["md_path"]
-        if not os.path.exists(md_path):
-            print(f"未找到解析结果：{md_path}")
-            return None
-        print(f"读取解析结果：{md_path}")
-        # 解析产物是 Markdown，复用 load_md 按原文加载为 Document
-        documents = Loader.load_md(md_path)
-        if documents:
-            for doc in documents:
-                # source 指回原始 PDF 便于溯源，解析产物路径另存 md_path
-                doc.metadata["source"] = file_path
-                doc.metadata["md_path"] = md_path
-        return documents
+        return load_mineru_md(file_path, "PDF")
 
 
     @staticmethod

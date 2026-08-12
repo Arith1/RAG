@@ -176,13 +176,3 @@ def minerU_files(file_paths: list, output_root: str | None = None) -> dict:
     extract_results = poll_batch_result(batch_id, header)
     results.update(download_and_extract(extract_results, output_root, valid_paths))
     return results
-
-
-if __name__ == "__main__":
-    # 示例：批量解析 resources 目录下的 PDF
-    demo_files = [
-        # os.path.join(os.path.dirname(__file__), "04.sample-multilingual-text.pdf"),
-        # os.path.join(os.path.dirname(__file__), "丝网重量计算公式.pdf"),
-        # "F:\\PracticeProject\\RAG\\rag_project\\rag个人知识库\\resources\\05.sample2.docx"
-    ]
-    print(minerU_files(demo_files))
