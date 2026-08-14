@@ -30,21 +30,32 @@ def _build_header() -> dict:
     }
 
 
-def poll_batch_result(batch_id, header, interval=5, timeout=600):
-    """轮询批量解析结果，全部完成后返回 extract_result 列表"""
+def poll_batch_result(batch_id, header, interval=5, timeout=600, expected_data_ids=None):
+    """轮询批量解析结果，全部完成后返回 extract_result 列表。
+
+    expected_data_ids: 非 None 时只等待这些 data_id 对应的文件，避免上传失败的文件阻塞整批。
+    """
     result_url = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
     # flush=True 强制刷新缓冲区，保证非终端环境（如 uv run）下能实时看到进度
     print('start polling batch:{} ...'.format(batch_id), flush=True)
     start = time.time()
     # 在 timeout 时限内每隔 interval 秒查一次，避免无限等待
     while time.time() - start < timeout:
-        res = requests.get(result_url, headers=header)
+        res = requests.get(result_url, headers=header, timeout=30)
         if res.status_code != 200:
             # 接口偶发非 200 不直接退出，休眠后继续重试
             print('poll failed. status:{}'.format(res.status_code), flush=True)
             time.sleep(interval)
             continue
         extract_results = res.json()["data"]["extract_result"]
+        if expected_data_ids is not None:
+            extract_results = [
+                item for item in extract_results
+                if item.get("data_id") in expected_data_ids
+            ]
+            if not extract_results:
+                time.sleep(interval)
+                continue
         # state 取值：waiting-file / pending / running / done / failed
         states = [item["state"] for item in extract_results]
         print('current states:{}'.format(states), flush=True)
@@ -92,8 +103,8 @@ def download_and_extract(extract_results, output_root, file_paths) -> dict:
         # full_zip_url 有时效性，拿到后尽快下载
         zip_content = download_zip(item["full_zip_url"])
         # 用 data_id 作目录后缀，同名文件产物也不会互相覆盖
-        # output_dir = os.path.join(output_root, "{}_{}".format(item["file_name"], item["data_id"]))
-        output_dir = os.path.join(output_root, "{}".format(item["file_name"]))
+        output_dir = os.path.join(output_root, "{}_{}".format(item["file_name"], item["data_id"]))
+        # output_dir = os.path.join(output_root, "{}".format(item["file_name"]))
         os.makedirs(output_dir, exist_ok=True)
         # 内存流直接解压，不落盘临时 zip 文件
         with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
@@ -109,8 +120,12 @@ def download_and_extract(extract_results, output_root, file_paths) -> dict:
     return results
 
 
-def submit_batch(file_paths: list, header: dict) -> str:
-    """申请上传链接并上传所有文件，返回 batch_id（不等待解析，便于调用方并行处理其他任务）"""
+def submit_batch(file_paths: list, header: dict) -> tuple[str, dict[str, str]]:
+    """申请上传链接并上传所有文件。
+
+    返回 (batch_id, failed_uploads)，failed_uploads 以 data_id 为 key、失败原因为 value。
+    单个文件上传失败不会中止整个 batch，由调用方决定后续策略。
+    """
     url = "https://mineru.net/api/v4/file-urls/batch"
     data = {
         "files": [
@@ -130,18 +145,26 @@ def submit_batch(file_paths: list, header: dict) -> str:
         raise RuntimeError('申请上传链接失败，原因:{}'.format(result["msg"]))
     batch_id = result["data"]["batch_id"]
     urls = result["data"]["file_urls"]
+    if len(urls) != len(file_paths):
+        raise RuntimeError(f"上传链接数量与文件数量不一致：{len(urls)} != {len(file_paths)}")
     print('batch_id:{}'.format(batch_id), flush=True)
     # 第 2 步：把本地文件 PUT 到预签名 URL（直传 OSS，无需再带 token）
     # file_urls 与 data["files"] 顺序一一对应，按下标对齐上传
+    failed_uploads = {}
     for i, upload_url in enumerate(urls):
-        with open(file_paths[i], 'rb') as f:
-            res_upload = requests.put(upload_url, data=f)
         file_name = os.path.basename(file_paths[i])
-        if res_upload.status_code == 200:
-            print(f"{file_name} upload success", flush=True)
-        else:
-            print(f"{file_name} upload failed. status:{res_upload.status_code}", flush=True)
-    return batch_id
+        try:
+            with open(file_paths[i], 'rb') as f:
+                res_upload = requests.put(upload_url, data=f)
+            if res_upload.ok:
+                print(f"{file_name} upload success", flush=True)
+            else:
+                print(f"{file_name} upload failed. status:{res_upload.status_code}", flush=True)
+                failed_uploads[str(i)] = f"上传失败 status:{res_upload.status_code}"
+        except Exception as e:
+            print(f"{file_name} upload exception: {e}", flush=True)
+            failed_uploads[str(i)] = f"上传异常:{e}"
+    return batch_id, failed_uploads
 
 
 def minerU_files(file_paths: list, output_root: str | None = None) -> dict:
@@ -172,7 +195,49 @@ def minerU_files(file_paths: list, output_root: str | None = None) -> dict:
 
     header = _build_header()
     # 提交 batch（申请链接 + 上传）→ 轮询直到全部终态 → 下载解压产物
-    batch_id = submit_batch(valid_paths, header)
-    extract_results = poll_batch_result(batch_id, header)
+    batch_id, failed_uploads = submit_batch(valid_paths, header)
+    successful_ids = {
+        str(i) for i in range(len(valid_paths)) if str(i) not in failed_uploads
+    }
+    if not successful_ids:
+        for i, p in enumerate(valid_paths):
+            results[p] = {
+                "status": "failed",
+                "output_dir": None,
+                "md_path": None,
+                "error": failed_uploads.get(str(i), "上传失败"),
+            }
+        return results
+
+    extract_results = poll_batch_result(
+        batch_id,
+        header,
+        expected_data_ids=successful_ids,
+    )
     results.update(download_and_extract(extract_results, output_root, valid_paths))
+    for i, p in enumerate(valid_paths):
+        if str(i) in failed_uploads:
+            results[p] = {
+                "status": "failed",
+                "output_dir": None,
+                "md_path": None,
+                "error": failed_uploads[str(i)],
+            }
     return results
+
+
+def minerU_files_ordered(file_paths: list, output_root: str | None = None) -> list[dict]:
+    """批量解析并返回与输入顺序完全一致的结果列表。"""
+    results = minerU_files(file_paths, output_root)
+    return [
+        results.get(
+            p,
+            {
+                "status": "failed",
+                "output_dir": None,
+                "md_path": None,
+                "error": "未返回解析结果",
+            },
+        )
+        for p in file_paths
+    ]

@@ -8,20 +8,17 @@ from typing import List, Optional
 
 from rag个人知识库.config.db_config import AsyncSession
 from rag个人知识库.crud.vector import select_file_names
-from rag个人知识库.service.ingest import process_file
+from rag个人知识库.service.ingest import ingest_files_batched
 from rag个人知识库.vector_store.milvus_store import asearch_with_rerank
 
 
 async def ingest_files(file_paths: List[str]) -> List[dict]:
-    """入库一组文件：逐文件预检（加载前判断）→ 按需加载 → 切分 → 入库/更新/跳过。
+    """入库一组文件：先预检过滤 skip，再把复杂文档批量解析，按原始顺序返回结果。
 
     返回每个文件的结构化结果（status/version/added/unchanged/removed/message）。
     """
-    results = []
     async with AsyncSession() as db:
-        for file_path in file_paths:
-            results.append(await process_file(db, file_path))
-    return results
+        return await ingest_files_batched(db, file_paths)
 
 
 async def search_documents(
@@ -46,13 +43,14 @@ async def search_documents(
     ]
 
 
-async def list_documents() -> List[dict]:
+async def list_documents(limit: Optional[int] = None, offset: int = 0) -> List[dict]:
     """列出已入库文档（读 vector_files），供用户选择检索范围。
 
+    按 updated_at 倒序返回；limit 为空时返回全部，offset 用于分页。
     返回 [{id, file_name, version, source, chunk_count, sync_status}, ...]
     """
     async with AsyncSession() as db:
-        files = await select_file_names(db)
+        files = await select_file_names(db, limit=limit, offset=offset)
     return [
         {
             "id": f.id,

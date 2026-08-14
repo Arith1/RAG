@@ -217,6 +217,9 @@ def search(
 
 def _rerank(query: str, documents: List[str], top_n: int) -> List[dict]:
     """调用 SiliconFlow rerank 接口，返回 [{index, relevance_score}, ...]（按分数降序）"""
+    if not documents:
+        return []
+
     resp = _session.post(
         f"{_require_env('SILICONFLOW_BASE_URL').rstrip('/')}/rerank",
         headers={"Authorization": f"Bearer {_require_env('SILICONFLOW_API_KEY')}"},
@@ -229,7 +232,10 @@ def _rerank(query: str, documents: List[str], top_n: int) -> List[dict]:
         timeout=30,
     )
     resp.raise_for_status()
-    return resp.json()["results"]
+    results = resp.json().get("results")
+    if not isinstance(results, list):
+        raise ValueError(f"rerank 响应缺少 results 列表：{resp.text[:200]}")
+    return results
 
 
 def search_with_rerank(
@@ -252,21 +258,37 @@ def search_with_rerank(
         return []
 
     try:
-        results = _rerank(query, [c.page_content for c in candidates], top_n=k)
-    except requests.RequestException as e:
-        # 精排只是质量增强，接口异常（超时/限流/余额不足）时退回双路召回结果，保检索可用
+        # 对全部召回候选做精排，避免阈值过滤后无法用后续候选补位
+        results = _rerank(
+            query,
+            [c.page_content for c in candidates],
+            top_n=len(candidates),
+        )
+    except Exception as e:
+        # 精排只是质量增强，接口/响应异常时退回双路召回结果，保检索可用
         print(f"[Rerank] 接口调用失败，降级返回召回 Top{k}：{e}")
         return candidates[:k]
 
     reranked = []
     for item in results:
-        score = item["relevance_score"]
+        index = item.get("index")
+        score = item.get("relevance_score")
+        if index is None or score is None:
+            continue
+        try:
+            index = int(index)
+            score = float(score)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= index < len(candidates)):
+            continue
         # 低于阈值的候选直接丢弃，避免不相关内容污染下游 prompt
         if score < score_threshold:
             continue
-        doc = candidates[item["index"]]
+        doc = candidates[index]
         doc.metadata["rerank_score"] = round(score, 4)
         reranked.append(doc)
+    reranked = reranked[:k]
     print(f"[Rerank] 召回 {len(candidates)} 条，精排后保留 {len(reranked)} 条（阈值 {score_threshold}）")
     return reranked
 

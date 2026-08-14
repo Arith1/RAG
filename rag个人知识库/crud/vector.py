@@ -144,6 +144,16 @@ async def update_chunk_count(db: AsyncSession, file_id: int) -> None:
         .values(chunk_count=result.scalar_one())
     )
 
-async def select_file_names(db: AsyncSession):
-    result = await db.execute(select(VectorFile))
+async def select_file_names(
+    db: AsyncSession,
+    limit: Optional[int] = None,
+    offset: int = 0,
+):
+    """按 updated_at 倒序列出文件记录，支持可选分页。"""
+    stmt = select(VectorFile).order_by(VectorFile.updated_at.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    if offset:
+        stmt = stmt.offset(offset)
+    result = await db.execute(stmt)
     return result.scalars().all()

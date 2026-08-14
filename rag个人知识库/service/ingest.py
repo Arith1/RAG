@@ -10,6 +10,7 @@
   4. 重试：文件 status 为 pending/failed 且内容未变时，precheck 返回 retry，
      重新同步 Milvus（幂等重放），成功后置 in_sync。
 """
+import asyncio
 import os
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
@@ -30,7 +31,13 @@ from rag个人知识库.crud.vector import (
     update_chunk_version,
     update_file_version,
 )
-from rag个人知识库.loader.load_file import load_single, validate_file
+from rag个人知识库.loader.load_file import (
+    load_mineru_md_from_result,
+    load_single,
+    needs_mineru,
+    validate_file,
+)
+from rag个人知识库.loader.parser.mineru_parser import minerU_files_ordered
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.spliter.spliter import split_documents
 from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint, compute_file_hash
@@ -62,7 +69,7 @@ async def precheck(
       - record: 命中的 VectorFile 或 None
     """
     file_name = os.path.basename(file_path)
-    content_hash = compute_file_hash(file_path)
+    content_hash = await asyncio.to_thread(compute_file_hash, file_path)
     record = await get_file_by_identity(db, file_name, file_path)
     if record is None:
         return "insert", content_hash, None
@@ -193,8 +200,15 @@ async def _sync_milvus(
         raise RuntimeError(f"Milvus 同步失败（已标记 failed，可重跑恢复）：{e}") from e
 
 
-async def process_file(db: AsyncSession, file_path: str) -> dict:
-    """单文件完整流程：校验 → 预检 → 按需加载/切分 → MySQL 落期望状态 → 同步 Milvus。"""
+async def process_file(
+    db: AsyncSession,
+    file_path: str,
+    mineru_result: Optional[dict] = None,
+) -> dict:
+    """单文件完整流程：校验 → 预检 → 按需加载/切分 → MySQL 落期望状态 → 同步 Milvus。
+
+    mineru_result: 批量 MinerU 解析结果；非 None 时不再单独触发 MinerU 上传解析。
+    """
     # 1. 基础校验
     error = validate_file(file_path)
     if error is not None:
@@ -212,7 +226,21 @@ async def process_file(db: AsyncSession, file_path: str) -> dict:
 
     # 3. 只有非 skip 才加载（避免对未变化文档做无谓解析）
     try:
-        docs = load_single(file_path)
+        if mineru_result is not None and mineru_result.get("status") != "success":
+            return {
+                "file_path": file_path,
+                "status": "error",
+                "message": f"MinerU 解析失败：{mineru_result.get('error') or '未返回解析结果'}",
+            }
+        if mineru_result is not None:
+            docs = await asyncio.to_thread(
+                load_mineru_md_from_result,
+                file_path,
+                mineru_result,
+                "批量文档",
+            )
+        else:
+            docs = await asyncio.to_thread(load_single, file_path)
     except Exception as e:
         print(f"[Ingest] {file_path} 加载失败：{e}")
         return {"file_path": file_path, "status": "error", "message": f"加载失败：{e}"}
@@ -225,7 +253,7 @@ async def process_file(db: AsyncSession, file_path: str) -> dict:
         doc.metadata["source"] = file_path
 
     # 4. 切分
-    chunks = split_documents(docs)
+    chunks = await asyncio.to_thread(split_documents, docs)
     if not chunks:
         return {"file_path": file_path, "status": "error", "message": "切分结果为空"}
 
@@ -268,8 +296,84 @@ async def process_file(db: AsyncSession, file_path: str) -> dict:
                 "update": "updated",
                 "retry": "retried",
             }[action],
-            "version": version,
+            "version": str(version),
             **summary,
         }
     except RuntimeError as e:
         return {"file_path": file_path, "status": "error", "message": str(e), "retryable": True}
+
+
+async def ingest_files_batched(db: AsyncSession, file_paths: List[str]) -> List[dict]:
+    """批量入库编排：先过滤 skip，把复杂文档批量交给 MinerU，再按原始顺序回填结果。
+
+    返回顺序与输入 file_paths 完全一致，复杂文档不会因为批量解析而打乱顺序。
+    """
+    ordered_results: List[Optional[dict]] = [None] * len(file_paths)
+    complex_batch: List[Tuple[int, str]] = []
+
+    for idx, file_path in enumerate(file_paths):
+        try:
+            error = await asyncio.to_thread(validate_file, file_path)
+            if error is not None:
+                ordered_results[idx] = {
+                    "file_path": file_path,
+                    "status": "error",
+                    "message": error.error_msg,
+                }
+                continue
+
+            action, _content_hash, record = await precheck(db, file_path)
+            if action == "skip":
+                ordered_results[idx] = {
+                    "file_path": file_path,
+                    "status": "skipped",
+                    "version": str(record.version),
+                }
+                continue
+
+            if await asyncio.to_thread(needs_mineru, file_path):
+                complex_batch.append((idx, file_path))
+            else:
+                ordered_results[idx] = await process_file(db, file_path)
+        except Exception as e:
+            await db.rollback()
+            ordered_results[idx] = {
+                "file_path": file_path,
+                "status": "error",
+                "message": f"处理失败：{e}",
+            }
+
+    # 预检阶段的 SELECT 会隐式开启事务，长时间批量解析前先释放数据库连接/事务
+    await db.rollback()
+
+    if complex_batch:
+        complex_paths = [path for _, path in complex_batch]
+        try:
+            mineru_results = await asyncio.to_thread(minerU_files_ordered, complex_paths)
+        except Exception as e:
+            mineru_results = None
+            batch_error = str(e)
+
+        for position, (idx, file_path) in enumerate(complex_batch):
+            try:
+                if mineru_results is None:
+                    ordered_results[idx] = {
+                        "file_path": file_path,
+                        "status": "error",
+                        "message": f"MinerU 批量解析失败：{batch_error}",
+                    }
+                else:
+                    ordered_results[idx] = await process_file(
+                        db,
+                        file_path,
+                        mineru_result=mineru_results[position],
+                    )
+            except Exception as e:
+                await db.rollback()
+                ordered_results[idx] = {
+                    "file_path": file_path,
+                    "status": "error",
+                    "message": f"处理失败：{e}",
+                }
+
+    return [result for result in ordered_results if result is not None]
