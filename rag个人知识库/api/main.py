@@ -169,9 +169,9 @@ def _client_ip(request: Request) -> str:
 async def register(body: RegisterIn, request: Request, db: AsyncSession = Depends(get_db)):
     """开放注册，默认角色 user（管理员由环境变量播种）。按 IP 限流防批量注册。"""
     reg_key = f"reg|{_client_ip(request)}"
-    if not check_allowed(reg_key):
+    if not await check_allowed(reg_key):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "注册过于频繁，请稍后再试")
-    record_failure(reg_key)  # 注册按尝试次数计数（无失败概念），窗口内最多 LOGIN_MAX_ATTEMPTS 次
+    await record_failure(reg_key)  # 注册按尝试次数计数（无失败概念），窗口内最多 LOGIN_MAX_ATTEMPTS 次
     username = body.username.strip()
     if len(username) < 2 or len(body.password) < 6:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "用户名至少 2 个字符，密码至少 6 位")
@@ -193,15 +193,15 @@ async def login(
 ):
     """OAuth2 密码流登录，返回 JWT。滑动窗口限流（5 次/分钟），失败写入审计。"""
     key = f"login|{form.username}|{_client_ip(request)}"
-    if not check_allowed(key):
+    if not await check_allowed(key):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "尝试过于频繁，请 1 分钟后再试")
     result = await db.execute(select(User).where(User.username == form.username))
     user = result.scalar_one_or_none()
     if user is None or not verify_password(form.password, user.password_hash):
-        record_failure(key)
+        await record_failure(key)
         await write_audit("login_failed", username=form.username, detail=f"ip={_client_ip(request)}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
-    clear_key(key)
+    await clear_key(key)
     return TokenOut(access_token=create_access_token(user), role=user.role)
 
 

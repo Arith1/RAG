@@ -4,10 +4,12 @@
 - 登录：OAuth2 密码流（Swagger 的 Authorize 按钮可直接用）
 - 鉴权：get_current_user（任何登录用户）/ require_admin（仅管理员）
 - 审计：audit() 写入 audit_logs（用户名冗余存储）
-- 防爆破：登录/注册滑动窗口限流（进程内实现，重启清零；生产可换 Redis）
+- 防爆破：登录/注册滑动窗口限流（Redis ZSET + Lua 原子，重启不清零、多 worker 共享；
+  Redis 不可用时回退进程内 dict）
 """
 import os
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -17,6 +19,8 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from rag个人知识库.config.redis import get_redis
 
 from rag个人知识库.config.db_config import AsyncSession, get_db
 from rag个人知识库.models.user import AuditLog, User
@@ -110,13 +114,17 @@ async def write_audit(
         await db.commit()
 
 
-# ── 暴力破解防护：滑动窗口限流（进程内，重启清零；生产可换 Redis）──
+# ── 暴力破解防护：滑动窗口限流 ──
+# 主后端 Redis（ZSET + Lua 原子），重启不清零、多 worker 共享计数；
+# Redis 不可用时自动回退进程内 dict，系统不中断。
 LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
 LOGIN_WINDOW_SECONDS = 60
+
+# 进程内兜底（Redis 不可用时）
 _attempts: dict = {}  # key -> deque[时间戳]
 
 
-def _prune(key: str) -> None:
+def _local_prune(key: str) -> None:
     now = time.time()
     dq = _attempts.get(key)
     if dq is None:
@@ -127,18 +135,82 @@ def _prune(key: str) -> None:
         _attempts.pop(key, None)
 
 
-def check_allowed(key: str) -> bool:
-    """窗口内失败次数未超限返回 True。"""
-    _prune(key)
+def _local_check_allowed(key: str) -> bool:
+    _local_prune(key)
     return len(_attempts.get(key, ())) < LOGIN_MAX_ATTEMPTS
 
 
-def record_failure(key: str) -> None:
+def _local_record_failure(key: str) -> None:
     _attempts.setdefault(key, deque()).append(time.time())
 
 
-def clear_key(key: str) -> None:
+def _local_clear_key(key: str) -> None:
     _attempts.pop(key, None)
+
+
+# Redis 滑动窗口：ZSET 成员为失败时间戳（score=时间戳），窗口内计数 = ZCARD。
+# 两条 Lua 保证原子性（Redis 单线程执行脚本），避免并发下计数不准。
+_CHECK_LUA = """
+-- KEYS[1]=限流key  ARGV[1]=窗口秒  ARGV[2]=上限  ARGV[3]=当前毫秒时间戳
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3] - ARGV[1] * 1000)
+local count = redis.call('ZCARD', KEYS[1])
+if count >= tonumber(ARGV[2]) then return 0 end
+return 1
+"""
+
+_RECORD_LUA = """
+-- KEYS[1]=限流key  ARGV[1]=窗口秒  ARGV[3]=当前毫秒时间戳  ARGV[4]=唯一成员
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3] - ARGV[1] * 1000)
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
+"""
+
+
+async def _redis_check(key: str) -> "bool | None":
+    """Redis 原子检查（含窗口清理）：True 放行 / False 拦截 / None 表示 Redis 不可用。"""
+    try:
+        r = get_redis()
+        ok = await r.eval(_CHECK_LUA, 1, key, LOGIN_WINDOW_SECONDS,
+                          LOGIN_MAX_ATTEMPTS, int(time.time() * 1000))
+        return bool(ok)
+    except Exception:
+        return None
+
+
+async def _redis_record(key: str) -> bool:
+    """Redis 原子记录一次失败，成功返回 True；Redis 不可用返回 False。"""
+    try:
+        r = get_redis()
+        member = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        await r.eval(_RECORD_LUA, 1, key, LOGIN_WINDOW_SECONDS, 0,
+                     int(time.time() * 1000), member)
+        return True
+    except Exception:
+        return False
+
+
+async def check_allowed(key: str) -> bool:
+    """窗口内失败次数未超限返回 True（Redis 优先，不可用回退进程内）。"""
+    result = await _redis_check(key)
+    if result is not None:
+        return result
+    return _local_check_allowed(key)
+
+
+async def record_failure(key: str) -> None:
+    """记录一次失败（Redis 优先，不可用回退进程内）。"""
+    if not await _redis_record(key):
+        _local_record_failure(key)
+
+
+async def clear_key(key: str) -> None:
+    """清除限流记录（Redis 与进程内都清）。"""
+    try:
+        await get_redis().delete(key)
+    except Exception:
+        pass
+    _local_clear_key(key)
 
 
 # ── 种子管理员（首次启动时从环境变量播种）──
