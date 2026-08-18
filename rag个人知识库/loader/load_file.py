@@ -40,7 +40,9 @@ def needs_mineru(file_path: str) -> bool:
     ext = file_path.rsplit(".", 1)[-1].lower()
     if ext == "pdf":
         return True
-    if ext in ("doc", "docx"):
+    # .doc 在 validate_file 已被拦截（提示另存为 .docx），这里只认 docx，
+    # 避免二进制 .doc 进入 word_complicatedness 抛 PackageNotFoundError/BadZipFile
+    if ext == "docx":
         return word_complicatedness(file_path) >= COMPLEXITY_THRESHOLD
     return False
 
@@ -180,6 +182,11 @@ def validate_file(file_path: str) -> Optional[DocumentValidationError]:
     if not os.path.exists(file_path):
         print(f"{DocumentValidationErrorType.NOT_FOUND_FILE}")
         return DocumentValidationError(file_path, DocumentValidationErrorType.NOT_FOUND_FILE)
+    # 校验 .doc 旧版二进制格式：python-docx/ZipFile 无法解析，
+    # 在通用格式校验前拦截并给出明确转换提示（load_doc 仅兼容 .docx）
+    if file_path.rsplit(".", 1)[-1].lower() == "doc":
+        print(f"{DocumentValidationErrorType.DOC_NEEDS_CONVERSION}")
+        return DocumentValidationError(file_path, DocumentValidationErrorType.DOC_NEEDS_CONVERSION)
     # 校验是否支持该文件类型，如果不存在则返回
     if load_func not in load_map:
         print(f"{DocumentValidationErrorType.UNSUPPORTED_FORMAT}")

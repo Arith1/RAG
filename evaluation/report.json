@@ -1,0 +1,306 @@
+{
+  "total": 25,
+  "k": 5,
+  "hit@1": 0.8,
+  "hit@3": 1.0,
+  "hit@5": 1.0,
+  "mean_top1_score": 0.8912,
+  "per_doc": {
+    "AI智能体开发框架LangChain.docx": {
+      "hit": 1,
+      "total": 1,
+      "rate": 1.0
+    },
+    "JWT认证原理与验证流程.md": {
+      "hit": 4,
+      "total": 4,
+      "rate": 1.0
+    },
+    "Redis入库队列设计与实现.md": {
+      "hit": 5,
+      "total": 5,
+      "rate": 1.0
+    },
+    "会话管理模型设计与实现.md": {
+      "hit": 4,
+      "total": 4,
+      "rate": 1.0
+    },
+    "意图识别模块设计与实现.md": {
+      "hit": 4,
+      "total": 4,
+      "rate": 1.0
+    },
+    "文档加载与切分模块设计与实现.md": {
+      "hit": 5,
+      "total": 5,
+      "rate": 1.0
+    },
+    "项目开发经验QA.md": {
+      "hit": 2,
+      "total": 2,
+      "rate": 1.0
+    }
+  },
+  "details": [
+    {
+      "id": "jwt-1",
+      "question": "JWT 的三段结构分别是什么？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "top1_score": 0.9234,
+      "actual_sources": [
+        "JWT认证原理与验证流程.md"
+      ]
+    },
+    {
+      "id": "jwt-2",
+      "question": "JWT 怎么防止 token 被篡改？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "top1_score": 0.9387,
+      "actual_sources": [
+        "JWT认证原理与验证流程.md"
+      ]
+    },
+    {
+      "id": "jwt-3",
+      "question": "什么是 JWT 算法混淆攻击？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "top1_score": 0.4728,
+      "actual_sources": [
+        "JWT认证原理与验证流程.md"
+      ]
+    },
+    {
+      "id": "jwt-4",
+      "question": "JWT 的过期时间是怎么判断的？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "top1_score": 0.9953,
+      "actual_sources": [
+        "JWT认证原理与验证流程.md"
+      ]
+    },
+    {
+      "id": "queue-1",
+      "question": "为什么用 Redis Streams 做入库任务队列？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.981,
+      "actual_sources": [
+        "Redis入库队列设计与实现.md"
+      ]
+    },
+    {
+      "id": "queue-2",
+      "question": "PEL 是什么？崩溃后未完成的任务怎么恢复？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.5698,
+      "actual_sources": [
+        "Redis入库队列设计与实现.md"
+      ]
+    },
+    {
+      "id": "queue-3",
+      "question": "入库任务失败重试超过几次会进入死信队列？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9856,
+      "actual_sources": [
+        "Redis入库队列设计与实现.md"
+      ]
+    },
+    {
+      "id": "queue-4",
+      "question": "入库时删除文档的竞态防护是怎么实现的？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9574,
+      "actual_sources": [
+        "Redis入库队列设计与实现.md"
+      ]
+    },
+    {
+      "id": "queue-5",
+      "question": "入库队列里 inflight 集合的作用是什么？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.6398,
+      "actual_sources": [
+        "Redis入库队列设计与实现.md"
+      ]
+    },
+    {
+      "id": "intent-1",
+      "question": "意图识别为什么要分规则层和 LLM 层？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9687,
+      "actual_sources": [
+        "意图识别模块设计与实现.md",
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "intent-2",
+      "question": "指代性追问（如'那它呢'）是怎么补全的？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.4415,
+      "actual_sources": [
+        "意图识别模块设计与实现.md"
+      ]
+    },
+    {
+      "id": "intent-3",
+      "question": "意图识别失败时的兜底策略是什么？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9744,
+      "actual_sources": [
+        "意图识别模块设计与实现.md"
+      ]
+    },
+    {
+      "id": "intent-4",
+      "question": "意图识别带 history 的指代补全完成度大概是多少？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9973,
+      "actual_sources": [
+        "会话管理模型设计与实现.md",
+        "意图识别模块设计与实现.md"
+      ]
+    },
+    {
+      "id": "session-1",
+      "question": "对话记忆的 checkpointer 支持哪两种后端？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9238,
+      "actual_sources": [
+        "会话管理模型设计与实现.md"
+      ]
+    },
+    {
+      "id": "session-2",
+      "question": "会话标识 thread_id 是怎么组成的？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9864,
+      "actual_sources": [
+        "会话管理模型设计与实现.md"
+      ]
+    },
+    {
+      "id": "session-3",
+      "question": "会话记忆的 TTL 过期清理规则是什么？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.9493,
+      "actual_sources": [
+        "会话管理模型设计与实现.md"
+      ]
+    },
+    {
+      "id": "session-4",
+      "question": "上下文达到多少时触发摘要压缩？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 2,
+      "top1_score": 0.8531,
+      "actual_sources": [
+        "会话管理模型设计与实现.md",
+        "意图识别模块设计与实现.md"
+      ]
+    },
+    {
+      "id": "loader-1",
+      "question": "word_complicatedness 评估文档复杂度有什么用？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 3,
+      "top1_score": 0.9733,
+      "actual_sources": [
+        "文档加载与切分模块设计与实现.md",
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "loader-2",
+      "question": "复杂文档为什么要走 MinerU 解析？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 2,
+      "top1_score": 0.9972,
+      "actual_sources": [
+        "文档加载与切分模块设计与实现.md",
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "loader-3",
+      "question": "表格和公式在切分时是怎么被保护的？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 1,
+      "top1_score": 0.78,
+      "actual_sources": [
+        "文档加载与切分模块设计与实现.md",
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "loader-4",
+      "question": "大文件入库时 smart_load 是怎么处理的？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 3,
+      "top1_score": 0.9955,
+      "actual_sources": [
+        "文档加载与切分模块设计与实现.md",
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "loader-5",
+      "question": "QA 文档的问答对为什么不能拆散，怎么保证？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 2,
+      "top1_score": 0.9911,
+      "actual_sources": [
+        "文档加载与切分模块设计与实现.md",
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "qa-1",
+      "question": "文件指纹有几把钥匙，各自作用是什么？",
+      "expected": "项目开发经验QA.md",
+      "hit_rank": 1,
+      "top1_score": 0.998,
+      "actual_sources": [
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "qa-2",
+      "question": "MySQL 和 Milvus 为什么用两阶段落库？",
+      "expected": "项目开发经验QA.md",
+      "hit_rank": 1,
+      "top1_score": 0.9872,
+      "actual_sources": [
+        "项目开发经验QA.md"
+      ]
+    },
+    {
+      "id": "langchain-1",
+      "question": "LangGraph 和 LangChain 有什么区别？",
+      "expected": "AI智能体开发框架LangChain.docx",
+      "hit_rank": 1,
+      "top1_score": 0.9992,
+      "actual_sources": [
+        "AI智能体开发框架LangChain.docx",
+        "项目开发经验QA.md"
+      ]
+    }
+  ]
+}

@@ -72,11 +72,16 @@ def download_zip(zip_url, retries=3):
         try:
             if attempt < retries:
                 # 前几次正常请求（走系统代理），应对 CDN 偶发抖动
-                return requests.get(zip_url, timeout=60).content
-            # 最后一次重试：绕过系统代理直连（本地代理常导致 SSL EOF）
-            session = requests.Session()
-            session.trust_env = False  # 忽略 HTTP_PROXY/HTTPS_PROXY 等环境变量
-            return session.get(zip_url, timeout=60).content
+                resp = requests.get(zip_url, timeout=60)
+            else:
+                # 最后一次重试：绕过系统代理直连（本地代理常导致 SSL EOF）
+                session = requests.Session()
+                session.trust_env = False  # 忽略 HTTP_PROXY/HTTPS_PROXY 等环境变量
+                resp = session.get(zip_url, timeout=60)
+            # 非 2xx（如预签名 URL 过期 403）按失败处理并重试，
+            # 避免把错误页字节当 zip 解压抛 BadZipFile 中断整批
+            resp.raise_for_status()
+            return resp.content
         except requests.exceptions.RequestException as e:
             print('download attempt {} failed:{}'.format(attempt, e), flush=True)
             time.sleep(2)
@@ -100,15 +105,25 @@ def download_and_extract(extract_results, output_root, file_paths) -> dict:
             print('{} 解析失败，原因:{}'.format(item["file_name"], err_msg), flush=True)
             results[src_path] = {"status": "failed", "output_dir": None, "md_path": None, "error": err_msg}
             continue
-        # full_zip_url 有时效性，拿到后尽快下载
-        zip_content = download_zip(item["full_zip_url"])
-        # 用 data_id 作目录后缀，同名文件产物也不会互相覆盖
-        output_dir = os.path.join(output_root, "{}_{}".format(item["file_name"], item["data_id"]))
-        # output_dir = os.path.join(output_root, "{}".format(item["file_name"]))
-        os.makedirs(output_dir, exist_ok=True)
-        # 内存流直接解压，不落盘临时 zip 文件
-        with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
-            zf.extractall(output_dir)
+        # full_zip_url 有时效性，拿到后尽快下载。
+        # 单文件下载/解压失败（URL 过期、zip 损坏等）只标记该文件失败，
+        # 不阻塞整批——download_zip 内部已重试，这里兜底隔离
+        try:
+            zip_content = download_zip(item["full_zip_url"])
+            # 用 data_id 作目录后缀，同名文件产物也不会互相覆盖
+            output_dir = os.path.join(output_root, "{}_{}".format(item["file_name"], item["data_id"]))
+            # output_dir = os.path.join(output_root, "{}".format(item["file_name"]))
+            os.makedirs(output_dir, exist_ok=True)
+            # 内存流直接解压，不落盘临时 zip 文件
+            with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
+                zf.extractall(output_dir)
+        except Exception as e:
+            print('{} 结果下载/解压失败，原因:{}'.format(item["file_name"], e), flush=True)
+            results[src_path] = {
+                "status": "failed", "output_dir": None, "md_path": None,
+                "error": f"结果下载/解压失败:{e}",
+            }
+            continue
         print('{} 解析结果已解压到:{}'.format(item["file_name"], output_dir), flush=True)
         # md_path 直接给到 full.md，下游无需感知产物目录结构
         results[src_path] = {

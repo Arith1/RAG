@@ -1,0 +1,220 @@
+"""对话编排：意图识别 + 查询提炼 → 向量检索 → 拼接 user_prompt → Agent 生成回答。
+
+流程（与产品定义一致）：
+  1. analyze(content, history)：一次 LLM 结构化输出，同时得到 intent 与提炼后的 query；
+     history 从对话记忆（Postgres checkpointer）读取最近几轮，用于把"它/那个/上面"
+     等指代补全为可独立检索的 query
+     - chat（闲聊）→ 只进入 LLM 对话，不检索
+     - rag_ask / other → 进入问答环节
+  2. search_documents(query)：对提炼后的 query 做向量检索
+  3. 检索结果与 query 拼接成 user_prompt
+  4. ask(user_prompt)：交给 Agent 生成回答
+  5. 返回 answer + intent + query + sources（来源引用）
+"""
+import asyncio
+from typing import List, Optional
+
+import openai
+from langchain_core.messages import HumanMessage
+
+from rag个人知识库.agent.ai_assist import ask, get_checkpointer
+from rag个人知识库.agent.intent import analyze
+from rag个人知识库.service.service import search_documents
+
+# analyze 用到的历史：最多取最近 N 轮（每轮 user+assistant 两条），单条截断长度
+HISTORY_MAX_TURNS = 3
+HISTORY_MAX_CHARS = 150
+
+
+def _msg_type(msg) -> Optional[str]:
+    """兼容 dict 与 BaseMessage 两种 checkpoint 消息表示。"""
+    if isinstance(msg, dict):
+        return msg.get("type")
+    return getattr(msg, "type", None)
+
+
+def _msg_content(msg) -> str:
+    """提取消息文本，兼容 str / 多模态 content 块列表。"""
+    content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        content = " ".join(parts)
+    return str(content or "")
+
+
+def load_recent_history(thread_id: str) -> Optional[str]:
+    """从对话记忆（checkpointer）读取最近几轮对话，格式化为 analyze 用的历史文本。
+
+    读的是与 agent 共用的同一份持久化记忆（Postgres / InMemory），不新增任何存储；
+    无历史 / 读取失败时返回 None（analyze 退化为无上下文的原逻辑）。
+    """
+    try:
+        tup = get_checkpointer().get_tuple({"configurable": {"thread_id": thread_id}})
+    except Exception as e:
+        print(f"[chat] 读取对话历史失败（不影响问答）：{e}")
+        return None
+    if tup is None:
+        return None
+    messages = tup.checkpoint.get("channel_values", {}).get("messages")
+    if not messages:
+        return None
+
+    lines = []
+    for msg in messages[-HISTORY_MAX_TURNS * 2:]:
+        mtype = _msg_type(msg)
+        if mtype == "human":
+            role = "用户"
+        elif mtype == "ai":
+            role = "助手"
+        else:
+            continue  # 跳过 tool / system 等
+        text = _msg_content(msg).strip()
+        if not text:
+            continue
+        lines.append(f"{role}：{text[:HISTORY_MAX_CHARS]}")
+    if not lines:
+        return None
+    return "\n".join(lines)
+
+
+def _friendly_model_error(exc: Exception) -> str:
+    """把常见的模型调用异常转换为用户可读的提示。"""
+    if isinstance(exc, openai.APITimeoutError):
+        return "模型响应超时，请稍后重试。"
+    if isinstance(exc, openai.APIConnectionError):
+        return "无法连接模型服务，请检查网络后重试。"
+    if isinstance(exc, openai.AuthenticationError):
+        return "模型 API Key 无效或没有访问权限。"
+    if isinstance(exc, openai.RateLimitError):
+        return "请求过于频繁，或 API 额度已用尽。"
+    if isinstance(exc, openai.APIStatusError):
+        if exc.status_code in (402, 429):
+            return "API 余额或调用额度可能不足，请检查账户。"
+        if exc.status_code in (401, 403):
+            return "模型 API Key 无效或没有访问权限。"
+        return f"模型服务返回错误：{exc.status_code}"
+    return "模型暂时不可用，请稍后重试。"
+
+
+def _build_context(hits: List[dict]) -> str:
+    """把检索命中结果拼成带编号的参考资料文本。"""
+    blocks = []
+    for index, hit in enumerate(hits, start=1):
+        source = hit.get("source") or "未知来源"
+        content = (hit.get("content") or "").strip()
+        blocks.append(f"[{index}] 来源：{source}\n{content}")
+    return "\n\n".join(blocks)
+
+
+def _build_user_prompt(query: str, hits: List[dict]) -> str:
+    """检索内容与 query 拼接成发给 Agent 的 user_prompt。"""
+    context = _build_context(hits)
+    return f"用户问题：{query}\n\n参考资料：\n{context}"
+
+
+async def chat(
+    content: str,
+    k: int = 3,
+    source: Optional[str] = None,
+    expr: Optional[str] = None,
+    thread_id: str = "default",
+) -> dict:
+    """对话统一入口：意图识别 → （闲聊直答 | 问答环节）。"""
+    # 第一步：意图识别 + 查询提炼（结合最近对话补全指代；读取失败则退化为无历史）
+    history = await asyncio.to_thread(load_recent_history, thread_id)
+    analysis = await asyncio.to_thread(analyze, content, history)
+
+    # 闲聊：只进入 LLM 对话，不做检索
+    if analysis.intent == "chat":
+        try:
+            answer = await asyncio.to_thread(
+                ask,
+                [HumanMessage(content=content)],
+                thread_id,
+            )
+        except Exception as exc:
+            return {
+                "answer": _friendly_model_error(exc),
+                "intent": analysis.intent,
+                "query": None,
+                "sources": [],
+                "hits": [],
+                "error": str(exc),
+            }
+        return {
+            "answer": answer,
+            "intent": analysis.intent,
+            "query": None,
+            "sources": [],
+            "hits": [],
+        }
+
+    # 当前没有文档上传/修改/删除等管理功能，遇到 other 直接明确提示，不触发检索
+    if analysis.intent == "other":
+        return {
+            "answer": "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。",
+            "intent": analysis.intent,
+            "query": None,
+            "sources": [],
+            "hits": [],
+        }
+
+    # 问答环节：用提炼后的 query 向量检索 → 拼接 user_prompt → Agent
+    query = analysis.query or content
+    hits = await search_documents(query, k=k, source=source, expr=expr)
+    if not hits:
+        return {
+            "answer": "知识库中未找到相关资料，请换个问法，或确认文档已入库。",
+            "intent": analysis.intent,
+            "query": query,
+            "sources": [],
+            "hits": [],
+        }
+
+    user_prompt = _build_user_prompt(query, hits)
+    try:
+        answer = await asyncio.to_thread(
+            ask,
+            [HumanMessage(content=user_prompt)],
+            thread_id,
+        )
+    except Exception as exc:
+        sources = [
+            {
+                "index": index,
+                "source": hit.get("source"),
+                "score": hit.get("score"),
+                "content": hit.get("content"),
+            }
+            for index, hit in enumerate(hits, start=1)
+        ]
+        return {
+            "answer": _friendly_model_error(exc),
+            "intent": analysis.intent,
+            "query": query,
+            "sources": sources,
+            "hits": hits,
+            "error": str(exc),
+        }
+
+    sources = [
+        {
+            "index": index,
+            "source": hit.get("source"),
+            "score": hit.get("score"),
+            "content": hit.get("content"),
+        }
+        for index, hit in enumerate(hits, start=1)
+    ]
+    return {
+        "answer": answer,
+        "intent": analysis.intent,
+        "query": query,
+        "sources": sources,
+        "hits": hits,
+    }

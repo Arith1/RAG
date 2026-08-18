@@ -27,6 +27,13 @@ def word_complicatedness(file_path: str) -> int:
 
     得分越高说明文档越复杂，越不适合用 UnstructuredWordDocumentLoader 直接解析。
     """
+    # 防御性检查：python-docx / zipfile 只能解析 OpenXML 的 .docx，
+    # 旧版二进制 .doc 会抛 PackageNotFoundError/BadZipFile，这里直接给出明确提示
+    if not file_path.lower().endswith(".docx"):
+        raise ValueError(
+            f"word_complicatedness 仅支持 .docx（OpenXML）格式，收到：{file_path}；"
+            "旧版 .doc 请先用 WPS/Word 另存为 .docx"
+        )
     score = 0
     doc = DocxDocument(file_path)
 

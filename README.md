@@ -1,43 +1,56 @@
-# rag-project · 文件指纹增量入库的 RAG 知识库
+# RAG 个人知识库
 
-基于**文件指纹 + MySQL/Milvus 双库协作**的 RAG 知识库系统：文件入库时自动判定同名同源、内容是否变化，做到「未变跳过、变更更新、失败重试」的增量同步；检索侧双路召回 + 重排精排，并支持按文档过滤。
+基于**文件指纹增量同步 + MySQL/Milvus 双库协作**的 RAG 问答系统：文档入库自动判定同名同源与内容变化（未变跳过 / 变更增量更新 / 失败可重试），检索侧双路召回 + 重排精排，接入 Agent 生成带来源引用的回答；配套完整 Web 服务（JWT + RBAC）、会话记忆（Postgres 持久化）、可靠入库任务队列（Redis Streams）。
 
-> 核心亮点：MySQL 元数据与 Milvus 向量通过**两阶段落库 + 同步状态机**保障跨库一致性，杜绝孤儿向量与丢失向量。
+> 核心亮点：**四存储各司其职**——MySQL（元数据权威）、Milvus（向量检索）、Postgres（对话记忆）、Redis（任务队列/限流）；两阶段落库 + 状态机保障跨库一致性，杜绝孤儿向量；Redis/PG 故障优雅降级，系统不中断。
 
 ---
 
 ## 功能特性
 
-- **文件指纹增量入库**：`file_name + source` 判定同名同源，`内容 SHA256` 判定是否变化——未变直接跳过加载、变更只更新差集、全新入库、失败可重跑。
-- **跨库一致性保障**：MySQL 先落「期望状态」（`pending`）→ Milvus 幂等同步 → `in_sync` / `failed` 状态机；失败重试按 source 单文件重建，可清理中途失败残留的孤儿向量。
-- **结构感知切分**：Markdown 标题分节、公式/表格原子块保护、超长表格自动拆分子表并重复表头。
-- **高质量检索**：dense（bge-m3）+ BM25 双路召回 → RRF 融合 → bge-reranker 精排 → 阈值过滤；支持 `source` / 原生表达式过滤。
-- **异步化**：Milvus 写入、删除、检索均封装为异步版本（线程池执行），便于后续接入 FastAPI。
-- **业务层与 CLI 解耦**：`service` 层返回 JSON 友好结构，CLI 只是薄壳，前端可直接复用。
+- **文件指纹增量入库**：`identity_hash` 判定同名同源，`file_content_hash` 判定内容变化——skip / insert / update / retry 四态分流，只增量更新差集。
+- **跨库一致性**：MySQL 先落期望状态（`pending`）→ Milvus 幂等同步 → `in_sync`/`failed` 状态机；失败重试按 source 重建，可清理孤儿向量。
+- **结构感知切分**：Markdown 标题分节、**表格/公式/问答对原子保护**（占位符 + 还原长度分组）、超长表格自动拆子表并重复表头、图片路径入 metadata。
+- **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤。
+- **Agent 问答**：意图识别（规则层 + LLM 查询重构，多轮指代补全）→ 检索 → DeepSeek Agent 生成带来源引用回答；对话记忆按用户隔离。
+- **会话记忆**：Postgres 持久化（跨重启/多 worker），TTL 按"最后活跃时间"自动清理，~20 轮对话自动摘要压缩。
+- **可靠入库队列**：Redis Streams（Consumer Group + PEL 崩溃恢复、指数退避重试、死信队列、inflight 竞态防护 409）。
+- **Web 服务**：FastAPI + JWT 认证 + RBAC（管理员管理文档 / 普通用户只读问答）+ 操作审计 + 登录限流 + 路径脱敏。
+- **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索对比实验、43 个 pytest 用例。
 
-## 架构
+## 系统架构
 
 ```mermaid
 flowchart LR
-    subgraph 入库管线
-        A[文档] --> B[预检·计算指纹]
-        B --> C{内容变化?}
-        C -- 未变且已同步 --> D[跳过]
-        C -- 变更 / 全新 --> E[加载 + 结构切分]
-        E --> F[(MySQL 落期望状态 pending)]
-        F --> G[(Milvus 幂等同步)]
-        G --> H[置为 in_sync]
-        G -.失败.-> I[failed + last_error]
-        I --> B
+    subgraph Web["FastAPI 服务"]
+        A["/chat 问答页<br/>/api/*"]
+        B[认证 JWT + RBAC]
+        C[文档管理<br/>上传/删除/列表]
+        D[问答编排<br/>意图识别→检索→Agent]
     end
 
-    subgraph 检索管线
-        Q[问题] --> R[双路召回<br/>dense + BM25]
-        R --> S[RRF 融合]
-        S --> T[bge-reranker 精排]
-        T --> U[阈值过滤]
-        U --> V[结果 + 来源]
+    subgraph 入库管线
+        E[文件] --> F{复杂度评估}
+        F -- 简单 --> G[Unstructured 本地解析]
+        F -- 复杂 --> H[MinerU 云端解析]
+        G & H --> I[结构感知切分]
+        I --> J[Redis Streams 队列]
+        J --> K[worker: 两阶段落库]
+        K --> L[(MySQL 元数据)]
+        K --> M[(Milvus 向量)]
     end
+
+    subgraph 检索问答
+        Q[问题] --> D
+        D --> N[双路召回 dense+BM25]
+        N --> O[RRF + rerank 精排]
+        O --> P[阈值过滤 + 来源引用]
+        P --> D
+    end
+
+    D --> R[(Postgres 对话记忆)]
+    C --> S[(Redis: ingest 队列/限流)]
+    L --> T[状态机 in_sync/failed]
 ```
 
 **同步状态机**
@@ -56,25 +69,30 @@ stateDiagram-v2
 | 层 | 选型 |
 | --- | --- |
 | 语言 / 运行时 | Python 3.14+ |
+| Web 框架 | FastAPI + uvicorn |
 | 元数据存储 | MySQL 8.x + SQLAlchemy 2.0（async）+ aiomysql |
 | 向量存储 | Milvus 2.x + pymilvus + langchain-milvus |
+| 对话记忆 | Postgres（langgraph-checkpoint-postgres）+ TTL 清理 |
+| 任务队列 / 限流 | Redis 8 + redis-py（Streams） |
 | Embedding / Rerank | SiliconFlow：`BAAI/bge-m3`、`BAAI/bge-reranker-v2-m3` |
-| 文档解析 | MinerU（复杂文档）+ Unstructured（简单文档） |
-| 框架 | langchain 生态（core / community / text-splitters） |
+| 文档解析 | MinerU（复杂文档）+ Unstructured（简单文档）+ python-docx |
+| LLM / Agent | DeepSeek + langchain 1.x（create_agent / LangGraph checkpointer） |
+| 测试 | pytest（43 用例） |
 
 ## 快速开始
 
 ### 环境要求
 
 - Python 3.14+
-- MySQL 8.x（本地或远程均可）
-- Milvus（Docker 一键启动）
+- MySQL 8.x、Milvus 2.x、Redis 7+、Postgres 16+（本地或 Docker）
 
 ```bash
-# 启动 Milvus standalone
-docker run -d --name milvus \
-  -p 19530:19530 -p 9091:9091 \
-  milvusdb/milvus:v2.5.4 standalone
+# 启动四个依赖服务（已有可跳过）
+docker run -d --name milvus -p 19530:19530 -p 9091:9091 milvusdb/milvus:v2.5.4 standalone
+docker run -d --name redis  -p 6379:6379 redis:7
+docker run -d --name pg-mem -e POSTGRES_USER=root -e POSTGRES_PASSWORD=root \
+  -e POSTGRES_DB=rag-demo -p 5432:5432 postgres:16
+# MySQL 请自行准备（本机安装或容器）
 ```
 
 ### 安装
@@ -82,13 +100,8 @@ docker run -d --name milvus \
 ```bash
 git clone https://github.com/Arith1/RAG-.git
 cd rag_project
-
-# 推荐使用 uv
 uv sync
-
-# 复制环境变量模板并填写密钥
-cp .env.example .env
-# Windows: copy .env.example .env
+cp .env.example .env   # 填写各密钥（见下表）
 ```
 
 `.env` 必需配置项：
@@ -96,62 +109,65 @@ cp .env.example .env
 | 变量 | 说明 |
 | --- | --- |
 | `ASYNC_DATABASE_URL` | MySQL 连接串，如 `mysql+aiomysql://root:root@localhost:3306/rag_demo?charset=utf8` |
-| `SILICONFLOW_API_KEY` | SiliconFlow 密钥（embedding + rerank 用） |
-| `MINERU_API_TOKEN` | MinerU 解析服务 Token（复杂 Word/PDF 用） |
+| `SILICONFLOW_API_KEY` | SiliconFlow 密钥（embedding + rerank） |
+| `MINERU_API_TOKEN` | MinerU 解析服务 Token（复杂 Word/PDF） |
 | `MILVUS_URI` | Milvus 地址，默认 `http://localhost:19530` |
+| `MEMORY_DATABASE_URL` | Postgres 连接串（对话记忆），如 `postgresql://root:root@localhost:5432/rag-demo` |
+| `REDIS_URL` | Redis 连接串，默认 `redis://localhost:6379/0` |
+| `DEEPSEEK_API_KEY` | DeepSeek 密钥（问答生成） |
+| `JWT_SECRET` | JWT 签名密钥（生产环境务必改为强随机串） |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 首次启动播种的管理员账号 |
 
 ### 初始化数据库
 
 ```bash
+# 1. MySQL 业务表（users / vector_files / chunk_records / audit_logs）
 mysql -uroot -p -e "CREATE DATABASE rag_demo CHARACTER SET utf8mb4;"
 mysql -uroot -p rag_demo < rag个人知识库/models/vector.sql
+
+# 2. Postgres 对话记忆：langgraph 首次使用自动建 checkpoint 表；
+#    再执行一次补充 created_at 列（TTL 清理的时间依据，幂等）
+psql -U root -d rag-demo -f rag个人知识库/models/postgres_memory.sql
 ```
 
-> 表结构采用**手动 SQL 管理**（`models/vector.sql`），代码不做自动迁移，避免隐式改表。
+> 表结构采用**手动 SQL 管理**（`models/*.sql`），代码不做任何 DDL，改表后需同步 SQL 文件并手动执行。
 
-### 入库文档
+### 启动服务
 
 ```bash
-# 把待入库文档放入 rag个人知识库/resources/（该目录已 gitignore），
-# 或直接修改 main.py 中的 file_path_list
+uvicorn rag个人知识库.api.main:app --host 0.0.0.0 --port 8010
+```
+
+- **问答页面**：http://localhost:8010/chat （登录后提问）
+- **Swagger 文档**：http://localhost:8010/docs
+- **队列状态**：`GET /api/ingest/stats`
+
+启动日志确认：`Redis 可用 → 入库任务队列已启用`、`对话记忆已启用 Postgres 持久化`（任一不可用会自动降级并提示）。
+
+### 入库文档（两种方式）
+
+```bash
+# 方式一：API 上传（走 Redis 队列，管理员）
+curl -X POST http://localhost:8010/api/documents/upload \
+  -H "Authorization: Bearer <token>" -F "file=@path/to/doc.md"
+
+# 方式二：CLI 批量入库（修改 main.py 的 file_path_list 后）
 python -m rag个人知识库.main ingest
 ```
 
 输出示例：`全新入库 v1.0` / `内容变更，已更新（新增 3 / 未变 20 / 删除 1）` / `内容未变，已跳过`。
 
-### 检索
+### 文档入库约定（重要）
 
-```bash
-# 列出已入库文档
-python -m rag个人知识库.main search --list
+系统采用**"人工轻约定 + 程序自动转换"**的分层策略，不需要精细排版。人工保证三点（每篇约 1 分钟）：
 
-# 全库检索
-python -m rag个人知识库.main search "LangChain 是什么" -k 3
+1. **有基本标题层级**（Markdown `#`~`####`）——标题是结构切分的主信号；
+2. **文本类优先转 md/txt**——本地解析免费、切分最准；扫描件/复杂排版自动走 MinerU；
+3. **编码保持 UTF-8**（GBK 有兜底，但 UTF-8 最稳）。
 
-# 指定文档内检索
-python -m rag个人知识库.main search "LangChain 是什么" --source "F:\path\AI智能体开发框架LangChain.docx"
-```
+程序自动处理：格式/大小校验 → 编码回退 → 复杂度评估分流 → 结构感知切分（标题分节、表格/公式/**问答对**原子保护）→ 增量同步。
 
-## 项目结构
-
-```
-rag_project/
-├─ rag个人知识库/
-│  ├─ main.py                # CLI 入口（ingest / search）
-│  ├─ service/
-│  │  ├─ ingest.py           # 入库编排：两阶段落库 + Milvus 同步
-│  │  └─ service.py          # 业务层：ingest_files / search_documents / list_documents
-│  ├─ loader/
-│  │  ├─ load_file.py        # 文档加载（docx/pdf/md/txt，UTF-8/GBK 回退）
-│  │  └─ parser/             # MinerU / Word 复杂度解析
-│  ├─ spliter/               # 结构感知切分
-│  ├─ vector_store/          # Milvus 存取 + 双路召回 + rerank 精排
-│  ├─ crud/                  # MySQL 数据访问
-│  ├─ models/                # SQLAlchemy 模型 + 建表 SQL（models/vector.sql）
-│  ├─ config/                # 数据库引擎与会话
-│  └─ utils/                 # 指纹哈希
-└─ .env.example              # 环境变量模板
-```
+决策规则：单篇整理 < 5 分钟就人工整理；同一种脏格式出现 ≥ 3 次才写代码适配（如问答对原子保护）；偶发怪文档清洗一次或不入库。
 
 ## 核心设计
 
@@ -163,7 +179,7 @@ rag_project/
 | `file_content_hash` | `SHA256(文件字节)` | 文件内容是否变化 |
 | `chunk_fingerprint` | `SHA256(source \| content)` | chunk 去重，同时作为 **Milvus 主键** |
 
-> 指纹全部以 `source` 参与哈希，保证 MySQL 指纹与 Milvus 主键口径完全一致，是增量更新与幂等写入的基础。
+> 指纹全部以 `source` 参与哈希，保证 MySQL 指纹与 Milvus 主键口径一致，是增量更新与幂等写入的基础。
 
 ### 增量入库流程
 
@@ -177,12 +193,87 @@ rag_project/
 
 ### 跨库一致性（两阶段 + 状态机）
 
-1. **阶段一（MySQL）**：把期望状态落库并提交（`sync_status=pending`）。失败即回滚，此时 Milvus 完全未动，不会产生孤儿向量。
-2. **阶段二（Milvus）**：按确定性 ID 幂等同步（先删后插）。成功置 `in_sync`；失败置 `failed + last_error`，期望状态保留在 MySQL，重跑自动恢复。
+1. **阶段一（MySQL）**：把期望状态落库并提交（`sync_status=pending`）。失败即回滚，Milvus 完全未动，不产生孤儿向量。
+2. **阶段二（Milvus）**：按确定性 ID 幂等同步（先删后插）。成功置 `in_sync`；失败置 `failed + last_error`，重跑自动恢复。
+
+### 入库任务队列（Redis Streams）
+
+```
+上传 → XADD ingest_queue → worker XREADGROUP 消费 → ingest_files()
+     ├─ 成功 → XACK + XDEL（消息不滞留）
+     ├─ 失败 → 指数退避重入队（2s/4s），超 3 次进死信队列
+     └─ 崩溃 → PEL 残留任务由 XAUTOCLAIM 重启回收
+```
+
+- `ingest:inflight` 集合标记"正在入库"，删除接口返回 **409**，防"上传后立刻删除"的孤儿向量竞态；
+- Redis 不可用 → 自动回退进程内后台任务，系统不中断。
+
+### 会话记忆（Postgres + TTL + 摘要）
+
+- 记忆按 `thread_id = {user_id}:{session_id}` 隔离，Postgres 持久化（跨重启/多 worker）；
+- **TTL**：以线程"最后活跃时间"为准，超过 `MEMORY_TTL_DAYS`（默认 1 天）整线程清理（后台任务周期执行）；
+- **摘要**：约 20 轮对话（40 条消息）或 6000 tokens 触发 SummarizationMiddleware 压缩，保留最近 10 条，上下文不无限增长。
+
+## 评测与测试
+
+```bash
+# 检索评测（golden 集 25 题 → hit@k + 精排分）
+python -m evaluation.run_evaluation
+
+# 分层检索对比实验（普通块 vs 子→父）
+python -m evaluation.experiment_parent_child
+
+# 单元测试
+python -m pytest tests/
+```
+
+当前基线：**hit@1 = 80% / hit@3 = 100% / hit@5 = 100%**，平均精排分 0.89（`evaluation/report.json`）。
+
+## API 一览
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/api/auth/register` | 公开 | 注册（默认普通用户） |
+| POST | `/api/auth/login` | 公开 | 登录，返回 JWT |
+| GET | `/api/auth/me` | 登录 | 当前用户信息 |
+| POST | `/api/documents/upload` | 管理员 | 上传文档（异步队列入库） |
+| GET | `/api/documents` | 登录 | 文档列表（source 脱敏） |
+| DELETE | `/api/documents/{id}` | 管理员 | 删除文档（正在入库返回 409） |
+| POST | `/api/chat` | 登录 | 知识库问答（多轮记忆） |
+| POST | `/api/search` | 登录 | 语义检索 |
+| GET | `/api/ingest/stats` | 登录 | 入库队列状态 |
+| GET | `/chat` | 公开 | 浏览器问答页面 |
+| GET | `/docs` | 公开 | Swagger |
+
+## 项目结构
+
+```
+rag_project/
+├─ rag个人知识库/
+│  ├─ api/                  # FastAPI：main(路由) / auth(JWT+RBAC+限流) / static(问答页)
+│  ├─ agent/                # ai_assist(Agent+记忆) / intent(意图+查询重构) / model(DeepSeek)
+│  ├─ service/              # ingest(入库编排) / chat(问答编排) / document_admin(删除)
+│  │                        # ingest_queue(Redis Streams) / memory_maintenance(TTL清理)
+│  ├─ loader/               # 文档加载（docx/pdf/md/txt，复杂度评估 + MinerU 分流）
+│  ├─ spliter/              # 结构感知切分（标题分节 + 原子块保护）
+│  ├─ vector_store/         # Milvus 存取 + 双路召回 + rerank
+│  ├─ crud/                 # MySQL 数据访问
+│  ├─ models/               # SQLAlchemy 模型 + 建表 SQL（vector.sql / postgres_memory.sql）
+│  ├─ config/               # db_config(MySQL) / redis(Redis)
+│  └─ utils/                # 指纹哈希
+├─ evaluation/              # golden 评测集 + 评测/实验脚本 + 报告
+├─ tests/                   # pytest 单元测试（43 用例）
+└─ .env.example             # 环境变量模板
+```
 
 ## 路线图
 
-- [ ] FastAPI 后端 + Web 前端（文档管理 / 对话界面）
-- [ ] LLM 问答：RAG 检索结果 + 大模型生成，带来源引用
-- [ ] 核心逻辑单元测试（指纹、差集、状态机）
-- [ ] 文件存储抽象层（本地实现，可插拔切换阿里 OSS）
+- [x] 增量同步 + 双库一致性状态机
+- [x] FastAPI 后端（JWT + RBAC + 文档管理 + 问答/检索接口）
+- [x] Agent 问答 + 多轮记忆（Postgres 持久化 + TTL + 摘要）
+- [x] Redis Streams 入库任务队列 + 竞态防护
+- [x] golden 评测集 + 分层检索对比实验 + pytest 套件
+- [ ] docker-compose 一键编排（MySQL/Milvus/Redis/Postgres/API）
+- [ ] SSE 流式输出
+- [ ] 分层检索（Parent-Child）落地（实验结论已具备）
+- [ ] Agentic RAG（检索工具化，多轮反思检索）

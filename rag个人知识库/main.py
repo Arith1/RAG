@@ -1,16 +1,18 @@
-"""RAG 知识库命令行入口：入库 / 检索两个子命令（业务逻辑在 service 层，前端可复用）。
+"""RAG 知识库命令行入口：入库 / 检索 / 问答三个子命令（业务逻辑在 service 层，前端可复用）。
 
 用法：
   python -m rag个人知识库.main ingest                    # 入库/增量同步
   python -m rag个人知识库.main search --list             # 列出已入库文档
   python -m rag个人知识库.main search "查询词" -k 3       # 全库检索
   python -m rag个人知识库.main search "查询词" --source "路径"  # 指定文档内检索
+  python -m rag个人知识库.main chat "LangChain 是什么" -k 3  # 基于知识库问答
 """
 
 import argparse
 import asyncio
 
 from rag个人知识库.config.db_config import engine
+from rag个人知识库.service.chat import chat
 from rag个人知识库.service.service import ingest_files, list_documents, search_documents
 
 file_path_list = [
@@ -49,6 +51,11 @@ async def run_ingest(_args) -> None:
         print(line)
 
 
+def _format_score(score) -> str:
+    """精排分为 None 说明 rerank 服务降级（按召回顺序返回），避免显示 'None'"""
+    return f"{score}" if score is not None else "—（精排降级，按召回顺序）"
+
+
 async def run_search(args) -> None:
     """查询入口：列出已入库文档，或按指定文档检索（双路召回 + rerank 精排）"""
     if args.list:
@@ -63,8 +70,30 @@ async def run_search(args) -> None:
         print("  未检索到相关结果")
         return
     for rank, hit in enumerate(hits, start=1):
-        print(f"Top{rank}（精排分 {hit['score']}）: {hit['content'][:120]}...")
+        print(f"Top{rank}（精排分 {_format_score(hit['score'])}）: {hit['content'][:120]}...")
         print(f"  来源：{hit['source']}")
+
+
+async def run_chat(args) -> None:
+    """问答入口：意图识别 → 向量检索 → Agent 生成回答"""
+    if not args.query:
+        print('请提供问题，例如：python -m rag个人知识库.main chat "LangChain 是什么"')
+        return
+
+    print(f"\n[问答] 问题：{args.query}")
+    result = await chat(
+        args.query,
+        k=args.top_k,
+        source=args.source,
+        expr=args.expr,
+    )
+
+    print("\n[回答]")
+    print(result["answer"])
+    if result.get("sources"):
+        print("\n[来源]")
+        for source in result["sources"]:
+            print(f"  [{source['index']}] {source['source']}（精排分 {_format_score(source['score'])}）")
 
 
 async def _print_documents() -> None:
@@ -80,7 +109,7 @@ async def _print_documents() -> None:
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="RAG 知识库：入库 / 检索")
+    parser = argparse.ArgumentParser(description="RAG 知识库：入库 / 检索 / 问答")
     subparsers = parser.add_subparsers(dest="command")
 
     ingest_parser = subparsers.add_parser("ingest", help="入库/增量同步")
@@ -93,6 +122,13 @@ async def main() -> None:
     search_parser.add_argument("--source", help="只在该文档（source）内检索，需与入库 source 一致")
     search_parser.add_argument("--expr", help="原生 Milvus 过滤表达式（与 --source 二选一，同时传以 --source 为准）")
     search_parser.set_defaults(handler=run_search)
+
+    chat_parser = subparsers.add_parser("chat", help="基于知识库的智能问答")
+    chat_parser.add_argument("query", help="用户问题")
+    chat_parser.add_argument("-k", "--top-k", type=int, default=3, help="检索召回条数（默认 3）")
+    chat_parser.add_argument("--source", help="只在该文档（source）内检索")
+    chat_parser.add_argument("--expr", help="原生 Milvus 过滤表达式")
+    chat_parser.set_defaults(handler=run_chat)
 
     args = parser.parse_args()
     handler = getattr(args, "handler", None)

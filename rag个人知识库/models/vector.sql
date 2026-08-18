@@ -1,11 +1,50 @@
 -- ============================================
+-- RAG 个人知识库 · MySQL 业务库完整表结构
+-- 说明：新环境初始化直接执行本文件（users / vector_files / chunk_records / audit_logs）；
+--       表结构变更一律改本文件后手动执行，应用代码不做任何 DDL。
+-- 执行：mysql -u root -p rag_demo < models/vector.sql
+-- ============================================
+
+-- ============================================
+-- 0. 用户表 (users) —— RBAC 权限根
+-- ============================================
+CREATE TABLE `users` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `username` VARCHAR(64) NOT NULL COMMENT '用户名',
+    `password_hash` VARCHAR(128) NOT NULL COMMENT 'bcrypt 密码哈希',
+    `role` VARCHAR(16) NOT NULL DEFAULT 'user' COMMENT '角色: admin(管理员)/user(普通用户)',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_username` (`username`) COMMENT '用户名唯一'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表（RBAC）';
+
+-- ============================================
+-- 0.1 审计日志表 (audit_logs)
+-- ============================================
+CREATE TABLE `audit_logs` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `user_id` BIGINT UNSIGNED NULL COMMENT '操作用户 id',
+    `username` VARCHAR(64) NULL COMMENT '操作用户名（冗余，防用户删除后审计丢失）',
+    `action` VARCHAR(32) NOT NULL COMMENT '操作类型: register/login_failed/upload/delete 等',
+    `target` VARCHAR(512) NULL COMMENT '操作对象（文件名/路径等）',
+    `detail` TEXT NULL COMMENT '补充信息',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+
+    PRIMARY KEY (`id`),
+    KEY `idx_username` (`username`) COMMENT '按用户查审计'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='操作审计日志';
+
+-- ============================================
 -- 1. 文件管理表 (vector_files)
 -- ============================================
 
 CREATE TABLE `vector_files` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
-    `file_name` VARCHAR(256) NOT NULL COMMENT '文件名',
-    `source` VARCHAR(256) NOT NULL COMMENT '来源标识（如文件路径/URL）',
+    `file_name` VARCHAR(512) NOT NULL COMMENT '文件名',
+    `source` VARCHAR(512) NOT NULL COMMENT '来源标识（如文件路径/URL）',
     `identity_hash` CHAR(64) NOT NULL COMMENT '文件身份唯一标识(SHA256(file_name+source))',
     `file_content_hash` CHAR(64) NOT NULL COMMENT '整个文件内容的 SHA256,用来判断文件内容是否修改',
     `version` DECIMAL(5,1) NOT NULL DEFAULT 1.0 COMMENT '当前版本号（如 1.0, 2.0）',

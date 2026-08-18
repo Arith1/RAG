@@ -9,6 +9,7 @@ class DocumentValidationErrorType:
     EMPTY_FILE = "空文件"  # 空文件
     ENCODING_ERROR = "编码错误" # 编码错误
     NOT_FOUND_FILE = "文件不存在或路径错误"
+    DOC_NEEDS_CONVERSION = "暂不支持旧版 .doc 格式，请用 WPS/Word 打开后另存为 .docx 再入库"
 
 class DocumentValidationError:
     file_path: str

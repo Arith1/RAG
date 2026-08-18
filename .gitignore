@@ -10,3 +10,7 @@ __pycache__/
 *.pyc
 .idea/
 .DS_Store
+
+# 测试产物/缓存（保留 tests/*.py 源码）
+.pytest_cache/
+/_test_*_tmp/

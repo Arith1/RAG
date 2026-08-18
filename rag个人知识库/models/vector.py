@@ -33,12 +33,12 @@ class VectorFile(Base):
         comment='自增主键'
     )
     file_name: Mapped[str] = mapped_column(
-        String(256),
+        String(512),
         nullable=False,
         comment='文件名'
     )
     source: Mapped[str] = mapped_column(
-        String(256),
+        String(512),
         nullable=False,
         comment='来源标识（如文件路径/URL）'
     )

@@ -33,6 +33,13 @@ DEFAULT_CHUNK_OVERLAP = 50
 _FORMULA_RE = re.compile(r'\$\$.*?\$\$', re.DOTALL)
 # 表格：连续的以 | 开头的行
 _TABLE_RE = re.compile(r'(?:^\|[^\n]*\|[ \t]*\n?)+', re.MULTILINE)
+# 问答对（QA 文档）：**Q：...** 与紧随的 A：... 视为一个原子单元，防止 Q 和 A 被 chunk 边界拆散。
+# 注意 MarkdownHeaderTextSplitter 会把段落间 \n\n 规范化为硬换行（两个空格+\n），
+# 因此分隔符兼容 "  \n" / "\n" / "\n\n" 三种形态；
+# ① Q 锚定行首（^），避免正文里引用的 "**Q：...**" 字样被误识别为问答对开头；
+# ② 结尾 lookahead 直接匹配"分隔符 + 下一对 Q"，让匹配在段间分隔符之前停下，
+#    分隔符保留在占位符之间，后续才能按段落切分（否则整节粘成一个 chunk）
+_QA_PAIR_RE = re.compile(r'(?m)^\*\*Q：.*?\*\*[ \t]*\n+[ \t]*A：.*?(?=[ \t]*\n+[ \t]*\*\*Q：|\Z)', re.DOTALL)
 # Markdown 图片链接：![alt](path)
 _IMAGE_RE = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
 
@@ -68,7 +75,11 @@ def _normalize_long_tables(text: str, max_chunk_size: int) -> str:
 
 
 def _protect_atomic_blocks(text: str) -> Tuple[str, Dict[str, str]]:
-    """把公式/表格替换为占位符，返回 (替换后的文本, {占位符: 原始块})，防止被字符切分拦腰切断"""
+    """把公式/表格/问答对替换为占位符，返回 (替换后的文本, {占位符: 原始块})，防止被字符切分拦腰切断。
+
+    问答对最外层先保护：其 A 回答中可能内嵌公式/表格，作为整体保护后，
+    内部内容不会再生成嵌套占位符，还原时无需考虑嵌套顺序。
+    """
     blocks: Dict[str, str] = {}
 
     def _repl(match):
@@ -76,6 +87,7 @@ def _protect_atomic_blocks(text: str) -> Tuple[str, Dict[str, str]]:
         blocks[key] = match.group(0)
         return key
 
+    text = _QA_PAIR_RE.sub(_repl, text)
     text = _FORMULA_RE.sub(_repl, text)
     text = _TABLE_RE.sub(_repl, text)
     return text, blocks
@@ -86,6 +98,45 @@ def _restore_atomic_blocks(text: str, blocks: Dict[str, str]) -> str:
     for key, block in blocks.items():
         text = text.replace(key, block)
     return text
+
+
+_ATOMIC_TOKEN_RE = re.compile(r'<ATOMIC_\d+>')
+
+
+def _effective_len(text: str, blocks: Dict[str, str]) -> int:
+    """按"还原后"长度计算：占位符按其原始块长度计，其余文本按字符数计。
+
+    避免占位符让文本显得很短、导致整节问答对堆进一个超长 chunk。
+    """
+    total, tokens_len = 0, 0
+    for token in _ATOMIC_TOKEN_RE.findall(text):
+        tokens_len += len(token)
+        total += len(blocks.get(token, token))
+    return total + (len(text) - tokens_len)
+
+
+def _split_by_restored_length(protected: str, blocks: Dict[str, str], max_chunk_size: int) -> List[str]:
+    """按段落切分受保护文本、并按"还原后长度"贪心分组：
+    - 原子块（公式/表格/问答对）作为整体永不被拆散
+    - 每组还原后总长度 ≤ max_chunk_size（单段本身超限时独立成组，不强行切原子块）
+    仅在存在原子块时使用；纯文本 section 仍走字符切分器。
+    """
+    parts = re.split(r'(\n+)', protected)  # [段, 分隔符, 段, ...]
+    groups: List[List[str]] = [[]]
+    cur_len = 0
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        sep = parts[i + 1] if i + 1 < len(parts) else ""
+        piece = seg + sep
+        if not piece.strip():
+            continue
+        eff = _effective_len(piece, blocks)
+        if groups[-1] and cur_len + eff > max_chunk_size:
+            groups.append([])
+            cur_len = 0
+        groups[-1].append(piece)
+        cur_len += eff
+    return ["".join(g).strip() for g in groups if "".join(g).strip()]
 
 
 def _header_path(metadata: dict) -> str:
@@ -126,9 +177,12 @@ def split_markdown_hybrid(
             if images:
                 merged_meta["images"] = ",".join(images)
 
-            # 公式/表格替换为占位符后再切分，保证原子性
+            # 公式/表格/问答对替换为占位符后再切分，保证原子性
             protected, blocks = _protect_atomic_blocks(section.page_content)
-            if len(protected) > max_chunk_size:
+            if blocks:
+                # 存在原子块：按"还原后长度"在段落间分组，原子块不拆散且 chunk 不超长
+                sub_texts = _split_by_restored_length(protected, blocks, max_chunk_size)
+            elif len(protected) > max_chunk_size:
                 sub_texts = char_splitter.split_text(protected)
             else:
                 sub_texts = [protected]

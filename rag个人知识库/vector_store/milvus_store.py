@@ -265,9 +265,14 @@ def search_with_rerank(
             top_n=len(candidates),
         )
     except Exception as e:
-        # 精排只是质量增强，接口/响应异常时退回双路召回结果，保检索可用
+        # 精排只是质量增强，接口/响应异常时退回双路召回结果，保检索可用；
+        # 降级结果没有精排分，显式写 None 并打 rerank_degraded 标记，供展示层区分
         print(f"[Rerank] 接口调用失败，降级返回召回 Top{k}：{e}")
-        return candidates[:k]
+        degraded = candidates[:k]
+        for doc in degraded:
+            doc.metadata["rerank_score"] = None
+            doc.metadata["rerank_degraded"] = True
+        return degraded
 
     reranked = []
     for item in results:
