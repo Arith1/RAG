@@ -7,9 +7,10 @@
 from typing import List, Optional
 
 from rag个人知识库.config.db_config import AsyncSession
+from rag个人知识库.config.redis import cache_get, cache_key, cache_set
 from rag个人知识库.crud.vector import select_file_names
 from rag个人知识库.service.ingest import ingest_files_batched
-from rag个人知识库.vector_store.milvus_store import asearch_with_rerank
+from rag个人知识库.vector_store.milvus_store import SEARCH_CACHE_TTL, asearch_with_rerank
 
 
 async def ingest_files(file_paths: List[str]) -> List[dict]:
@@ -29,10 +30,16 @@ async def search_documents(
 ) -> List[dict]:
     """检索：双路召回 Top recall_k → bge-reranker 精排 → 阈值过滤取 Top k。
 
-    返回 JSON 友好的命中列表：[{content, score, source, metadata}, ...]
+    结果按 (query, k, source, expr) 缓存到 Redis（SEARCH_CACHE_TTL，默认 10 分钟），
+    相同问题秒回，省 embedding + rerank 调用。返回 JSON 友好的命中列表。
     """
+    cache_key_ = cache_key("search", query, k, source or "", expr or "")
+    cached = await cache_get(cache_key_)
+    if cached is not None:
+        return cached
+
     hits = await asearch_with_rerank(query, k=k, expr=expr, source=source)
-    return [
+    result = [
         {
             "content": hit.page_content,
             "score": hit.metadata.get("rerank_score"),
@@ -41,6 +48,8 @@ async def search_documents(
         }
         for hit in hits
     ]
+    await cache_set(cache_key_, result, SEARCH_CACHE_TTL)
+    return result
 
 
 async def list_documents(limit: Optional[int] = None, offset: int = 0) -> List[dict]:

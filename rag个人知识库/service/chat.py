@@ -19,7 +19,9 @@ from langchain_core.messages import HumanMessage
 
 from rag个人知识库.agent.ai_assist import ask, get_checkpointer
 from rag个人知识库.agent.intent import analyze
+from rag个人知识库.config.redis import cache_get, cache_key, cache_set
 from rag个人知识库.service.service import search_documents
+from rag个人知识库.vector_store.milvus_store import ANSWER_CACHE_TTL
 
 # analyze 用到的历史：最多取最近 N 轮（每轮 user+assistant 两条），单条截断长度
 HISTORY_MAX_TURNS = 3
@@ -177,30 +179,38 @@ async def chat(
         }
 
     user_prompt = _build_user_prompt(query, hits)
-    try:
-        answer = await asyncio.to_thread(
-            ask,
-            [HumanMessage(content=user_prompt)],
-            thread_id,
-        )
-    except Exception as exc:
-        sources = [
-            {
-                "index": index,
-                "source": hit.get("source"),
-                "score": hit.get("score"),
-                "content": hit.get("content"),
+    # 回答缓存：同一 user_prompt（query + 相同参考资料）→ 复用 LLM 回答（TTL 1 小时）。
+    # user_prompt 已包含完整上下文，跨会话同问同答是安全的；Redis 不可用则正常生成。
+    ans_key = cache_key("ans", user_prompt)
+    cached_answer = await cache_get(ans_key)
+    if cached_answer is not None:
+        answer = cached_answer
+    else:
+        try:
+            answer = await asyncio.to_thread(
+                ask,
+                [HumanMessage(content=user_prompt)],
+                thread_id,
+            )
+            await cache_set(ans_key, answer, ANSWER_CACHE_TTL)
+        except Exception as exc:
+            sources = [
+                {
+                    "index": index,
+                    "source": hit.get("source"),
+                    "score": hit.get("score"),
+                    "content": hit.get("content"),
+                }
+                for index, hit in enumerate(hits, start=1)
+            ]
+            return {
+                "answer": _friendly_model_error(exc),
+                "intent": analysis.intent,
+                "query": query,
+                "sources": sources,
+                "hits": hits,
+                "error": str(exc),
             }
-            for index, hit in enumerate(hits, start=1)
-        ]
-        return {
-            "answer": _friendly_model_error(exc),
-            "intent": analysis.intent,
-            "query": query,
-            "sources": sources,
-            "hits": hits,
-            "error": str(exc),
-        }
 
     sources = [
         {

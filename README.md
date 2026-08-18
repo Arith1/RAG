@@ -11,7 +11,7 @@
 - **文件指纹增量入库**：`identity_hash` 判定同名同源，`file_content_hash` 判定内容变化——skip / insert / update / retry 四态分流，只增量更新差集。
 - **跨库一致性**：MySQL 先落期望状态（`pending`）→ Milvus 幂等同步 → `in_sync`/`failed` 状态机；失败重试按 source 重建，可清理孤儿向量。
 - **结构感知切分**：Markdown 标题分节、**表格/公式/问答对原子保护**（占位符 + 还原长度分组）、超长表格自动拆子表并重复表头、图片路径入 metadata。
-- **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤。
+- **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤；**检索结果 / embedding / 回答三层 Redis 缓存**（相同问题秒回、省 API 调用）。
 - **Agent 问答**：意图识别（规则层 + LLM 查询重构，多轮指代补全）→ 检索 → DeepSeek Agent 生成带来源引用回答；对话记忆按用户隔离。
 - **会话记忆**：Postgres 持久化（跨重启/多 worker），TTL 按"最后活跃时间"自动清理，~20 轮对话自动摘要压缩。
 - **可靠入库队列**：Redis Streams（Consumer Group + PEL 崩溃恢复、指数退避重试、死信队列、inflight 竞态防护 409）。
@@ -73,7 +73,7 @@ stateDiagram-v2
 | 元数据存储 | MySQL 8.x + SQLAlchemy 2.0（async）+ aiomysql |
 | 向量存储 | Milvus 2.x + pymilvus + langchain-milvus |
 | 对话记忆 | Postgres（langgraph-checkpoint-postgres）+ TTL 清理 |
-| 任务队列 / 限流 | Redis 8 + redis-py（Streams） |
+| 任务队列 / 限流 / 缓存 | Redis 8 + redis-py（Streams / ZSET / KV 缓存） |
 | Embedding / Rerank | SiliconFlow：`BAAI/bge-m3`、`BAAI/bge-reranker-v2-m3` |
 | 文档解析 | MinerU（复杂文档）+ Unstructured（简单文档）+ python-docx |
 | LLM / Agent | DeepSeek + langchain 1.x（create_agent / LangGraph checkpointer） |

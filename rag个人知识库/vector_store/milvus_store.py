@@ -13,6 +13,7 @@ from langchain_milvus import BM25BuiltInFunction, Milvus
 from langchain_openai import OpenAIEmbeddings
 from pymilvus import Function, FunctionType
 
+from rag个人知识库.config.redis import cache_get, cache_get_sync, cache_key, cache_set, cache_set_sync
 from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint
 
 load_dotenv()
@@ -44,10 +45,43 @@ def _require_env(name: str) -> str:
     return value
 
 
+# 缓存 TTL（秒）：embedding 7 天 / 检索结果 10 分钟 / 回答 1 小时（可用环境变量覆盖）
+EMBEDDING_CACHE_TTL = int(os.getenv("EMBEDDING_CACHE_TTL", str(7 * 24 * 3600)))
+SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "600"))
+ANSWER_CACHE_TTL = int(os.getenv("ANSWER_CACHE_TTL", "3600"))
+
+
+class CachedEmbeddings(OpenAIEmbeddings):
+    """OpenAIEmbeddings 子类：embed_query 结果缓存到 Redis。
+
+    相同查询文本免重复调用 embedding API（省额度 + 降延迟）。
+    同步实现（embed_query 在线程中执行）；Redis 不可用时静默透传。
+    """
+
+    def embed_query(self, text: str):
+        key = cache_key("emb", text)
+        cached = cache_get_sync(key)
+        if cached is not None:
+            return cached
+        vector = super().embed_query(text)
+        cache_set_sync(key, vector, EMBEDDING_CACHE_TTL)
+        return vector
+
+    async def aembed_query(self, text: str):
+        key = cache_key("emb", text)
+        cached = await cache_get(key)
+        if cached is not None:
+            return cached
+        vector = await super().aembed_query(text)
+        await cache_set(key, vector, EMBEDDING_CACHE_TTL)
+        return vector
+
+
 @lru_cache(maxsize=1)
 def get_embeddings() -> OpenAIEmbeddings:
-    """构造 SiliconFlow embedding 客户端（OpenAI 兼容协议，进程内单例复用）"""
-    return OpenAIEmbeddings(
+    """构造 SiliconFlow embedding 客户端（OpenAI 兼容协议，进程内单例复用）；
+    返回 CachedEmbeddings 包装，embed_query 走 Redis 缓存。"""
+    return CachedEmbeddings(
         model=EMBEDDING_MODEL,
         api_key=_require_env("SILICONFLOW_API_KEY"),
         base_url=_require_env("SILICONFLOW_BASE_URL"),
