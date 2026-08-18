@@ -81,10 +81,30 @@ stateDiagram-v2
 
 ## 快速开始
 
-### 环境要求
+### 一键启动（Docker Compose，推荐）
 
-- Python 3.14+
-- MySQL 8.x、Milvus 2.x、Redis 7+、Postgres 16+（本地或 Docker）
+```bash
+# 1. 配置密钥（复制模板后填写 SILICONFLOW_API_KEY / MINERU_API_TOKEN /
+#    DEEPSEEK_API_KEY / JWT_SECRET / ADMIN_PASSWORD 等）
+cp .env.example .env
+
+# 2. 一键启动全部服务（MySQL / Milvus(含 etcd+minio) / Redis / Postgres / API）
+docker compose up -d --build
+
+# 3. 首次问答后，为 Postgres 对话记忆补充 created_at 列（幂等，TTL 清理的时间依据）
+docker compose exec postgres psql -U root -d rag-demo -f /init-sql/postgres_memory.sql
+
+# 4. 访问
+#    问答页  http://localhost:8010/chat      Swagger: http://localhost:8010/docs
+```
+
+- 数据持久化：容器删除不丢数据（compose 数据卷）；文档/上传产物落在宿主机 `rag个人知识库/resources/`
+- 常用命令：`docker compose down`（停）、`docker compose logs -f api`（看日志）
+- 初始化：MySQL 首次启动自动建 4 张业务表（`docker/init/` + `models/vector.sql`）
+
+### 手动启动（不用 compose）
+
+**环境要求**：Python 3.14+、MySQL 8.x、Milvus 2.x、Redis 7+、Postgres 16+。
 
 ```bash
 # 启动四个依赖服务（已有可跳过）
@@ -98,7 +118,7 @@ docker run -d --name pg-mem -e POSTGRES_USER=root -e POSTGRES_PASSWORD=root \
 ### 安装
 
 ```bash
-git clone https://github.com/Arith1/RAG-.git
+git clone https://github.com/Arith1/RAG.git
 cd rag_project
 uv sync
 cp .env.example .env   # 填写各密钥（见下表）
@@ -273,7 +293,7 @@ rag_project/
 - [x] Agent 问答 + 多轮记忆（Postgres 持久化 + TTL + 摘要）
 - [x] Redis Streams 入库任务队列 + 竞态防护
 - [x] golden 评测集 + 分层检索对比实验 + pytest 套件
-- [ ] docker-compose 一键编排（MySQL/Milvus/Redis/Postgres/API）
+- [x] docker-compose 一键编排（MySQL/Milvus/Redis/Postgres/API）
 - [ ] SSE 流式输出
 - [ ] 分层检索（Parent-Child）落地（实验结论已具备）
 - [ ] Agentic RAG（检索工具化，多轮反思检索）

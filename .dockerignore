@@ -1,0 +1,19 @@
+# 版本控制与本地环境
+.git/
+.gitignore
+.env
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 运行时不需要（resources 由 docker-compose 挂载；测试/评测不进镜像）
+tests/
+evaluation/
+rag个人知识库/resources/
+rag个人知识库/demo/
+
+# 文档
+README.md
