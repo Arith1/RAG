@@ -9,13 +9,15 @@
   - 管理员：额外拥有文档上传/删除权限（RBAC 在服务端依赖强制，不依赖前端隐藏）
 """
 import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
@@ -30,7 +32,7 @@ from rag个人知识库.config.db_config import engine, get_db
 from rag个人知识库.config.redis import redis_available
 from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
-from rag个人知识库.service.chat import chat
+from rag个人知识库.service.chat import chat, chat_stream
 from rag个人知识库.service.document_admin import delete_document
 from rag个人知识库.service.ingest_queue import (
     enqueue_ingest, is_inflight, queue_stats, run_worker,
@@ -140,6 +142,24 @@ async def _check_business_tables() -> None:
 
 
 app = FastAPI(title="RAG 个人知识库", version="0.2.0", lifespan=lifespan)
+
+# CORS：允许 Vue 开发服务器（Vite 默认 5173）跨域调用
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def _sse_events(gen):
+    """把 chat_stream 的 JSON 事件封装为 SSE 帧：data: {json}\n\n"""
+    async for event in gen:
+        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 @app.get("/")
@@ -336,6 +356,26 @@ async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
         sources=sources,
         session_id=session_id,
         error=result.get("error"),
+    )
+
+
+@app.post("/api/chat/stream")
+async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
+    """知识库问答（SSE 流式）：meta 事件 → 逐 token → done 事件。
+
+    前端用 fetch ReadableStream 消费（SSE POST 不支持 EventSource），
+    禁用缓冲保证逐段即时到达。
+    """
+    session_id = body.session_id or uuid.uuid4().hex
+    thread_id = f"{user.id}:{session_id}"
+    gen = chat_stream(body.content, thread_id=thread_id)
+    return StreamingResponse(
+        _sse_events(gen),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 关 Nginx 缓冲（若前置代理）
+        },
     )
 
 

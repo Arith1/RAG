@@ -10,6 +10,7 @@
     from rag个人知识库.agent.ai_assist import ask
     answer = ask([HumanMessage(content="你好")], thread_id="user-123")
 """
+import asyncio
 from typing import List
 
 import os
@@ -112,6 +113,52 @@ def ask(messages: List[BaseMessage], thread_id: str = "default") -> str:
         config={"configurable": {"thread_id": thread_id}},
     )
     return str(response["messages"][-1].content)
+
+
+async def astream(messages: List[BaseMessage], thread_id: str = "default"):
+    """流式版本：逐 token 产出 agent 回答片段（供 SSE 输出打字机效果）。
+
+    注意：checkpointer 是同步 PostgresSaver，langgraph 的 async astream 需要异步
+    checkpointer（aget_tuple）会 NotImplementedError。因此这里用「同步 stream 在
+    线程中执行 + asyncio.Queue 桥接」，与现有同步 ask() 共用同一 checkpointer，
+    thread_id 记忆不受影响；记忆由 langgraph 在流结束时统一落盘。
+    """
+    if not messages:
+        raise ValueError("messages 不能为空")
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _run():
+        try:
+            for chunk, _metadata in get_agent().stream(
+                {"messages": messages},
+                config={"configurable": {"thread_id": thread_id}},
+                stream_mode="messages",  # token 级增量
+            ):
+                content = getattr(chunk, "content", "")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):  # 多模态 content 块
+                    text = "".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b)
+                        for b in content
+                    )
+                else:
+                    text = str(content or "")
+                if text:
+                    queue.put_nowait(text)
+            queue.put_nowait(None)
+        except Exception as exc:
+            queue.put_nowait(exc)
+
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _run)  # 后台线程执行，不阻塞消费
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 
 def clear_thread(thread_id: str = "default") -> None:

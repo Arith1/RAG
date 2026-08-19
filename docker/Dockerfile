@@ -8,11 +8,11 @@ WORKDIR /app
 
 # 只安装 pyproject.toml 声明的依赖（不安装项目本身——包目录无 __init__.py，
 # 运行时以源码目录方式 import，代码直接 COPY 进镜像即可）
-COPY pyproject.toml ./
+COPY ../pyproject.toml ./
 RUN uv pip install --system --no-cache-dir -r pyproject.toml
 
 # 拷贝应用代码（.dockerignore 已排除 .venv/.git/resources 等）
-COPY . .
+COPY .. .
 
 # 启动 FastAPI 服务
 EXPOSE 8010

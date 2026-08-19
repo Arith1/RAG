@@ -1,7 +1,9 @@
 # ─────────────────────────────────────────────────────────────
 # RAG 个人知识库 · 一键编排
 #
-# 启动：  docker compose up -d --build
+# 启动（二选一）：
+#   cd docker && docker compose up -d --build          # 在 docker/ 目录内
+#   docker compose -f docker/docker-compose.yml up -d --build   # 项目根目录
 # 停止：  docker compose down          （加 -v 会连数据卷一起删）
 # 查看：  docker compose logs -f api
 #
@@ -11,7 +13,7 @@
 #   milvus   向量库
 #   redis    入库任务队列 / 限流
 #   postgres 对话记忆
-#   api      FastAPI 应用（构建自 ./Dockerfile）
+#   api      FastAPI 应用（构建自 docker/Dockerfile，context=项目根）
 #
 # 注意：
 #   1. 密钥从根目录 .env 注入（SILICONFLOW_API_KEY / MINERU_API_TOKEN /
@@ -32,8 +34,8 @@ services:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./docker/init/01-vector.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
-      - ./rag个人知识库/models:/init-sql:ro
+      - ./init/01-vector.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
+      - ../rag个人知识库/models:/init-sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
       interval: 5s
@@ -105,7 +107,7 @@ services:
       - "5432:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
-      - ./rag个人知识库/models/postgres_memory.sql:/init-sql/postgres_memory.sql:ro
+      - ../rag个人知识库/models/postgres_memory.sql:/init-sql/postgres_memory.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U root -d rag-demo"]
       interval: 5s
@@ -113,7 +115,9 @@ services:
       retries: 20
 
   api:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile  # Dockerfile 与 compose 同在 docker/ 目录，context 用项目根
     container_name: rag-api
     ports:
       - "8010:8010"
@@ -127,7 +131,7 @@ services:
       milvus:
         condition: service_started
     env_file:
-      - .env
+      - ../.env
     environment:
       # 容器内通过服务名互联，覆盖 .env 里的 localhost 地址
       ASYNC_DATABASE_URL: mysql+aiomysql://root:root@mysql:3306/rag_demo?charset=utf8
@@ -136,7 +140,7 @@ services:
       MILVUS_URI: http://milvus:19530
     volumes:
       # 文档与上传产物持久化到宿主机（resources 已 gitignore）
-      - ./rag个人知识库/resources:/app/rag个人知识库/resources
+      - ../rag个人知识库/resources:/app/rag个人知识库/resources
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/api/health')"]
       interval: 10s

@@ -70,6 +70,7 @@ stateDiagram-v2
 | --- | --- |
 | 语言 / 运行时 | Python 3.14+ |
 | Web 框架 | FastAPI + uvicorn |
+| 前端 | Vue 3 + Vite + TypeScript + Pinia + Vue Router（SSE 流式问答） |
 | 元数据存储 | MySQL 8.x + SQLAlchemy 2.0（async）+ aiomysql |
 | 向量存储 | Milvus 2.x + pymilvus + langchain-milvus |
 | 对话记忆 | Postgres（langgraph-checkpoint-postgres）+ TTL 清理 |
@@ -89,7 +90,7 @@ stateDiagram-v2
 cp .env.example .env
 
 # 2. 一键启动全部服务（MySQL / Milvus(含 etcd+minio) / Redis / Postgres / API）
-docker compose up -d --build
+docker compose -f docker/docker-compose.yml up -d --build
 
 # 3. 首次问答后，为 Postgres 对话记忆补充 created_at 列（幂等，TTL 清理的时间依据）
 docker compose exec postgres psql -U root -d rag-demo -f /init-sql/postgres_memory.sql
@@ -158,11 +159,22 @@ psql -U root -d rag-demo -f rag个人知识库/models/postgres_memory.sql
 uvicorn rag个人知识库.api.main:app --host 0.0.0.0 --port 8010
 ```
 
-- **问答页面**：http://localhost:8010/chat （登录后提问）
+- **问答页面**：http://localhost:8010/chat （内置 HTML 问答页，登录后提问）
 - **Swagger 文档**：http://localhost:8010/docs
 - **队列状态**：`GET /api/ingest/stats`
 
 启动日志确认：`Redis 可用 → 入库任务队列已启用`、`对话记忆已启用 Postgres 持久化`（任一不可用会自动降级并提示）。
+
+### 启动 Vue 前端（可选，标准前端）
+
+```bash
+cd rag_frontend
+npm install          # 首次
+npm run dev          # http://localhost:5173（/api 自动代理到 8010）
+npm run build        # 类型检查 + 产物构建
+```
+
+前端功能：登录（JWT）、**SSE 流式问答**（打字机效果 + 来源引用）、文档管理（管理员上传/删除 + 队列状态）。
 
 ### 入库文档（两种方式）
 
@@ -260,6 +272,7 @@ python -m pytest tests/
 | GET | `/api/documents` | 登录 | 文档列表（source 脱敏） |
 | DELETE | `/api/documents/{id}` | 管理员 | 删除文档（正在入库返回 409） |
 | POST | `/api/chat` | 登录 | 知识库问答（多轮记忆） |
+| POST | `/api/chat/stream` | 登录 | **SSE 流式问答**（meta → token×N → done） |
 | POST | `/api/search` | 登录 | 语义检索 |
 | GET | `/api/ingest/stats` | 登录 | 入库队列状态 |
 | GET | `/chat` | 公开 | 浏览器问答页面 |
@@ -294,6 +307,6 @@ rag_project/
 - [x] Redis Streams 入库任务队列 + 竞态防护
 - [x] golden 评测集 + 分层检索对比实验 + pytest 套件
 - [x] docker-compose 一键编排（MySQL/Milvus/Redis/Postgres/API）
-- [ ] SSE 流式输出
+- [x] SSE 流式输出 + Vue 3 + TypeScript 前端
 - [ ] 分层检索（Parent-Child）落地（实验结论已具备）
 - [ ] Agentic RAG（检索工具化，多轮反思检索）
