@@ -21,6 +21,7 @@
 """
 import asyncio
 import os
+import time
 
 from rag个人知识库.config.redis import get_redis, redis_available
 from rag个人知识库.service.service import ingest_files
@@ -60,14 +61,34 @@ async def _ensure_group() -> None:
 
 
 async def _recover_pending() -> None:
-    """启动时回收上次崩溃未 ACK 的任务（PEL 中的残留，空闲 > 10s）。"""
+    """回收上次崩溃未 ACK 的任务并**立即重新处理**（PEL 中的残留，空闲 > 10s）。
+
+    注意：XAUTOCLAIM 只是把 pending 消息的所有权转移给本 consumer，
+    消息不会自动重新投递——必须认领后手动执行 process_message + XACK，
+    否则任务永久滞留 PEL、文件永不入库（本函数此前只打印不处理，属缺陷，已修复）。
+    """
+    r = get_redis()
     try:
-        result = await get_redis().xautoclaim(STREAM, GROUP, "recovery", 10000, "0", count=100)
-        claimed = result[1] if result else []
-        for msg_id, fields in claimed:
-            print(f"[ingest_queue] 回收崩溃残留任务 {msg_id}: {fields.get('path')}")
+        start = "0"
+        while True:
+            # xautoclaim 返回 (next_start_id, claimed_messages, deleted_ids)
+            result = await r.xautoclaim(STREAM, GROUP, "recovery", 10000, start, count=100)
+            claimed = result[1] if result else []
+            if not claimed:
+                break
+            for msg_id, fields in claimed:
+                path = fields.get("path", "")
+                print(f"[ingest_queue] 回收崩溃残留任务 {msg_id} 并重新处理: {path}")
+                ok = await process_message(msg_id, fields)
+                if ok:
+                    await r.xack(STREAM, GROUP, msg_id)
+                    await r.xdel(STREAM, msg_id)
+                else:
+                    await _handle_failure(msg_id, fields)
+                await r.srem(INFLIGHT_KEY, path)
+            start = result[0] if result else "0"
     except Exception as e:
-        print(f"[ingest_queue] 崩溃任务回收跳过：{e}")
+        print(f"[ingest_queue] 崩溃任务回收失败：{e}")
 
 
 async def process_message(msg_id: str, fields: dict) -> bool:
@@ -107,18 +128,24 @@ async def _handle_failure(msg_id: str, fields: dict) -> None:
 async def run_worker(stop: "asyncio.Event | None" = None) -> None:
     """消费循环：阻塞读新任务 → 处理 → ACK / 失败重试。
 
-    FastAPI lifespan 内嵌运行，或独立进程执行：
+    除启动时回收外，运行中每 60s 兜底回收一次 PEL（防"运行中崩溃"产生的残留，
+    而不是只有启动时才恢复）。FastAPI lifespan 内嵌运行，或独立进程执行：
       python -m rag个人知识库.service.ingest_queue
     """
     await _ensure_group()
     await _recover_pending()
     r = get_redis()
     print(f"[ingest_queue] worker 启动（consumer={CONSUMER}）")
+    last_recover = time.monotonic()
     while not (stop is not None and stop.is_set()):
         try:
             # BLOCK 2s 等新消息；">" 只读尚未投递的新消息
             resp = await r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=1, block=2000)
             if not resp:
+                # 空闲窗口内周期性兜底回收崩溃残留（认领后重新处理）
+                if time.monotonic() - last_recover > 60:
+                    await _recover_pending()
+                    last_recover = time.monotonic()
                 continue
             for _stream, messages in resp:
                 for msg_id, fields in messages:
@@ -135,6 +162,10 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
             raise
         except Exception as e:
             print(f"[ingest_queue] worker 异常：{e}")
+            try:
+                await _ensure_group()  # 流/消费组被误删（如 FLUSHDB）时自愈
+            except Exception:
+                pass
             await asyncio.sleep(2)
 
 
