@@ -233,6 +233,7 @@ async def chat(
 async def chat_stream(
     content: str,
     thread_id: str = "default",
+    session_id: Optional[str] = None,
     k: int = 3,
     source: Optional[str] = None,
     expr: Optional[str] = None,
@@ -240,12 +241,13 @@ async def chat_stream(
     """流式问答：analyze + 检索为前置步骤（普通 await），LLM 生成段逐 token 产出。
 
     产出事件（JSON dict，供 SSE 帧封装）：
-      {"type": "meta",   "intent", "query", "sources": [...]}  检索完成，即将开始生成
+      {"type": "meta",   "session_id", "intent", "query", "sources": [...]}  检索完成，即将开始生成
       {"type": "token",  "text": "..."}                        生成中的增量片段
       {"type": "done",   "answer": "完整回答"}                 生成结束
       {"type": "answer", "intent", "query", "answer", "sources"} 闲聊/other/无资料：一次性完整结果
       {"type": "error",  "message"}                            生成异常
 
+    session_id 由 API 层生成并回传（meta 事件带上），前端据此维持多轮会话；
     与 chat() 共用 analyze/检索/缓存逻辑，仅 LLM 生成段改为流式。
     """
     history = await asyncio.to_thread(load_recent_history, thread_id)
@@ -254,12 +256,12 @@ async def chat_stream(
     # 闲聊：不走检索，直接完整回答
     if analysis.intent == "chat":
         answer = await asyncio.to_thread(ask, [HumanMessage(content=content)], thread_id)
-        yield {"type": "answer", "intent": "chat", "query": None,
+        yield {"type": "answer", "session_id": session_id, "intent": "chat", "query": None,
                "answer": answer, "sources": []}
         return
 
     if analysis.intent == "other":
-        yield {"type": "answer", "intent": "other", "query": None,
+        yield {"type": "answer", "session_id": session_id, "intent": "other", "query": None,
                "answer": "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。",
                "sources": []}
         return
@@ -269,14 +271,16 @@ async def chat_stream(
         hits = await search_documents(query, k=k, source=source, expr=expr)
     except Exception as exc:
         # 检索失败（如 Milvus 不可用）：发 error 事件而非直接断流，前端可提示重试
-        yield {"type": "error", "message": f"检索服务异常：{exc}"}
+        yield {"type": "error", "session_id": session_id, "message": f"检索服务异常：{exc}"}
         return
     sources = [
         {"index": index, "source": hit.get("source"),
          "score": hit.get("score"), "content": hit.get("content")}
         for index, hit in enumerate(hits, start=1)
     ]
-    yield {"type": "meta", "intent": analysis.intent, "query": query, "sources": sources}
+    # meta 事件回传 session_id：前端据此维持多轮会话（服务端生成的 id 必须返回）
+    yield {"type": "meta", "session_id": session_id, "intent": analysis.intent,
+           "query": query, "sources": sources}
 
     if not hits:
         yield {"type": "answer", "intent": analysis.intent, "query": query,

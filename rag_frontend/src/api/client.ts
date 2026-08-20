@@ -9,11 +9,11 @@ export interface SourceItem {
 
 /** SSE 流式事件（与后端 chat_stream 产出的 JSON 一一对应） */
 export type ChatStreamEvent =
-  | { type: 'meta'; intent: string; query: string; sources: SourceItem[] }
+  | { type: 'meta'; session_id: string | null; intent: string; query: string; sources: SourceItem[] }
   | { type: 'token'; text: string }
   | { type: 'done'; answer: string }
-  | { type: 'answer'; intent: string; query: string | null; answer: string; sources: SourceItem[] }
-  | { type: 'error'; message: string }
+  | { type: 'answer'; session_id: string | null; intent: string; query: string | null; answer: string; sources: SourceItem[] }
+  | { type: 'error'; session_id?: string | null; message: string }
 
 /** 带 JWT 的 fetch 封装：401 自动登出并回登录页。JSON 响应自动解析。 */
 export async function api<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {

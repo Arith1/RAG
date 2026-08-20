@@ -83,3 +83,20 @@ def cache_set_sync(key: str, value, ttl: int) -> bool:
         return True
     except Exception:
         return False
+
+
+async def cache_clear_prefix(prefix: str) -> int:
+    """按前缀清除缓存（如 "search:" / "ans:"）。
+
+    用于文档入库/删除后让检索与回答缓存失效，避免旧数据在 TTL 内继续被返回。
+    返回删除的 key 数；Redis 不可用返回 0。
+    """
+    try:
+        r = get_redis()
+        deleted = 0
+        async for key in r.scan_iter(f"{prefix}*"):
+            await r.delete(key)
+            deleted += 1
+        return deleted
+    except Exception:
+        return 0

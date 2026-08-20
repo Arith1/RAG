@@ -29,7 +29,7 @@ from rag个人知识库.api.auth import (
     write_audit,
 )
 from rag个人知识库.config.db_config import engine, get_db
-from rag个人知识库.config.redis import redis_available
+from rag个人知识库.config.redis import cache_clear_prefix, redis_available
 from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.chat import chat, chat_stream
@@ -328,6 +328,9 @@ async def remove_document(
     ok = await delete_document(db, file_id, admin, upload_dir=UPLOAD_DIR)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+    # 删除后清空检索/回答缓存，避免 TTL 内继续返回已删文档的旧结果
+    await cache_clear_prefix("search:")
+    await cache_clear_prefix("ans:")
     return {"status": "deleted", "file_id": file_id}
 
 
@@ -368,7 +371,7 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
     """
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
-    gen = chat_stream(body.content, thread_id=thread_id)
+    gen = chat_stream(body.content, thread_id=thread_id, session_id=session_id)
     return StreamingResponse(
         _sse_events(gen),
         media_type="text/event-stream",

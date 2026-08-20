@@ -42,6 +42,7 @@ async function send() {
   try {
     await streamChat({ content: text, session_id: sessionId.value }, (evt) => {
       if (evt.type === 'meta') {
+        sessionId.value = evt.session_id ?? null // 服务端生成并回传，维持多轮会话
         assistant.sources = evt.sources
         scrollToBottom()
       } else if (evt.type === 'token') {

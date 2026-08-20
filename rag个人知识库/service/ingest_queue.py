@@ -23,7 +23,7 @@ import asyncio
 import os
 import time
 
-from rag个人知识库.config.redis import get_redis, redis_available
+from rag个人知识库.config.redis import cache_clear_prefix, get_redis, redis_available
 from rag个人知识库.service.service import ingest_files
 
 STREAM = "ingest_queue"
@@ -100,7 +100,10 @@ async def process_message(msg_id: str, fields: dict) -> bool:
         print(f"[ingest_queue] 任务 {msg_id} 文件已不存在，丢弃：{path}")
         return True
     try:
-        await ingest_files([path])
+        result = await ingest_files([path])
+        # 入库完成（无论 insert/update）后清空检索/回答缓存，避免旧数据在 TTL 内被返回
+        await cache_clear_prefix("search:")
+        await cache_clear_prefix("ans:")
         return True
     except Exception as e:
         print(f"[ingest_queue] 任务 {msg_id} 处理失败：{e}")
