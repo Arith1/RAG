@@ -1,6 +1,6 @@
 
 
-class DocumentValidationErrorType:
+class DocumentValidationErrorType(Exception):
     LOAD_FAILED = "加载失败"
     FILE_TOO_LARGE = "文件大小超限"  # 文件大小超限
     UNSUPPORTED_FORMAT = "不支持的格式"  # 不支持的格式

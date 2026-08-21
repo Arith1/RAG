@@ -10,6 +10,7 @@
 """
 import asyncio
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -17,7 +18,7 @@ from typing import List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
@@ -40,13 +41,17 @@ from rag个人知识库.service.ingest_queue import (
 from rag个人知识库.service.memory_maintenance import (
     CLEANUP_INTERVAL_SECONDS, MEMORY_TTL_DAYS, cleanup_expired_memory,
 )
+from rag个人知识库.service.oss_archive import (
+    UPLOAD_DIR, build_download_url, local_source_exists,
+)
 from rag个人知识库.service.service import ingest_files, list_documents, search_documents
 
-# ── 上传目录与限制（与 loader 的校验口径一致）──
+logger = logging.getLogger(__name__)
+
+# ── 上传目录与限制（与 loader/oss_archive 的校验口径一致）──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "resources", "uploads"))
-MAX_UPLOAD_SIZE = 10 * 1024 * 1024
-ALLOWED_EXT = {".pdf", ".docx", ".doc", ".txt", ".md"}
+MAX_UPLOAD_SIZE = os.getenv("MAX_FILE_SIZE", 10*1024*1024)
+ALLOWED_EXT = {".pdf", ".docx", ".txt", ".md"}
 
 
 # ── 请求/响应模型 ──
@@ -103,12 +108,17 @@ async def _memory_cleanup_loop() -> None:
         try:
             await asyncio.to_thread(cleanup_expired_memory, MEMORY_TTL_DAYS)
         except Exception as e:
-            print(f"[api] 对话记忆清理任务异常：{e}")
+            logger.warning("[api] 对话记忆清理任务异常：%s", e)
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # 统一日志配置：未覆写时会输出到 stderr（uvicorn 启动时可看到各模块 INFO/WARNING 日志）
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    )
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     await _check_business_tables()
     await seed_admin()
@@ -116,11 +126,11 @@ async def lifespan(_app: FastAPI):
     ingest_worker_task = None
     if await redis_available():
         ingest_worker_task = asyncio.create_task(run_worker())
-        print("[api] 入库任务队列已启用（Redis Streams worker 启动）")
+        logger.info("[api] 入库任务队列已启用（Redis Streams worker 启动）")
     else:
-        print("[api] Redis 不可用，入库任务回退进程内执行（配置 REDIS_URL 并启动 Redis 后启用队列）")
-    print(f"[api] 上传目录：{UPLOAD_DIR}")
-    print(f"[api] 对话记忆 TTL={MEMORY_TTL_DAYS} 天，清理间隔={CLEANUP_INTERVAL_SECONDS}s")
+        logger.info("[api] Redis 不可用，入库任务回退进程内执行（配置 REDIS_URL 并启动 Redis 后启用队列）")
+    logger.info("[api] 上传目录：%s", UPLOAD_DIR)
+    logger.info("[api] 对话记忆 TTL=%s 天，清理间隔=%ss", MEMORY_TTL_DAYS, CLEANUP_INTERVAL_SECONDS)
     yield
     cleanup_task.cancel()
     if ingest_worker_task is not None:
@@ -136,8 +146,8 @@ async def _check_business_tables() -> None:
             await conn.execute(text("SELECT 1 FROM vector_files LIMIT 1"))
             await conn.execute(text("SELECT 1 FROM audit_logs LIMIT 1"))
     except Exception as e:
-        print("[api] 业务表缺失或数据库未就绪，请先执行表结构初始化：")
-        print("      mysql -u root -p rag_demo < rag个人知识库/models/vector.sql")
+        logger.error("[api] 业务表缺失或数据库未就绪，请先执行表结构初始化：")
+        logger.error("      mysql -u root -p rag_demo < rag个人知识库/models/vector.sql")
         raise RuntimeError(f"业务表检查失败：{e}") from e
 
 
@@ -238,7 +248,11 @@ async def upload_document(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """上传文档并异步入库（加载→切分→MySQL→Milvus）。MinerU 解析在后台执行，不阻塞响应。"""
+    """上传文档并异步入库（加载→切分→MySQL→Milvus）。MinerU 解析在后台执行，不阻塞响应。
+
+    上传按用户分目录隔离：uploads/{user_id}/{file_name}；source 采用相对路径，
+    便于服务器环境下与 OSS 归档（key=相对路径）及下载 URL 保持一致。
+    """
     # 跨平台安全取文件名：统一先转正斜杠再取最后一段，兼容 Windows/Linux 部署
     file_name = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
     if not file_name:
@@ -254,10 +268,12 @@ async def upload_document(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "文件为空")
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "文件超过 10MB 上限")
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    # 按用户分目录隔离：uploads/{user_id}/{file_name}（不同用户同名文件互不覆盖）
+    user_dir = os.path.join(UPLOAD_DIR, str(admin.id))
+    os.makedirs(user_dir, exist_ok=True)
     # 保留原始文件名：同名重复上传 = 同一文档（同 source/identity）→ 指纹增量更新语义；
     # basename 已剥离路径，无路径穿越风险
-    path = os.path.join(UPLOAD_DIR, file_name)
+    path = os.path.join(user_dir, file_name)
     with open(path, "wb") as f:
         f.write(content)
     audit(db, admin, "upload", target=file_name, detail=path)
@@ -273,13 +289,19 @@ async def upload_document(
 
 
 def _sanitize_source(path: str) -> str:
-    """对外隐藏本地绝对路径：上传目录内 → uploads/文件名；项目内 → 相对路径；其他 → 文件名。"""
+    """对外隐藏本地绝对路径；相对路径（uploads/{user_id}/文件）直接展示，不暴露服务器盘符。
+
+    相对 source 是服务器环境下与 OSS 归档/下载一致的标准口径，脱敏后原样返回；
+    绝对路径（存量/CLI 手动入库）则归一为 uploads/ 前缀的相对形式。
+    """
     if not path:
         return path
+    if path.startswith("uploads/"):
+        return path  # 已是相对路径，直接展示
     abs_path = os.path.abspath(path)
     abs_upload = os.path.abspath(UPLOAD_DIR)
     if abs_path.startswith(abs_upload + os.sep):
-        return "uploads/" + os.path.basename(abs_path)
+        return "uploads/" + os.path.relpath(abs_path, abs_upload).replace(os.sep, "/")
     base = os.path.abspath(BASE_DIR)
     if abs_path.startswith(base + os.sep):
         return os.path.relpath(abs_path, base).replace(os.sep, "/")
@@ -332,6 +354,44 @@ async def remove_document(
     await cache_clear_prefix("search:")
     await cache_clear_prefix("ans:")
     return {"status": "deleted", "file_id": file_id}
+
+
+@app.get("/api/documents/{file_id}/download")
+async def download_document(
+    file_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """下载文档原件：优先返回 OSS 签名/公有 URL；OSS 未启用且本地原件还在时直接回文件。
+
+    服务器环境下原始文件已归档到 OSS，此接口提供可下载的链接（或直接流式返回本地副本）。
+    """
+    result = await db.execute(select(VectorFile).where(VectorFile.id == file_id))
+    record = result.scalar_one_or_none()
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+
+    # 1) OSS 启用的场景：返回会过期的签名 URL / 公有 URL，前端直接打开
+    url = await build_download_url(record.source)
+    if url:
+        return {"file_name": record.file_name, "source": record.source, "url": url, "expires_in": 3600}
+
+    # 2) OSS 未启用且本地原件保留：直接流式返回本地文件
+    media_type = {
+        ".md": "text/markdown; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pdf": "application/pdf",
+    }.get(os.path.splitext(record.file_name)[1].lower(), "application/octet-stream")
+    local = local_source_exists(record.source)
+    if local:
+        return FileResponse(local, media_type=media_type, filename=record.file_name)
+
+    # 3) 原件既不在 OSS 也未保留本地（如旧数据的绝对路径且已归档）
+    raise HTTPException(
+        status.HTTP_404_NOT_FOUND,
+        detail="文档原件不存在（可能未归档或已清理）"
+    )
 
 
 @app.get("/api/ingest/stats")

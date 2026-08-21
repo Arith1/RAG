@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from rag个人知识库.loader.load_file import load_single
-from rag个人知识库.spliter.spliter import HEADERS_TO_SPLIT_ON, split_documents
+from rag个人知识库.splitter.spliter import HEADERS_TO_SPLIT_ON, split_documents
 from rag个人知识库.vector_store.milvus_store import get_embeddings
 
 RES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

@@ -11,6 +11,7 @@
      重新同步 Milvus（幂等重放），成功后置 in_sync。
 """
 import asyncio
+import logging
 import os
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 from langchain_core.documents import Document
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rag个人知识库.config.db_config import async_session as session_factory
 from rag个人知识库.crud.vector import (
     SYNC_FAILED,
     SYNC_IN_SYNC,
@@ -39,7 +41,8 @@ from rag个人知识库.loader.load_file import (
 )
 from rag个人知识库.loader.parser.mineru_parser import minerU_files_ordered
 from rag个人知识库.models.vector import VectorFile
-from rag个人知识库.spliter.spliter import split_documents
+from rag个人知识库.splitter.spliter import split_documents
+from rag个人知识库.service.oss_archive import rel_source_from_local
 from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint, compute_file_hash
 from rag个人知识库.vector_store.milvus_store import (
     aadd_chunks,
@@ -50,6 +53,8 @@ from rag个人知识库.vector_store.milvus_store import (
 # 版本号步进：1.0 -> 1.1 -> ... -> 1.9 -> 2.0（Numeric(5,1) 保留一位小数）
 VERSION_STEP = Decimal("0.1")
 INITIAL_VERSION = Decimal("1.0")
+
+logger = logging.getLogger(__name__)
 
 
 def _next_version(current: Decimal) -> Decimal:
@@ -70,7 +75,8 @@ async def precheck(
     """
     file_name = os.path.basename(file_path)
     content_hash = await asyncio.to_thread(compute_file_hash, file_path)
-    record = await get_file_by_identity(db, file_name, file_path)
+    # source 统一为相对路径（uploads/{user_id}/file），保证预检与入库/检索口径一致
+    record = await get_file_by_identity(db, file_name, rel_source_from_local(file_path))
     if record is None:
         return "insert", content_hash, None
     if record.file_content_hash != content_hash:
@@ -103,7 +109,8 @@ async def _stage_insert(
     返回 (file_id, version, summary)。Milvus 写入由调用方在阶段二执行。
     """
     file_name = os.path.basename(file_path)
-    source = file_path
+    # 用相对路径作为 source（uploads/{user_id}/file），与 Milvus 主键/检索口径一致
+    source = rel_source_from_local(file_path)
 
     file = await insert_file(db, file_name, source, content_hash, version=INITIAL_VERSION)
     fingerprints = _unique_fingerprints(chunks, source)
@@ -111,7 +118,7 @@ async def _stage_insert(
     await update_chunk_count(db, file.id)
 
     summary = {"added": len(fingerprints), "unchanged": 0, "removed": 0}
-    print(f"[Ingest] 全新入库 v{INITIAL_VERSION}：{file_path}，chunk 数 {len(fingerprints)}")
+    logger.info("[Ingest] 全新入库 v%s：%s，chunk 数 %d", INITIAL_VERSION, file_path, len(fingerprints))
     return file.id, INITIAL_VERSION, summary
 
 
@@ -162,21 +169,24 @@ async def _stage_update(
     await update_chunk_count(db, file_id)
 
     summary = {"added": len(added), "unchanged": len(unchanged), "removed": len(removed)}
-    print(
-        f"[Ingest] 更新完成 v{record.version} -> v{new_version}："
-        f"新增 {len(added)}，未变 {len(unchanged)}，删除 {len(removed)}"
+    logger.info(
+        "[Ingest] 更新完成 v%s -> v%s：新增 %d，未变 %d，删除 %d",
+        record.version, new_version, len(added), len(unchanged), len(removed),
     )
     return file_id, new_version, [fp_to_chunk[fp] for fp in added], removed, summary
 
 
 async def _sync_milvus(
-    db: AsyncSession,
     file_id: int,
     added_chunks: List[Document],
     removed_ids: List[str],
     rebuild_source: Optional[str] = None,
 ) -> None:
     """阶段二：同步 Milvus（幂等可重放）。成功置 in_sync，失败置 failed + last_error。
+
+    本阶段使用**独立会话**标记状态，与阶段一（MySQL 落期望状态）事务完全隔离：
+    Milvus 同步成功/失败的状态更新不会再触碰阶段一已提交的事务，避免跨事务复用
+    session 带来的隐式提交/状态串扰风险。
 
     rebuild_source: 非 None 时先按 source 删除该文件全部向量再全量插入
     （retry 重建用，清理上次更新失败残留的旧 chunk 孤儿向量）。
@@ -188,15 +198,16 @@ async def _sync_milvus(
             await aadd_chunks(added_chunks)
         if removed_ids:
             await adelete_chunks_by_ids(removed_ids)
-        await set_sync_status(db, file_id, SYNC_IN_SYNC)
-        await db.commit()
-    except Exception as e:
-        await db.rollback()
-        try:
-            await set_sync_status(db, file_id, SYNC_FAILED, str(e))
+        async with session_factory() as db:
+            await set_sync_status(db, file_id, SYNC_IN_SYNC)
             await db.commit()
+    except Exception as e:
+        try:
+            async with session_factory() as db:
+                await set_sync_status(db, file_id, SYNC_FAILED, str(e))
+                await db.commit()
         except Exception as e2:
-            print(f"[Ingest] 标记同步失败状态出错：{e2}")
+            logger.warning("[Ingest] 标记同步失败状态出错：%s", e2)
         raise RuntimeError(f"Milvus 同步失败（已标记 failed，可重跑恢复）：{e}") from e
 
 
@@ -217,7 +228,7 @@ async def process_file(
     # 2. 预检（加载前）：内容未变且已同步 → 直接跳过
     action, content_hash, record = await precheck(db, file_path)
     if action == "skip":
-        print(f"[Ingest] {file_path} 内容未变化且已同步，跳过加载与入库")
+        logger.info("[Ingest] %s 内容未变化且已同步，跳过加载与入库", file_path)
         return {
             "file_path": file_path,
             "status": "skipped",
@@ -242,15 +253,17 @@ async def process_file(
         else:
             docs = await asyncio.to_thread(load_single, file_path)
     except Exception as e:
-        print(f"[Ingest] {file_path} 加载失败：{e}")
+        logger.warning("[Ingest] %s 加载失败：%s", file_path, e)
         return {"file_path": file_path, "status": "error", "message": f"加载失败：{e}"}
     if not docs:
         return {"file_path": file_path, "status": "error", "message": "加载结果为空"}
 
     # 保证 metadata.source 与入库 source 一致：强制覆盖 loader 可能设置的任何 source，
-    # 确保 MySQL 指纹与 Milvus 主键（chunk ID）口径完全一致
+    # 确保 MySQL 指纹与 Milvus 主键（chunk ID）口径完全一致。
+    # source 统一为相对路径（uploads/{user_id}/file）；retry/update 走 record.source（同口径）。
+    upload_source = rel_source_from_local(file_path)
     for doc in docs:
-        doc.metadata["source"] = file_path
+        doc.metadata["source"] = upload_source
 
     # 4. 切分
     chunks = await asyncio.to_thread(split_documents, docs)
@@ -282,13 +295,13 @@ async def process_file(
             await db.commit()
         except Exception as e:
             await db.rollback()
-            print(f"[Ingest] {file_path} 元数据落库失败，已回滚（Milvus 未改动）：{e}")
+            logger.warning("[Ingest] %s 元数据落库失败，已回滚（Milvus 未改动）：%s", file_path, e)
             return {"file_path": file_path, "status": "error", "message": f"元数据落库失败：{e}"}
 
-    # 6. 阶段二：同步 Milvus
+    # 6. 阶段二：同步 Milvus（独立会话标记状态，与阶段一事务隔离）
     try:
-        await _sync_milvus(db, file_id, added_chunks, removed_ids, rebuild_source)
-        print(f"[Ingest] {file_path} 处理完成：{summary}")
+        await _sync_milvus(file_id, added_chunks, removed_ids, rebuild_source)
+        logger.info("[Ingest] %s 处理完成：%s", file_path, summary)
         return {
             "file_path": file_path,
             "status": {

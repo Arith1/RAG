@@ -17,7 +17,7 @@ engine = create_async_engine(
     max_overflow=20,  # 溢出连接池大小
 )
 # 2.创建异步会话工厂，用于创建会话对象
-AsyncSession = async_sessionmaker(
+async_session = async_sessionmaker(
     bind=engine, # 绑定引擎
     class_=AsyncSession, # 使用的会话类
     expire_on_commit=False, # 会话对象不过期不重新查询数据库
@@ -25,9 +25,10 @@ AsyncSession = async_sessionmaker(
     # future=True, # 启用未来对象
     # connect_args={"check_same_thread": False}
 )
-# 3.依赖项，用于创建会话对象
+# 3.依赖项，用于创建会话对象（用绑定 engine 的 async_session 工厂，
+#    不能直接用未绑定的 AsyncSession 类，否则报 UnboundExecutionError）
 async def get_db():
-    async with AsyncSession() as session:
+    async with async_session() as session:
         try:
             yield session
             await session.commit()

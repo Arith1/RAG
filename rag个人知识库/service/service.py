@@ -6,11 +6,15 @@
 """
 from typing import List, Optional
 
-from rag个人知识库.config.db_config import AsyncSession
-from rag个人知识库.config.redis import cache_get, cache_key, cache_set
+from rag个人知识库.config.db_config import async_session
+from rag个人知识库.config.redis import cache_clear_prefix, cache_get, cache_key, cache_set
 from rag个人知识库.crud.vector import select_file_names
 from rag个人知识库.service.ingest import ingest_files_batched
 from rag个人知识库.vector_store.milvus_store import SEARCH_CACHE_TTL, asearch_with_rerank
+
+# 数据发生变更（新增/更新/重放）的状态集合：命中任一即需清检索/回答缓存，
+# 避免旧数据在 TTL 内继续被返回；skipped/error 不涉及数据变更，无需清缓存。
+_CHANGED_STATUSES = {"inserted", "updated", "retried"}
 
 
 async def ingest_files(file_paths: List[str]) -> List[dict]:
@@ -18,8 +22,16 @@ async def ingest_files(file_paths: List[str]) -> List[dict]:
 
     返回每个文件的结构化结果（status/version/added/unchanged/removed/message）。
     """
-    async with AsyncSession() as db:
-        return await ingest_files_batched(db, file_paths)
+    async with async_session() as db:
+        results = await ingest_files_batched(db, file_paths)
+
+    # 缓存失效统一在这里处理：只要本批有任何文件实际更改了知识库数据，
+    # 就清一次检索/回答缓存（全批只清一次）。与改造前"每个文件清两次"相比，
+    # 批量入库（如队列连续消费 10 个文件）只需失效一次，避免缓存踩踏。
+    if any(r.get("status") in _CHANGED_STATUSES for r in results):
+        await cache_clear_prefix("search:")
+        await cache_clear_prefix("ans:")
+    return results
 
 
 async def search_documents(
@@ -58,7 +70,7 @@ async def list_documents(limit: Optional[int] = None, offset: int = 0) -> List[d
     按 updated_at 倒序返回；limit 为空时返回全部，offset 用于分页。
     返回 [{id, file_name, version, source, chunk_count, sync_status}, ...]
     """
-    async with AsyncSession() as db:
+    async with async_session() as db:
         files = await select_file_names(db, limit=limit, offset=offset)
     return [
         {

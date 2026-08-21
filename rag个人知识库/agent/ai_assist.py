@@ -11,6 +11,7 @@
     answer = ask([HumanMessage(content="你好")], thread_id="user-123")
 """
 import asyncio
+import logging
 from typing import List
 
 import os
@@ -21,6 +22,8 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from rag个人知识库.agent.model import get_chat_model
+
+logger = logging.getLogger(__name__)
 
 # 系统提示词：直接内聚到 agent，约束只依据资料回答
 SYSTEM_PROMPT = (
@@ -59,13 +62,13 @@ def get_checkpointer():
             saver.setup()  # 建 checkpoint 表（幂等）
             _checkpointer_stack = stack
             _checkpointer = saver
-            print("[ai_assist] 对话记忆已启用 Postgres 持久化")
+            logger.info("[ai_assist] 对话记忆已启用 Postgres 持久化")
         except Exception as e:
-            print(f"[ai_assist] Postgres 记忆初始化失败（{e}），回退进程内 InMemorySaver")
+            logger.warning("[ai_assist] Postgres 记忆初始化失败（%s），回退进程内 InMemorySaver", e)
             _checkpointer = InMemorySaver()
     else:
-        print("[ai_assist] 未配置 MEMORY_DATABASE_URL，对话记忆用进程内 InMemorySaver（重启丢失；"
-              "生产请配置 Postgres）")
+        logger.info("[ai_assist] 未配置 MEMORY_DATABASE_URL，对话记忆用进程内 InMemorySaver（重启丢失；"
+                    "生产请配置 Postgres）")
         _checkpointer = InMemorySaver()
     return _checkpointer
 

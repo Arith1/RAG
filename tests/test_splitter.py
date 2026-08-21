@@ -1,7 +1,7 @@
 """切分器单元测试：QA 原子保护 / 还原长度分组 / 占位符机制（纯函数，无网络）。"""
 from langchain_core.documents import Document
 
-from rag个人知识库.spliter.spliter import (
+from rag个人知识库.splitter.spliter import (
     _QA_PAIR_RE, _effective_len, _protect_atomic_blocks, _restore_atomic_blocks,
     _split_by_restored_length, split_documents,
 )

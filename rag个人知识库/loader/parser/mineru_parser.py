@@ -8,6 +8,7 @@ MinerU PDF 批量解析：调用 minerU_files(file_paths) 传入本地文件路�
 提交（submit_batch）与轮询下载（poll + download）已拆分，
 调用方可先提交 batch，利用服务端解析的等待期并行处理其他本地文档。
 """
+import logging
 import os
 import time
 import zipfile
@@ -15,6 +16,8 @@ import io
 
 import requests
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 def _build_header() -> dict:
@@ -36,15 +39,14 @@ def poll_batch_result(batch_id, header, interval=5, timeout=600, expected_data_i
     expected_data_ids: 非 None 时只等待这些 data_id 对应的文件，避免上传失败的文件阻塞整批。
     """
     result_url = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
-    # flush=True 强制刷新缓冲区，保证非终端环境（如 uv run）下能实时看到进度
-    print('start polling batch:{} ...'.format(batch_id), flush=True)
+    logger.info("start polling batch:%s ...", batch_id)
     start = time.time()
     # 在 timeout 时限内每隔 interval 秒查一次，避免无限等待
     while time.time() - start < timeout:
         res = requests.get(result_url, headers=header, timeout=30)
         if res.status_code != 200:
             # 接口偶发非 200 不直接退出，休眠后继续重试
-            print('poll failed. status:{}'.format(res.status_code), flush=True)
+            logger.warning("poll failed. status:%s", res.status_code)
             time.sleep(interval)
             continue
         extract_results = res.json()["data"]["extract_result"]
@@ -58,7 +60,7 @@ def poll_batch_result(batch_id, header, interval=5, timeout=600, expected_data_i
                 continue
         # state 取值：waiting-file / pending / running / done / failed
         states = [item["state"] for item in extract_results]
-        print('current states:{}'.format(states), flush=True)
+        logger.info("current states:%s", states)
         # 所有文件都到达终态（done/failed）才结束轮询，部分失败不阻塞其他文件
         if all(s in ("done", "failed") for s in states):
             return extract_results
@@ -83,7 +85,7 @@ def download_zip(zip_url, retries=3):
             resp.raise_for_status()
             return resp.content
         except requests.exceptions.RequestException as e:
-            print('download attempt {} failed:{}'.format(attempt, e), flush=True)
+            logger.warning("download attempt %d failed:%s", attempt, e)
             time.sleep(2)
     raise RuntimeError(f"zip 下载失败，已重试 {retries} 次: {zip_url}")
 
@@ -102,7 +104,7 @@ def download_and_extract(extract_results, output_root, file_paths) -> dict:
         # 解析失败的记录原因后跳过（单文件失败不阻塞整批）
         if item["state"] != "done":
             err_msg = item.get("err_msg") or "解析失败"
-            print('{} 解析失败，原因:{}'.format(item["file_name"], err_msg), flush=True)
+            logger.warning("%s 解析失败，原因:%s", item["file_name"], err_msg)
             results[src_path] = {"status": "failed", "output_dir": None, "md_path": None, "error": err_msg}
             continue
         # full_zip_url 有时效性，拿到后尽快下载。
@@ -118,13 +120,13 @@ def download_and_extract(extract_results, output_root, file_paths) -> dict:
             with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
                 zf.extractall(output_dir)
         except Exception as e:
-            print('{} 结果下载/解压失败，原因:{}'.format(item["file_name"], e), flush=True)
+            logger.warning("%s 结果下载/解压失败，原因:%s", item["file_name"], e)
             results[src_path] = {
                 "status": "failed", "output_dir": None, "md_path": None,
                 "error": f"结果下载/解压失败:{e}",
             }
             continue
-        print('{} 解析结果已解压到:{}'.format(item["file_name"], output_dir), flush=True)
+        logger.info("%s 解析结果已解压到:%s", item["file_name"], output_dir)
         # md_path 直接给到 full.md，下游无需感知产物目录结构
         results[src_path] = {
             "status": "success",
@@ -162,7 +164,7 @@ def submit_batch(file_paths: list, header: dict) -> tuple[str, dict[str, str]]:
     urls = result["data"]["file_urls"]
     if len(urls) != len(file_paths):
         raise RuntimeError(f"上传链接数量与文件数量不一致：{len(urls)} != {len(file_paths)}")
-    print('batch_id:{}'.format(batch_id), flush=True)
+    logger.info("batch_id:%s", batch_id)
     # 第 2 步：把本地文件 PUT 到预签名 URL（直传 OSS，无需再带 token）
     # file_urls 与 data["files"] 顺序一一对应，按下标对齐上传
     failed_uploads = {}
@@ -172,12 +174,12 @@ def submit_batch(file_paths: list, header: dict) -> tuple[str, dict[str, str]]:
             with open(file_paths[i], 'rb') as f:
                 res_upload = requests.put(upload_url, data=f)
             if res_upload.ok:
-                print(f"{file_name} upload success", flush=True)
+                logger.info("%s upload success", file_name)
             else:
-                print(f"{file_name} upload failed. status:{res_upload.status_code}", flush=True)
+                logger.warning("%s upload failed. status:%s", file_name, res_upload.status_code)
                 failed_uploads[str(i)] = f"上传失败 status:{res_upload.status_code}"
         except Exception as e:
-            print(f"{file_name} upload exception: {e}", flush=True)
+            logger.warning("%s upload exception: %s", file_name, e)
             failed_uploads[str(i)] = f"上传异常:{e}"
     return batch_id, failed_uploads
 
@@ -199,10 +201,10 @@ def minerU_files(file_paths: list, output_root: str | None = None) -> dict:
         if os.path.isfile(p):
             valid_paths.append(p)
         else:
-            print(f"文件不存在，跳过:{p}", flush=True)
+            logger.warning("文件不存在，跳过:%s", p)
             results[p] = {"status": "skipped", "output_dir": None, "md_path": None, "error": "文件不存在"}
     if not valid_paths:
-        print("没有可上传的有效文件", flush=True)
+        logger.warning("没有可上传的有效文件")
         return results
     # 默认产物目录跟随第一个文件所在目录
     if output_root is None:

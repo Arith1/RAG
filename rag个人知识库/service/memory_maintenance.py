@@ -13,11 +13,14 @@
            python -m rag个人知识库.service.memory_maintenance
   - 未配置 MEMORY_DATABASE_URL（InMemory 模式）时自动跳过——进程内记忆随进程消亡，无需清理。
 """
+import logging
 import os
 import sys
 import time
 
 import psycopg
+
+logger = logging.getLogger(__name__)
 
 MEMORY_TTL_DAYS = float(os.getenv("MEMORY_TTL_DAYS", "1"))
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("MEMORY_CLEANUP_INTERVAL_MINUTES", "60")) * 60
@@ -50,13 +53,13 @@ def cleanup_expired_memory(ttl_days: float = MEMORY_TTL_DAYS) -> int:
     """
     conn = _connect()
     if conn is None:
-        print("[memory_maintenance] 未配置 MEMORY_DATABASE_URL，跳过清理（InMemory 模式无需持久化清理）")
+        logger.info("[memory_maintenance] 未配置 MEMORY_DATABASE_URL，跳过清理（InMemory 模式无需持久化清理）")
         return -1
     try:
         conn.autocommit = True
         cur = conn.cursor()
         if not _has_created_at(cur):
-            print(_ALTER_HINT)
+            logger.warning("%s", _ALTER_HINT)
             return 0
         cur.execute(
             """
@@ -73,9 +76,9 @@ def cleanup_expired_memory(ttl_days: float = MEMORY_TTL_DAYS) -> int:
         if threads:
             for table in ("checkpoint_blobs", "checkpoint_writes", "checkpoints"):
                 cur.execute(f"DELETE FROM {table} WHERE thread_id = ANY(%s)", (threads,))
-            print(f"[memory_maintenance] 已清理 {len(threads)} 个超过 {ttl_days} 天未活动的会话线程")
+            logger.info("[memory_maintenance] 已清理 %d 个超过 %s 天未活动的会话线程", len(threads), ttl_days)
         else:
-            print(f"[memory_maintenance] 无过期会话（TTL {ttl_days} 天）")
+            logger.info("[memory_maintenance] 无过期会话（TTL %s 天）", ttl_days)
         return len(threads)
     finally:
         conn.close()
@@ -91,7 +94,7 @@ def cleanup_loop(
         try:
             cleanup_expired_memory(ttl_days)
         except Exception as e:
-            print(f"[memory_maintenance] 清理任务异常：{e}")
+            logger.warning("[memory_maintenance] 清理任务异常：%s", e)
         time.sleep(interval)
 
 

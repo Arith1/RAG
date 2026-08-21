@@ -2,6 +2,7 @@
 向量化存储与查询接口（MySQL 指纹 与 Milvus 主键共用同一口径）
 """
 import asyncio
+import logging
 import os
 from functools import lru_cache
 from typing import List, Optional, Tuple
@@ -17,6 +18,8 @@ from rag个人知识库.config.redis import cache_get, cache_get_sync, cache_key
 from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Milvus 连接地址：Docker Standalone 默认暴露 19530 gRPC 端口
 MILVUS_URI = os.getenv("MILVUS_URI", "http://localhost:19530")
@@ -162,7 +165,7 @@ def add_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
     按 batch_size 分批后单批失败也不影响已写入的批次。
     """
     if not chunks:
-        print("[VectorStore] 没有需要入库的 chunk，跳过")
+        logger.info("[VectorStore] 没有需要入库的 chunk，跳过")
         return []
 
     unique_chunks, ids = _dedup_chunks(chunks)
@@ -176,27 +179,23 @@ def add_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
         batch = unique_chunks[start:start + batch_size]
         batch_ids = ids[start:start + batch_size]
         inserted.extend(vector_store.add_documents(batch, ids=batch_ids))
-    print(f"[VectorStore] 成功写入 {len(inserted)} 个 chunk（原始 {len(chunks)} 个，批内去重 {len(chunks) - len(unique_chunks)} 个）")
+    logger.info("[VectorStore] 成功写入 %d 个 chunk（原始 %d 个，批内去重 %d 个）",
+                len(inserted), len(chunks), len(chunks) - len(unique_chunks))
     return inserted
-
-
-def save_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
-    """兼容旧入口：等价于 add_chunks"""
-    return add_chunks(chunks, batch_size=batch_size)
 
 
 def delete_chunks_by_ids(ids: List[str], batch_size: int = 64) -> None:
     """按确定性主键删除 Milvus 中的旧 chunk（更新流程中已消失的 chunk）"""
     if not ids:
-        print("[VectorStore] 没有需要删除的 chunk ID，跳过")
+        logger.info("[VectorStore] 没有需要删除的 chunk ID，跳过")
         return
     vector_store = get_vector_store()
     if vector_store.col is None:
-        print("[VectorStore] 集合尚未创建，无需删除")
+        logger.info("[VectorStore] 集合尚未创建，无需删除")
         return
     for start in range(0, len(ids), batch_size):
         vector_store.delete(ids=ids[start:start + batch_size])
-    print(f"[VectorStore] 已删除 {len(ids)} 个旧 chunk")
+    logger.info("[VectorStore] 已删除 %d 个旧 chunk", len(ids))
 
 
 def _source_expr(source: str) -> str:
@@ -209,12 +208,12 @@ def delete_chunks_by_source(source: str) -> None:
     """按 source 删除该文件在 Milvus 的全部向量（retry 重建用，先清后插避免残留孤儿向量）"""
     vector_store = get_vector_store()
     if vector_store.col is None:
-        print("[VectorStore] 集合尚未创建，无需删除")
+        logger.info("[VectorStore] 集合尚未创建，无需删除")
         return
     ok = vector_store.delete(expr=_source_expr(source))
     if not ok:
         raise RuntimeError(f"按 source 删除 Milvus 向量失败：{source}")
-    print(f"[VectorStore] 已按 source 删除该文件全部向量：{source}")
+    logger.info("[VectorStore] 已按 source 删除该文件全部向量：%s", source)
 
 # RRF 融合器：按各路排名倒数 1/(k+rank) 加总打分，与两路分数量纲无关，无需调权重；
 # 无状态对象，模块级定义一次处处复用
@@ -301,7 +300,7 @@ def search_with_rerank(
     except Exception as e:
         # 精排只是质量增强，接口/响应异常时退回双路召回结果，保检索可用；
         # 降级结果没有精排分，显式写 None 并打 rerank_degraded 标记，供展示层区分
-        print(f"[Rerank] 接口调用失败，降级返回召回 Top{k}：{e}")
+        logger.warning("[Rerank] 接口调用失败，降级返回召回 Top%d：%s", k, e)
         degraded = candidates[:k]
         for doc in degraded:
             doc.metadata["rerank_score"] = None
@@ -328,7 +327,8 @@ def search_with_rerank(
         doc.metadata["rerank_score"] = round(score, 4)
         reranked.append(doc)
     reranked = reranked[:k]
-    print(f"[Rerank] 召回 {len(candidates)} 条，精排后保留 {len(reranked)} 条（阈值 {score_threshold}）")
+    logger.info("[Rerank] 召回 %d 条，精排后保留 %d 条（阈值 %s）",
+                len(candidates), len(reranked), score_threshold)
     return reranked
 
 

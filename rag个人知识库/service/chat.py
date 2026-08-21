@@ -12,6 +12,7 @@
   5. 返回 answer + intent + query + sources（来源引用）
 """
 import asyncio
+import logging
 from typing import List, Optional
 
 import openai
@@ -22,6 +23,8 @@ from rag个人知识库.agent.intent import analyze
 from rag个人知识库.config.redis import cache_get, cache_key, cache_set
 from rag个人知识库.service.service import search_documents
 from rag个人知识库.vector_store.milvus_store import ANSWER_CACHE_TTL
+
+logger = logging.getLogger(__name__)
 
 # analyze 用到的历史：最多取最近 N 轮（每轮 user+assistant 两条），单条截断长度
 HISTORY_MAX_TURNS = 3
@@ -58,7 +61,7 @@ def load_recent_history(thread_id: str) -> Optional[str]:
     try:
         tup = get_checkpointer().get_tuple({"configurable": {"thread_id": thread_id}})
     except Exception as e:
-        print(f"[chat] 读取对话历史失败（不影响问答）：{e}")
+        logger.warning("[chat] 读取对话历史失败（不影响问答）：%s", e)
         return None
     if tup is None:
         return None
@@ -255,7 +258,16 @@ async def chat_stream(
 
     # 闲聊：不走检索，直接完整回答
     if analysis.intent == "chat":
-        answer = await asyncio.to_thread(ask, [HumanMessage(content=content)], thread_id)
+        try:
+            answer = await asyncio.to_thread(
+                ask, [HumanMessage(content=content)], thread_id
+            )
+        except Exception as exc:
+            # 与 chat() 的闲聊分支保持一致：模型调用异常转成 error 事件，
+            # 前端可展示友好提示，而不是收到裸 500
+            yield {"type": "error", "session_id": session_id,
+                   "message": _friendly_model_error(exc)}
+            return
         yield {"type": "answer", "session_id": session_id, "intent": "chat", "query": None,
                "answer": answer, "sources": []}
         return

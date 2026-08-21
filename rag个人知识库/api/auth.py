@@ -7,6 +7,7 @@
 - 防爆破：登录/注册滑动窗口限流（Redis ZSET + Lua 原子，重启不清零、多 worker 共享；
   Redis 不可用时回退进程内 dict）
 """
+import logging
 import os
 import time
 import uuid
@@ -22,8 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.config.redis import get_redis
 
-from rag个人知识库.config.db_config import AsyncSession, get_db
+from rag个人知识库.config.db_config import async_session, get_db
 from rag个人知识库.models.user import AuditLog, User
+
+logger = logging.getLogger(__name__)
 
 # JWT 配置（生产环境务必在 .env 中覆盖 JWT_SECRET）
 JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production")
@@ -108,7 +111,7 @@ async def write_audit(
 ) -> None:
     """独立会话写审计：用于异常路径（如登录失败，请求会抛 401 被外层回滚），
     避免审计记录随事务一起被丢弃。"""
-    async with AsyncSession() as db:
+    async with async_session() as db:
         db.add(AuditLog(user_id=user_id, username=username, action=action,
                         target=target, detail=detail))
         await db.commit()
@@ -218,13 +221,13 @@ async def seed_admin() -> None:
     username = os.getenv("ADMIN_USERNAME", "admin").strip()
     password = os.getenv("ADMIN_PASSWORD")
     if not password:
-        print("[auth] 未配置 ADMIN_PASSWORD，跳过管理员播种（配置后重启生效）")
+        logger.info("[auth] 未配置 ADMIN_PASSWORD，跳过管理员播种（配置后重启生效）")
         return
-    async with AsyncSession() as db:
+    async with async_session() as db:
         result = await db.execute(select(User).where(User.username == username))
         if result.scalar_one_or_none() is not None:
-            print(f"[auth] 管理员账号已存在：{username}")
+            logger.info("[auth] 管理员账号已存在：%s", username)
             return
         db.add(User(username=username, password_hash=hash_password(password), role="admin"))
         await db.commit()
-        print(f"[auth] 已创建管理员账号：{username}")
+        logger.info("[auth] 已创建管理员账号：%s", username)

@@ -20,11 +20,15 @@
   await run_worker()
 """
 import asyncio
+import logging
 import os
 import time
 
-from rag个人知识库.config.redis import cache_clear_prefix, get_redis, redis_available
+from rag个人知识库.config.redis import get_redis, redis_available
+from rag个人知识库.service.oss_archive import archive_local_file, rel_source_from_local
 from rag个人知识库.service.service import ingest_files
+
+logger = logging.getLogger(__name__)
 
 STREAM = "ingest_queue"
 DEAD_LETTER = "ingest_queue:dead"
@@ -36,11 +40,15 @@ CONSUMER = f"worker-{os.getpid()}"
 
 
 async def enqueue_ingest(file_path: str) -> str | None:
-    """把文件路径加入入库队列，返回消息 ID；Redis 不可用时返回 None。"""
+    """把文件路径加入入库队列，返回消息 ID；Redis 不可用时返回 None。
+
+    inflight 集合统一存**相对 source**（uploads/{user_id}/file），与记录 source 口径一致，
+    否则删除接口按 source 判断 in-flight 会对不上。
+    """
     if not await redis_available():
         return None
     r = get_redis()
-    await r.sadd(INFLIGHT_KEY, file_path)
+    await r.sadd(INFLIGHT_KEY, rel_source_from_local(file_path))
     return await r.xadd(STREAM, {"path": file_path})
 
 
@@ -48,7 +56,7 @@ async def is_inflight(file_path: str) -> bool:
     """文件是否正在入库（删除接口据此返回 409）。Redis 不可用时返回 False（放行）。"""
     if not await redis_available():
         return False
-    return bool(await get_redis().sismember(INFLIGHT_KEY, file_path))
+    return bool(await get_redis().sismember(INFLIGHT_KEY, rel_source_from_local(file_path)))
 
 
 async def _ensure_group() -> None:
@@ -78,40 +86,60 @@ async def _recover_pending() -> None:
                 break
             for msg_id, fields in claimed:
                 path = fields.get("path", "")
-                print(f"[ingest_queue] 回收崩溃残留任务 {msg_id} 并重新处理: {path}")
+                logger.info("[ingest_queue] 回收崩溃残留任务 %s 并重新处理: %s", msg_id, path)
                 ok = await process_message(msg_id, fields)
                 if ok:
                     await r.xack(STREAM, GROUP, msg_id)
                     await r.xdel(STREAM, msg_id)
                 else:
                     await _handle_failure(msg_id, fields)
-                await r.srem(INFLIGHT_KEY, path)
+                await r.srem(INFLIGHT_KEY, rel_source_from_local(path))
             start = result[0] if result else "0"
     except Exception as e:
-        print(f"[ingest_queue] 崩溃任务回收失败：{e}")
+        logger.warning("[ingest_queue] 崩溃任务回收失败：%s", e)
 
 
 async def process_message(msg_id: str, fields: dict) -> bool:
-    """执行一次入库，成功返回 True。文件已不存在视为成功（可能被删除接口清理）。"""
+    """执行一次入库，成功返回 True。文件已不存在视为成功（可能被删除接口清理）。
+
+    时序（原件保管关键）：
+      入库成功 → 归档原件到 OSS → 成功才删本地 upload
+      任何一步失败都返回 False 走重试；期间本地原件保留，重试可继续使用。
+    """
     path = fields.get("path", "")
     if not path:
         return True
     if not os.path.isfile(path):
-        print(f"[ingest_queue] 任务 {msg_id} 文件已不存在，丢弃：{path}")
+        logger.info("[ingest_queue] 任务 %s 文件已不存在，丢弃：%s", msg_id, path)
         return True
     try:
         result = await ingest_files([path])
-        # 入库完成（无论 insert/update）后清空检索/回答缓存，避免旧数据在 TTL 内被返回
-        await cache_clear_prefix("search:")
-        await cache_clear_prefix("ans:")
-        return True
+        # 缓存失效（search/ans）已下沉到 service.ingest_files 统一处理
+        if any(r.get("status") == "error" for r in result):
+            # 入库失败：不归档、不删原件，走重试（本地文件仍在）
+            return False
+        # 入库成功（inserted/updated/retried/skipped）：归档原件到 OSS，成功才删本地
+        archived = await archive_local_file(path)
+        if not archived:
+            logger.warning("[ingest_queue] 任务 %s 归档 OSS 失败，保留本地原件重试：%s", msg_id, path)
+        return archived
     except Exception as e:
-        print(f"[ingest_queue] 任务 {msg_id} 处理失败：{e}")
+        logger.warning("[ingest_queue] 任务 %s 处理失败：%s", msg_id, e)
         return False
 
 
+async def _delayed_requeue(path: str, delay: float) -> None:
+    """独立后台任务：延迟后重入队，不阻塞 worker 主消费循环。"""
+    await asyncio.sleep(delay)
+    await enqueue_ingest(path)
+
+
 async def _handle_failure(msg_id: str, fields: dict) -> None:
-    """失败重试：指数退避重入队，超限进死信。"""
+    """失败重试：指数退避重入队，超限进死信。
+
+    延迟重入队用**派生后台任务**执行（asyncio.create_task），避免 sleep 阻塞
+    worker 消费循环、连累队列后续消息的处理。
+    """
     r = get_redis()
     path = fields.get("path", "")
     retries = await r.hincrby(RETRY_HASH, path, 1)
@@ -120,12 +148,11 @@ async def _handle_failure(msg_id: str, fields: dict) -> None:
     if retries >= MAX_RETRIES:
         await r.xadd(DEAD_LETTER, {"path": path, "error": f"重试 {retries} 次仍失败", "origin": msg_id})
         await r.hdel(RETRY_HASH, path)
-        print(f"[ingest_queue] 任务 {msg_id} 进入死信队列：{path}")
+        logger.warning("[ingest_queue] 任务 %s 进入死信队列：%s", msg_id, path)
         return
     delay = 2 ** int(retries)  # 指数退避 2s / 4s
-    print(f"[ingest_queue] 任务 {msg_id} 第 {retries} 次失败，{delay}s 后重试：{path}")
-    await asyncio.sleep(delay)
-    await enqueue_ingest(path)
+    logger.warning("[ingest_queue] 任务 %s 第 %d 次失败，%ds 后重试：%s", msg_id, retries, delay, path)
+    asyncio.create_task(_delayed_requeue(path, delay))
 
 
 async def run_worker(stop: "asyncio.Event | None" = None) -> None:
@@ -138,7 +165,7 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
     await _ensure_group()
     await _recover_pending()
     r = get_redis()
-    print(f"[ingest_queue] worker 启动（consumer={CONSUMER}）")
+    logger.info("[ingest_queue] worker 启动（consumer=%s）", CONSUMER)
     last_recover = time.monotonic()
     while not (stop is not None and stop.is_set()):
         try:
@@ -159,12 +186,12 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
                         await _handle_failure(msg_id, fields)
                     # ACK 后删除消息本体，避免 stream 无限增长（XACK 不会移除条目）
                     await r.xdel(STREAM, msg_id)
-                    await r.srem(INFLIGHT_KEY, fields.get("path", ""))
+                    await r.srem(INFLIGHT_KEY, rel_source_from_local(fields.get("path", "")))
         except asyncio.CancelledError:
-            print("[ingest_queue] worker 停止")
+            logger.info("[ingest_queue] worker 停止")
             raise
         except Exception as e:
-            print(f"[ingest_queue] worker 异常：{e}")
+            logger.warning("[ingest_queue] worker 异常：%s", e)
             try:
                 await _ensure_group()  # 流/消费组被误删（如 FLUSHDB）时自愈
             except Exception:

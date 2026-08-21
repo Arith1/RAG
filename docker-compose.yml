@@ -2,8 +2,8 @@
 # RAG 个人知识库 · 一键编排
 #
 # 启动（二选一）：
-#   cd docker && docker compose up -d --build          # 在 docker/ 目录内
-#   docker compose -f docker/docker-compose.yml up -d --build   # 项目根目录
+#   docker compose up -d --build            # 项目根目录内直接启动
+#   docker compose -f docker-compose.yml up -d --build   # 任意目录指定根目录 compose
 # 停止：  docker compose down          （加 -v 会连数据卷一起删）
 # 查看：  docker compose logs -f api
 #
@@ -13,11 +13,17 @@
 #   milvus   向量库
 #   redis    入库任务队列 / 限流
 #   postgres 对话记忆
-#   api      FastAPI 应用（构建自 docker/Dockerfile，context=项目根）
+#   api      FastAPI 应用（构建自项目根 Dockerfile，context=项目根）
+#
+# 路径说明：本 compose 位于项目根目录，所有相对路径均以项目根为基准。
+#   .env 密钥文件 → ./.env（先 cp .env.example .env 并填写）
+#   init SQL     → ./docker/init/01-vector.sql
+#   业务模型 SQL → ./rag个人知识库/models（挂载为 /init-sql）
+#   resources    → ./rag个人知识库/resources（挂载为 /app/rag个人知识库/resources）
 #
 # 注意：
 #   1. 密钥从根目录 .env 注入（SILICONFLOW_API_KEY / MINERU_API_TOKEN /
-#      DEEPSEEK_API_KEY / JWT_SECRET / ADMIN_* 等），先 cp .env.example .env 并填写
+#      DEEPSEEK_API_KEY / JWT_SECRET / ADMIN_* 等）
 #   2. Postgres 对话记忆的 created_at 列：首次问答后 langgraph 自动建表，
 #      再执行一次：docker compose exec postgres psql -U root -d rag-demo \
 #        -f /init-sql/postgres_memory.sql（已挂载到容器）
@@ -34,8 +40,8 @@ services:
       - "3306:3306"
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./init/01-vector.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
-      - ../rag个人知识库/models:/init-sql:ro
+      - ./docker/init/01-vector.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
+      - ./rag个人知识库/models:/init-sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
       interval: 5s
@@ -84,6 +90,13 @@ services:
     depends_on:
       - etcd
       - minio
+    healthcheck:
+      # 9091 是 Milvus 的 metrics 端口，/healthz 返回 OK 表示 standalone 已就绪
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
   redis:
     image: redis:7-alpine
@@ -107,7 +120,7 @@ services:
       - "15432:5432"  # 宿主机 15432 → 容器 5432（与 .env 的 MEMORY_DATABASE_URL 一致）
     volumes:
       - pg-data:/var/lib/postgresql/data
-      - ../rag个人知识库/models/postgres_memory.sql:/init-sql/postgres_memory.sql:ro
+      - ./rag个人知识库/models/postgres_memory.sql:/init-sql/postgres_memory.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U root -d rag-demo"]
       interval: 5s
@@ -116,8 +129,7 @@ services:
 
   api:
     build:
-      context: ..
-      dockerfile: Dockerfile  # Dockerfile 与 compose 同在 docker/ 目录，context 用项目根
+      context: .  # 根目录方案：compose 在项目根，Dockerfile 在项目根，context 直接 ./
     container_name: rag-api
     ports:
       - "8010:8010"
@@ -129,9 +141,9 @@ services:
       postgres:
         condition: service_healthy
       milvus:
-        condition: service_started
+        condition: service_healthy
     env_file:
-      - ../.env
+      - ./.env
     environment:
       # 容器内通过服务名互联，覆盖 .env 里的 localhost 地址
       ASYNC_DATABASE_URL: mysql+aiomysql://root:root@mysql:3306/rag_demo?charset=utf8
@@ -140,7 +152,7 @@ services:
       MILVUS_URI: http://milvus:19530
     volumes:
       # 文档与上传产物持久化到宿主机（resources 已 gitignore）
-      - ../rag个人知识库/resources:/app/rag个人知识库/resources
+      - ./rag个人知识库/resources:/app/rag个人知识库/resources
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/api/health')"]
       interval: 10s

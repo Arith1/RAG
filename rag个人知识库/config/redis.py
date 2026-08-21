@@ -90,13 +90,25 @@ async def cache_clear_prefix(prefix: str) -> int:
 
     用于文档入库/删除后让检索与回答缓存失效，避免旧数据在 TTL 内继续被返回。
     返回删除的 key 数；Redis 不可用返回 0。
+
+    性能说明：
+      - scan_iter 显式 count 控制每轮迭代量，避免默认小批次下多次往返
+      - 用 UNLINK 替代 DELETE：内存异步释放，大 value 下不阻塞 Redis 主线程
+      - 收集到 key 后经 pipeline 批量下发，减少网络往返次数
     """
     try:
         r = get_redis()
         deleted = 0
-        async for key in r.scan_iter(f"{prefix}*"):
-            await r.delete(key)
-            deleted += 1
+        batch: list = []
+        async for key in r.scan_iter(f"{prefix}*", count=200):
+            batch.append(key)
+            if len(batch) >= 200:
+                deleted += len(batch)
+                await r.unlink(*batch)
+                batch.clear()
+        if batch:
+            deleted += len(batch)
+            await r.unlink(*batch)
         return deleted
     except Exception:
         return 0

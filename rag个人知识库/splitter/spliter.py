@@ -11,11 +11,14 @@
 
 入口 split_documents 按 metadata 中的 doc_type 自动分发策略。
 """
+import logging
 import re
 from typing import Dict, List, Tuple
 
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
+logger = logging.getLogger(__name__)
 
 # 按 H1~H4 分节，key 用于 metadata、也用于拼接标题路径
 HEADERS_TO_SPLIT_ON = [
@@ -196,7 +199,7 @@ def split_markdown_hybrid(
                 content = f"{header_path}\n\n{restored}" if header_path else restored
                 final_chunks.append(Document(page_content=content, metadata=dict(merged_meta)))
 
-    print(f"[HybridSplitter] 最终共切分出 {len(final_chunks)} 个 chunk")
+    logger.info("[HybridSplitter] 最终共切分出 %d 个 chunk", len(final_chunks))
     return final_chunks
 
 
@@ -212,7 +215,7 @@ def split_by_chars(
         separators=["\n\n", "\n", "。", "，", " ", ""],
     )
     chunks = splitter.split_documents(documents)
-    print(f"[CharSplitter] 共切分出 {len(chunks)} 个 chunk")
+    logger.info("[CharSplitter] 共切分出 %d 个 chunk", len(chunks))
     return chunks
 
 
@@ -241,5 +244,6 @@ def split_documents(
         chunks.extend(split_markdown_hybrid(md_docs, max_chunk_size, chunk_overlap))
     if plain_docs:
         chunks.extend(split_by_chars(plain_docs, max_chunk_size, chunk_overlap))
-    print(f"[split_documents] markdown 文档 {len(md_docs)} 个，纯文本文档 {len(plain_docs)} 个，共 {len(chunks)} 个 chunk")
+    logger.info("[split_documents] markdown 文档 %d 个，纯文本文档 %d 个，共 %d 个 chunk",
+            len(md_docs), len(plain_docs), len(chunks))
     return chunks
