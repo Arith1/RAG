@@ -12,7 +12,8 @@ CREATE TABLE `users` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
     `username` VARCHAR(64) NOT NULL COMMENT '用户名',
     `password_hash` VARCHAR(128) NOT NULL COMMENT 'bcrypt 密码哈希',
-    `role` VARCHAR(16) NOT NULL DEFAULT 'user' COMMENT '角色: admin(管理员)/user(普通用户)',
+    `role` VARCHAR(16) NOT NULL DEFAULT 'user' COMMENT '角色: admin(管理员)/user(普通用户)/guest(访客,暂未开放注册)',
+    `status` VARCHAR(16) NOT NULL DEFAULT 'active' COMMENT '账号状态: active(正常)/deleting(删除处理中)/disabled(禁用)',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
@@ -46,6 +47,8 @@ CREATE TABLE `vector_files` (
     `file_name` VARCHAR(512) NOT NULL COMMENT '文件名',
     `source` VARCHAR(512) NOT NULL COMMENT '来源标识（如文件路径/URL）',
     `identity_hash` CHAR(64) NOT NULL COMMENT '文件身份唯一标识(SHA256(file_name+source))',
+    `owner_id` BIGINT UNSIGNED NOT NULL COMMENT '文档归属用户 id（users.id，必填；用户删除时文档级联删除）',
+    `is_public` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否共享：0=私有(仅owner可见) 1=共享(所有登录用户可检索)',
     `file_content_hash` CHAR(64) NOT NULL COMMENT '整个文件内容的 SHA256,用来判断文件内容是否修改',
     `version` DECIMAL(5,1) NOT NULL DEFAULT 1.0 COMMENT '当前版本号（如 1.0, 2.0）',
     `chunk_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该文件的 chunk 总数',
@@ -56,7 +59,10 @@ CREATE TABLE `vector_files` (
 
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_identity_hash` (`identity_hash`) COMMENT '同一文件名+来源唯一',
-    KEY `idx_updated_at` (`updated_at`) COMMENT '按更新时间排序'
+    KEY `idx_updated_at` (`updated_at`) COMMENT '按更新时间排序',
+    KEY `idx_owner_id` (`owner_id`) COMMENT '按归属用户过滤（我的文档）',
+    KEY `idx_is_public` (`is_public`) COMMENT '按共享状态过滤（检索共享文档）',
+    CONSTRAINT `fk_vector_files_owner` FOREIGN KEY (`owner_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='向量文件元数据';
 
 -- ============================================

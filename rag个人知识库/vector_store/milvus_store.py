@@ -214,6 +214,21 @@ def delete_chunks_by_source(source: str) -> None:
     if not ok:
         raise RuntimeError(f"按 source 删除 Milvus 向量失败：{source}")
     logger.info("[VectorStore] 已按 source 删除该文件全部向量：%s", source)
+def _owner_expr(owner_id: int) -> str:
+    """构造按用户 id 过滤的 Milvus 表达式：owner_id == 15（账户删除清向量用）"""
+    return f"owner_id == {int(owner_id)}"
+
+
+def delete_chunks_by_owner(owner_id: int) -> None:
+    """按 owner_id 删除该用户在 Milvus 的全部向量（账户删除队列表征，幂等可重试）"""
+    vector_store = get_vector_store()
+    if vector_store.col is None:
+        logger.info("[VectorStore] 集合尚未创建，无需删除")
+        return
+    ok = vector_store.delete(expr=_owner_expr(owner_id))
+    if not ok:
+        raise RuntimeError(f"按 owner_id 删除 Milvus 向量失败：{owner_id}")
+    logger.info("[VectorStore] 已按 owner_id 删除该用户全部向量：%s", owner_id)
 
 # RRF 融合器：按各路排名倒数 1/(k+rank) 加总打分，与两路分数量纲无关，无需调权重；
 # 无状态对象，模块级定义一次处处复用
@@ -225,19 +240,34 @@ _RRF_RANKER = Function(
 )
 
 
+def _file_ids_expr(file_ids: List[int]) -> str:
+    """构造按文件 id 过滤的 Milvus 表达式：file_id in [1,2,3]（可见性过滤的核心载体）"""
+    ids = ",".join(str(i) for i in file_ids)
+    return f"file_id in [{ids}]"
+
+
 def search(
     query: str,
     k: int = 3,
     expr: Optional[str] = None,
     source: Optional[str] = None,
+    file_ids: Optional[List[int]] = None,
 ) -> List[Document]:
     """双路召回：dense 语义 + BM25 关键词两路各取候选，RRF 融合后返回 Top k。
 
     expr: 原生 Milvus 过滤表达式（如 'file_name == "a.docx"'）；
-    source: 便捷的按来源过滤，与 expr 二选一，同时提供时以 source 为准。
+    source: 便捷的按来源过滤；file_ids: 按文件 id 集合过滤（可见性控制）。
+    三者同时提供时以 file_ids 为最外层、source/expr 用 and 组合。
     """
     vector_store = get_vector_store()
-    filter_expr = _source_expr(source) if source is not None else expr
+    parts = []
+    if file_ids:
+        parts.append(_file_ids_expr(file_ids))
+    if source is not None:
+        parts.append(_source_expr(source))
+    elif expr:
+        parts.append(expr)
+    filter_expr = " and ".join(parts) if parts else None
     kwargs: dict = {
         # 每路各自预取 k 条再融合（库内默认只预取 4 条，必须显式放大）
         "fetch_k": k,
@@ -278,6 +308,7 @@ def search_with_rerank(
     score_threshold: float = RERANK_SCORE_THRESHOLD,
     expr: Optional[str] = None,
     source: Optional[str] = None,
+    file_ids: Optional[List[int]] = None,
 ) -> List[Document]:
     """
     双路召回 + 精排：dense/BM25 双路召回 Top recall_k → reranker 精排 → 阈值过滤后取 Top k。
@@ -285,8 +316,9 @@ def search_with_rerank(
     recall_k 需明显大于 k（默认 20 vs 5），给精排留足挑选空间；
     精排分写入 metadata 的 rerank_score，便于下游观察区分度；
     rerank 接口故障时降级返回召回 Top k，不让精排环节成为单点故障。
+    file_ids: 按文件 id 集合过滤（可见性控制），透传给 search。
     """
-    candidates = search(query, k=recall_k, expr=expr, source=source)
+    candidates = search(query, k=recall_k, expr=expr, source=source, file_ids=file_ids)
     if not candidates:
         return []
 
@@ -346,6 +378,9 @@ async def adelete_chunks_by_ids(ids: List[str], batch_size: int = 64) -> None:
 async def adelete_chunks_by_source(source: str) -> None:
     """delete_chunks_by_source 的异步版本：线程池中执行按 source 删除"""
     await asyncio.to_thread(delete_chunks_by_source, source)
+async def adelete_chunks_by_owner(owner_id: int) -> None:
+    """delete_chunks_by_owner 的异步版本：线程池中执行按 owner_id 删除"""
+    await asyncio.to_thread(delete_chunks_by_owner, owner_id)
 
 
 async def asearch_with_rerank(
@@ -355,8 +390,9 @@ async def asearch_with_rerank(
     score_threshold: float = RERANK_SCORE_THRESHOLD,
     expr: Optional[str] = None,
     source: Optional[str] = None,
+    file_ids: Optional[List[int]] = None,
 ) -> List[Document]:
     """search_with_rerank 的异步版本：线程池中执行召回 + 精排"""
     return await asyncio.to_thread(
-        search_with_rerank, query, k, recall_k, score_threshold, expr, source
+        search_with_rerank, query, k, recall_k, score_threshold, expr, source, file_ids
     )

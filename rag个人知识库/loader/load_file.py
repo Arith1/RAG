@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 # 文件大小阈值（单位：字节），超过此值使用 lazy_load 避免内存溢出
 # 默认 10MB
-LARGE_FILE_THRESHOLD = os.getenv("LARGE_FILE_THRESHOLD", 5 * 1024 * 1024)
-MAX_FILE_SIZE = os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024)
+LARGE_FILE_THRESHOLD = int(os.getenv("LARGE_FILE_THRESHOLD", 5 * 1024 * 1024))
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10 * 1024 * 1024))
 
 
 def smart_load(loader, file_path: str) -> List[Document]:

@@ -16,12 +16,12 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.api.auth import (
@@ -30,13 +30,18 @@ from rag个人知识库.api.auth import (
     write_audit,
 )
 from rag个人知识库.config.db_config import engine, get_db
-from rag个人知识库.config.redis import cache_clear_prefix, redis_available
+from rag个人知识库.config.redis import cache_clear_source, redis_available
 from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.chat import chat, chat_stream
-from rag个人知识库.service.document_admin import delete_document
+from rag个人知识库.service.delete_queue import (
+    enqueue_delete, process_delete_message,
+    run_worker as run_delete_worker,
+)
+from rag个人知识库.service.document_admin import delete_document, revoke_document_public
 from rag个人知识库.service.ingest_queue import (
-    enqueue_ingest, is_inflight, queue_stats, run_worker,
+    enqueue_ingest, is_inflight, queue_stats,
+    run_worker as run_ingest_worker,
 )
 from rag个人知识库.service.memory_maintenance import (
     CLEANUP_INTERVAL_SECONDS, MEMORY_TTL_DAYS, cleanup_expired_memory,
@@ -50,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 # ── 上传目录与限制（与 loader/oss_archive 的校验口径一致）──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MAX_UPLOAD_SIZE = os.getenv("MAX_FILE_SIZE", 10*1024*1024)
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_FILE_SIZE", 10*1024*1024))
 ALLOWED_EXT = {".pdf", ".docx", ".txt", ".md"}
 
 
@@ -124,9 +129,12 @@ async def lifespan(_app: FastAPI):
     await seed_admin()
     cleanup_task = asyncio.create_task(_memory_cleanup_loop())
     ingest_worker_task = None
+    delete_worker_task = None
     if await redis_available():
-        ingest_worker_task = asyncio.create_task(run_worker())
+        ingest_worker_task = asyncio.create_task(run_ingest_worker())
+        delete_worker_task = asyncio.create_task(run_delete_worker())
         logger.info("[api] 入库任务队列已启用（Redis Streams worker 启动）")
+        logger.info("[api] 账户删除队列已启用（Redis Streams worker 启动）")
     else:
         logger.info("[api] Redis 不可用，入库任务回退进程内执行（配置 REDIS_URL 并启动 Redis 后启用队列）")
     logger.info("[api] 上传目录：%s", UPLOAD_DIR)
@@ -135,6 +143,8 @@ async def lifespan(_app: FastAPI):
     cleanup_task.cancel()
     if ingest_worker_task is not None:
         ingest_worker_task.cancel()
+    if delete_worker_task is not None:
+        delete_worker_task.cancel()
     await engine.dispose()
 
 
@@ -227,6 +237,8 @@ async def login(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "尝试过于频繁，请 1 分钟后再试")
     result = await db.execute(select(User).where(User.username == form.username))
     user = result.scalar_one_or_none()
+    if user is not None and user.status != "active":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "账号已删除/删除中/禁用，无法登录")
     if user is None or not verify_password(form.password, user.password_hash):
         await record_failure(key)
         await write_audit("login_failed", username=form.username, detail=f"ip={_client_ip(request)}")
@@ -238,20 +250,62 @@ async def login(
 @app.get("/api/auth/me", response_model=UserOut)
 async def me(user: User = Depends(get_current_user)):
     return UserOut(id=user.id, username=user.username, role=user.role)
+@app.post("/api/auth/delete-account", status_code=status.HTTP_202_ACCEPTED)
+async def delete_account(
+    background: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """提交账户删除请求。
+
+    处理顺序：
+      1. 当前用户 status 置为 deleting
+      2. 该用户所有文档 is_public 置为 0（防止删除队列执行期间共享文档仍被他人检索）
+      3. 进入 delete_queue（Redis Streams），队列内先删 Milvus，再删 OSS，最后删 MySQL 用户
+    Redis 不可用时回退进程内异步任务，保证删除请求不中断。
+    """
+    if user.status != "active":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "当前账号状态不可删除")
+
+    user.status = "deleting"
+    await db.execute(
+        update(VectorFile)
+        .where(VectorFile.owner_id == user.id)
+        .values(is_public=False)
+    )
+    audit(db, user, "delete_account_request", target=user.username, detail="status=deleting, docs is_public=0")
+    await db.commit()
+
+    msg_id = await enqueue_delete(user.id)
+    if msg_id is not None:
+        return {
+            "status": "deleting",
+            "queued": True,
+            "message": "已提交账户删除队列，删除完成后账号将无法登录",
+        }
+
+    background.add_task(process_delete_message, None, {"user_id": str(user.id)})
+    return {
+        "status": "deleting",
+        "queued": False,
+        "message": "Redis 未启用，已启动进程内账户删除任务",
+    }
 
 
-# ══ 文档管理（RBAC：上传/删除仅管理员）══
+# ══ 文档管理（上传：登录用户可上传自己的文档；删除：本人或管理员）══
 @app.post("/api/documents/upload")
 async def upload_document(
     background: BackgroundTasks,
     file: UploadFile = File(...),
-    admin: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
+    is_public: bool = Form(False),
     db: AsyncSession = Depends(get_db),
 ):
     """上传文档并异步入库（加载→切分→MySQL→Milvus）。MinerU 解析在后台执行，不阻塞响应。
 
-    上传按用户分目录隔离：uploads/{user_id}/{file_name}；source 采用相对路径，
-    便于服务器环境下与 OSS 归档（key=相对路径）及下载 URL 保持一致。
+    普通用户/管理员均可上传；文档归属当前用户（owner_id=user.id），
+    is_public 控制是否共享（默认私有）。上传按用户分目录隔离：
+    uploads/{user_id}/{file_name}；source 采用相对路径，便于与 OSS 归档及下载 URL 保持一致。
     """
     # 跨平台安全取文件名：统一先转正斜杠再取最后一段，兼容 Windows/Linux 部署
     file_name = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
@@ -269,22 +323,24 @@ async def upload_document(
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "文件超过 10MB 上限")
     # 按用户分目录隔离：uploads/{user_id}/{file_name}（不同用户同名文件互不覆盖）
-    user_dir = os.path.join(UPLOAD_DIR, str(admin.id))
+    user_dir = os.path.join(UPLOAD_DIR, str(user.id))
     os.makedirs(user_dir, exist_ok=True)
     # 保留原始文件名：同名重复上传 = 同一文档（同 source/identity）→ 指纹增量更新语义；
     # basename 已剥离路径，无路径穿越风险
     path = os.path.join(user_dir, file_name)
     with open(path, "wb") as f:
         f.write(content)
-    audit(db, admin, "upload", target=file_name, detail=path)
+    audit(db, user, "upload", target=file_name, detail=path)
     # 优先走 Redis Streams 任务队列（可靠、可重试、崩溃恢复）；
     # Redis 不可用时回退进程内后台任务，保证系统不中断
-    msg_id = await enqueue_ingest(path)
+    msg_id = await enqueue_ingest(path, owner_id=user.id, is_public=is_public)
     if msg_id is not None:
         return {"status": "processing", "file_name": file_name, "path": path,
+                "is_public": is_public,
                 "message": "已提交入库队列，稍后刷新文档列表查看结果（sync_status 变为 in_sync 即完成）"}
-    background.add_task(ingest_files, [path])
+    background.add_task(ingest_files, [path], owner_id=user.id, is_public=is_public)
     return {"status": "processing", "file_name": file_name, "path": path,
+            "is_public": is_public,
             "message": "已提交入库（进程内任务，Redis 未启用），稍后刷新文档列表查看结果"}
 
 
@@ -324,8 +380,8 @@ def _sanitize_source_paths(items: List[dict]) -> None:
 
 @app.get("/api/documents", response_model=List[DocumentOut])
 async def list_docs(user: User = Depends(get_current_user)):
-    """文档列表（所有登录用户可读，仅元数据；source 已脱敏不暴露本地路径）。"""
-    docs = await list_documents()
+    """文档列表（登录用户可见：自己的 + 共享的；source 已脱敏不暴露本地路径）。"""
+    docs = await list_documents(user_id=user.id)
     for d in docs:
         d["source"] = _sanitize_source(d["source"])
     return docs
@@ -350,10 +406,30 @@ async def remove_document(
     ok = await delete_document(db, file_id, admin, upload_dir=UPLOAD_DIR)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
-    # 删除后清空检索/回答缓存，避免 TTL 内继续返回已删文档的旧结果
-    await cache_clear_prefix("search:")
-    await cache_clear_prefix("ans:")
+    # 删除后只清理包含该文档 source 的检索/回答缓存，避免 TTL 内继续返回已删文档的旧结果
+    await cache_clear_source(record.source)
     return {"status": "deleted", "file_id": file_id}
+@app.post("/api/documents/{file_id}/revoke")
+async def revoke_document(
+    file_id: int,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员把共享文档取消为私有（is_public=1 → 0）。
+
+    普通用户不受影响；文档不存在时返回 404。
+    """
+    record = await revoke_document_public(db, file_id, admin)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+    # 取消共享后只清理包含该文档 source 的检索/回答缓存，不影响其他文档缓存
+    await cache_clear_source(record.source)
+    return {
+        "status": "revoked",
+        "file_id": file_id,
+        "file_name": record.file_name,
+        "is_public": record.is_public,
+    }
 
 
 @app.get("/api/documents/{file_id}/download")
@@ -407,7 +483,7 @@ async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
     try:
-        result = await chat(body.content, thread_id=thread_id)
+        result = await chat(body.content, thread_id=thread_id, user_id=user.id)
     except Exception as e:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"问答服务异常：{e}")
     sources = result.get("sources", [])
@@ -431,7 +507,7 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
     """
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
-    gen = chat_stream(body.content, thread_id=thread_id, session_id=session_id)
+    gen = chat_stream(body.content, thread_id=thread_id, session_id=session_id, user_id=user.id)
     return StreamingResponse(
         _sse_events(gen),
         media_type="text/event-stream",
@@ -444,9 +520,9 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
 
 @app.post("/api/search")
 async def search_api(body: SearchIn, user: User = Depends(get_current_user)):
-    """语义检索（双路召回 + rerank 精排）。"""
+    """语义检索（双路召回 + rerank 精排），仅返回当前用户可见的文档（自己的 + 共享的）。"""
     try:
-        hits = await search_documents(body.query, k=body.k, source=body.source)
+        hits = await search_documents(body.query, k=body.k, source=body.source, user_id=user.id)
     except Exception as e:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"检索服务异常：{e}")
     _sanitize_source_paths(hits)

@@ -1,10 +1,13 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import DateTime, Integer, String, Index, Text, ForeignKey, BigInteger, \
+from sqlalchemy import Boolean, DateTime, Integer, String, Index, Text, ForeignKey, BigInteger, \
     Numeric, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+if TYPE_CHECKING:
+    from rag个人知识库.models.user import User
 
 
 class Base(DeclarativeBase):
@@ -24,6 +27,11 @@ class Base(DeclarativeBase):
 
 class VectorFile(Base):
     __tablename__ = 'vector_files'
+
+    __table_args__ = (
+        Index("idx_owner_id", "owner_id"),
+        Index("idx_is_public", "is_public"),
+    )
 
     # 字段定义
     id: Mapped[int] = mapped_column(
@@ -47,6 +55,21 @@ class VectorFile(Base):
         nullable=False,
         unique=True,
         comment="文件身份唯一标识(SHA256(file_name+source))"
+    )
+    # 文档归属用户（必填；用户删除时文档级联删除，对应 SQL fk_vector_files_owner CASCADE）
+    owner_id: Mapped[int] = mapped_column(
+        BigInteger(),
+        ForeignKey('users.id', ondelete='CASCADE'),
+        nullable=False,
+        comment="文档归属用户 id（users.id）"
+    )
+    # 是否共享：False=私有（仅 owner 可见）/ True=共享（所有登录用户可检索）
+    is_public: Mapped[bool] = mapped_column(
+        Boolean(),
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment="是否共享: 0=私有 1=共享"
     )
     file_content_hash: Mapped[str] = mapped_column(
         String(64),  # CHAR(64) 在 SQLAlchemy 中用 String 即可
@@ -86,6 +109,9 @@ class VectorFile(Base):
         back_populates='file',
         cascade='all, delete-orphan',  # 对应 ON DELETE CASCADE
         passive_deletes=True  # 让数据库处理级联删除
+    )
+    owner: Mapped['User'] = relationship(
+        back_populates='documents'
     )
 
     def __repr__(self):

@@ -103,6 +103,8 @@ async def _stage_insert(
     file_path: str,
     content_hash: str,
     chunks: List[Document],
+    owner_id: Optional[int] = None,
+    is_public: bool = False,
 ) -> Tuple[int, Decimal, Dict[str, int]]:
     """阶段一（仅 MySQL）：全新入库，落库期望状态（status=pending）。
 
@@ -112,7 +114,10 @@ async def _stage_insert(
     # 用相对路径作为 source（uploads/{user_id}/file），与 Milvus 主键/检索口径一致
     source = rel_source_from_local(file_path)
 
-    file = await insert_file(db, file_name, source, content_hash, version=INITIAL_VERSION)
+    file = await insert_file(
+        db, file_name, source, content_hash,
+        version=INITIAL_VERSION, owner_id=owner_id, is_public=is_public,
+    )
     fingerprints = _unique_fingerprints(chunks, source)
     await insert_chunks(db, file.id, fingerprints, INITIAL_VERSION)
     await update_chunk_count(db, file.id)
@@ -215,10 +220,13 @@ async def process_file(
     db: AsyncSession,
     file_path: str,
     mineru_result: Optional[dict] = None,
+    owner_id: Optional[int] = None,
+    is_public: bool = False,
 ) -> dict:
     """单文件完整流程：校验 → 预检 → 按需加载/切分 → MySQL 落期望状态 → 同步 Milvus。
 
     mineru_result: 批量 MinerU 解析结果；非 None 时不再单独触发 MinerU 上传解析。
+    owner_id / is_public: 文档归属与共享标记（API 上传场景传入，写入 vector_files + chunk metadata）。
     """
     # 1. 基础校验
     error = validate_file(file_path)
@@ -279,12 +287,14 @@ async def process_file(
         removed_ids: List[str] = []
         summary = {"added": len(chunks), "unchanged": 0, "removed": 0}
         rebuild_source = record.source
+        owner_id = owner_id or record.owner_id  # 重放沿用记录里的 owner
     else:
         rebuild_source = None
         try:
             if action == "insert":
                 file_id, version, summary = await _stage_insert(
-                    db, file_path, content_hash, chunks
+                    db, file_path, content_hash, chunks,
+                    owner_id=owner_id, is_public=is_public,
                 )
                 added_chunks = chunks
                 removed_ids = []
@@ -292,11 +302,19 @@ async def process_file(
                 file_id, version, added_chunks, removed_ids, summary = await _stage_update(
                     db, record, content_hash, chunks
                 )
+                owner_id = owner_id or record.owner_id  # 更新沿用已有 owner
             await db.commit()
         except Exception as e:
             await db.rollback()
             logger.warning("[Ingest] %s 元数据落库失败，已回滚（Milvus 未改动）：%s", file_path, e)
             return {"file_path": file_path, "status": "error", "message": f"元数据落库失败：{e}"}
+
+    # 5.5 阶段二前：把 file_id / owner_id 写入即将入 Milvus 的 chunk metadata
+    #   （检索可见性过滤载体：file_id in (...) / owner_id 溯源；source 已在切分前写入）
+    if owner_id is not None:
+        for doc in added_chunks:
+            doc.metadata["file_id"] = file_id
+            doc.metadata["owner_id"] = owner_id
 
     # 6. 阶段二：同步 Milvus（独立会话标记状态，与阶段一事务隔离）
     try:
@@ -316,10 +334,16 @@ async def process_file(
         return {"file_path": file_path, "status": "error", "message": str(e), "retryable": True}
 
 
-async def ingest_files_batched(db: AsyncSession, file_paths: List[str]) -> List[dict]:
+async def ingest_files_batched(
+    db: AsyncSession,
+    file_paths: List[str],
+    owner_id: Optional[int] = None,
+    is_public: bool = False,
+) -> List[dict]:
     """批量入库编排：先过滤 skip，把复杂文档批量交给 MinerU，再按原始顺序回填结果。
 
     返回顺序与输入 file_paths 完全一致，复杂文档不会因为批量解析而打乱顺序。
+    owner_id / is_public 透传给每个文件的入库（写入归属与共享标记）。
     """
     ordered_results: List[Optional[dict]] = [None] * len(file_paths)
     complex_batch: List[Tuple[int, str]] = []
@@ -347,7 +371,9 @@ async def ingest_files_batched(db: AsyncSession, file_paths: List[str]) -> List[
             if await asyncio.to_thread(needs_mineru, file_path):
                 complex_batch.append((idx, file_path))
             else:
-                ordered_results[idx] = await process_file(db, file_path)
+                ordered_results[idx] = await process_file(
+                    db, file_path, owner_id=owner_id, is_public=is_public,
+                )
         except Exception as e:
             await db.rollback()
             ordered_results[idx] = {
@@ -380,6 +406,8 @@ async def ingest_files_batched(db: AsyncSession, file_paths: List[str]) -> List[
                         db,
                         file_path,
                         mineru_result=mineru_results[position],
+                        owner_id=owner_id,
+                        is_public=is_public,
                     )
             except Exception as e:
                 await db.rollback()

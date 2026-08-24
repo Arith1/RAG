@@ -84,6 +84,74 @@ def cache_set_sync(key: str, value, ttl: int) -> bool:
     except Exception:
         return False
 
+def _cache_value_has_source(value, source: str) -> bool:
+    """判断一个 Redis 缓存值是否引用了指定文档 source。
+
+    支持：
+      - search 缓存：list[dict]，检查 item.source 或 item.metadata.source
+      - ans 缓存（新格式）：dict，检查 source_list
+      - ans 旧格式：纯字符串，直接包含匹配（尽力兼容）
+    """
+    if isinstance(value, dict):
+        source_list = value.get("source_list")
+        if isinstance(source_list, list) and source in source_list:
+            return True
+        sources = value.get("sources")
+        if isinstance(sources, list):
+            if source in sources:
+                return True
+            if any(isinstance(s, dict) and s.get("source") == source for s in sources):
+                return True
+        return False
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if item.get("source") == source:
+                return True
+            meta = item.get("metadata")
+            if isinstance(meta, dict) and meta.get("source") == source:
+                return True
+        return False
+    if isinstance(value, str):
+        return source in value
+    return False
+
+
+async def cache_clear_source(source: str) -> int:
+    """只清理包含指定文档 source 的检索/回答缓存。
+
+    用于共享文档被取消共享后，精准删除引用该文档的缓存，而不是清空所有用户缓存。
+    返回删除的 key 数；Redis 不可用返回 0。
+    """
+    if not source:
+        return 0
+    try:
+        r = get_redis()
+        deleted = 0
+        for prefix in ("search:", "ans:"):
+            batch: list = []
+            async for key in r.scan_iter(f"{prefix}*", count=200):
+                raw = await r.get(key)
+                if raw is None:
+                    continue
+                try:
+                    value = json.loads(raw)
+                except Exception:
+                    value = raw
+                if not _cache_value_has_source(value, source):
+                    continue
+                batch.append(key)
+                if len(batch) >= 200:
+                    deleted += len(batch)
+                    await r.unlink(*batch)
+                    batch.clear()
+            if batch:
+                deleted += len(batch)
+                await r.unlink(*batch)
+        return deleted
+    except Exception:
+        return 0
 
 async def cache_clear_prefix(prefix: str) -> int:
     """按前缀清除缓存（如 "search:" / "ans:"）。

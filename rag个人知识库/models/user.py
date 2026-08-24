@@ -1,14 +1,14 @@
 """用户与审计模型（MySQL 业务库）。
 
-- User：账号 + 角色（admin/user），RBAC 的根
-- AuditLog：管理员操作审计（上传/删除等），用户名冗余存储，防用户删除后审计丢失
+- User：账号 + 角色（admin/user/guest）+ 状态（active/deleting/disabled），RBAC 的根
+- AuditLog：操作审计（注册/上传/删除等），用户名冗余存储，防用户删除后审计丢失
 """
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy import BigInteger, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from rag个人知识库.models.vector import Base
+from rag个人知识库.models.vector import Base, VectorFile
 
 
 class User(Base):
@@ -25,11 +25,22 @@ class User(Base):
     )
     role: Mapped[str] = mapped_column(
         String(16), nullable=False, default="user", server_default="user",
-        comment="角色: admin(管理员) / user(普通用户)"
+        comment="角色: admin(管理员) / user(普通用户) / guest(访客,暂未开放注册)"
+    )
+    # 账号状态：active(正常) / deleting(删除处理中) / disabled(禁用)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active",
+        comment="账号状态: active(正常)/deleting(删除处理中)/disabled(禁用)"
+    )
+
+    # 关系：该用户拥有的文档（SQL 外键 ON DELETE CASCADE 已负责级联删除）
+    documents: Mapped[List["VectorFile"]] = relationship(
+        back_populates="owner",
+        passive_deletes=True,
     )
 
     def __repr__(self):
-        return f"<User(id={self.id}, username='{self.username}', role='{self.role}')>"
+        return f"<User(id={self.id}, username='{self.username}', role='{self.role}', status='{self.status}')>"
 
 
 class AuditLog(Base):

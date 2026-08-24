@@ -55,3 +55,27 @@ async def delete_document(
 
     logger.info("[document_admin] 已删除文档：%s (id=%d)", record.file_name, file_id)
     return True
+async def revoke_document_public(
+    db: AsyncSession,
+    file_id: int,
+    actor: User,
+) -> VectorFile | None:
+    """管理员把共享文档取消共享（is_public=1 → 0）。
+
+    返回 None 表示文档不存在；返回 VectorFile 表示已改为私有（事务由调用方提交）。
+    """
+    result = await db.execute(select(VectorFile).where(VectorFile.id == file_id))
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+
+    record.is_public = False
+    db.add(AuditLog(
+        user_id=actor.id,
+        username=actor.username,
+        action="revoke_public",
+        target=record.file_name,
+        detail=f"{record.source} (is_public=1 -> 0 by admin)",
+    ))
+    logger.info("[document_admin] 管理员 %s 已将共享文档取消共享：%s (id=%d)", actor.username, record.file_name, file_id)
+    return record

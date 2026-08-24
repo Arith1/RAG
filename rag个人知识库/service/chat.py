@@ -128,8 +128,12 @@ async def chat(
     source: Optional[str] = None,
     expr: Optional[str] = None,
     thread_id: str = "default",
+    user_id: Optional[int] = None,
 ) -> dict:
-    """对话统一入口：意图识别 → （闲聊直答 | 问答环节）。"""
+    """对话统一入口：意图识别 → （闲聊直答 | 问答环节）。
+
+    user_id: 检索可见性过滤（仅返回当前用户可见文档），传 None 不过滤（CLI 场景）。
+    """
     # 第一步：意图识别 + 查询提炼（结合最近对话补全指代；读取失败则退化为无历史）
     history = await asyncio.to_thread(load_recent_history, thread_id)
     analysis = await asyncio.to_thread(analyze, content, history)
@@ -171,7 +175,7 @@ async def chat(
 
     # 问答环节：用提炼后的 query 向量检索 → 拼接 user_prompt → Agent
     query = analysis.query or content
-    hits = await search_documents(query, k=k, source=source, expr=expr)
+    hits = await search_documents(query, k=k, source=source, expr=expr, user_id=user_id)
     if not hits:
         return {
             "answer": "知识库中未找到相关资料，请换个问法，或确认文档已入库。",
@@ -183,11 +187,12 @@ async def chat(
 
     user_prompt = _build_user_prompt(query, hits)
     # 回答缓存：同一 user_prompt（query + 相同参考资料）→ 复用 LLM 回答（TTL 1 小时）。
-    # user_prompt 已包含完整上下文，跨会话同问同答是安全的；Redis 不可用则正常生成。
+    # 缓存值改为 {answer, source_list}，便于按文档 source 精准失效。
+    # 兼容旧缓存：如果缓存还是纯字符串，直接作为 answer 使用。
     ans_key = cache_key("ans", user_prompt)
     cached_answer = await cache_get(ans_key)
     if cached_answer is not None:
-        answer = cached_answer
+        answer = cached_answer.get("answer") if isinstance(cached_answer, dict) else cached_answer
     else:
         try:
             answer = await asyncio.to_thread(
@@ -195,7 +200,14 @@ async def chat(
                 [HumanMessage(content=user_prompt)],
                 thread_id,
             )
-            await cache_set(ans_key, answer, ANSWER_CACHE_TTL)
+            await cache_set(
+                ans_key,
+                {
+                    "answer": answer,
+                    "source_list": [hit.get("source") for hit in hits],
+                },
+                ANSWER_CACHE_TTL,
+            )
         except Exception as exc:
             sources = [
                 {
@@ -240,6 +252,7 @@ async def chat_stream(
     k: int = 3,
     source: Optional[str] = None,
     expr: Optional[str] = None,
+    user_id: Optional[int] = None,
 ):
     """流式问答：analyze + 检索为前置步骤（普通 await），LLM 生成段逐 token 产出。
 
@@ -280,7 +293,7 @@ async def chat_stream(
 
     query = analysis.query or content
     try:
-        hits = await search_documents(query, k=k, source=source, expr=expr)
+        hits = await search_documents(query, k=k, source=source, expr=expr, user_id=user_id)
     except Exception as exc:
         # 检索失败（如 Milvus 不可用）：发 error 事件而非直接断流，前端可提示重试
         yield {"type": "error", "session_id": session_id, "message": f"检索服务异常：{exc}"}
@@ -302,11 +315,13 @@ async def chat_stream(
 
     user_prompt = _build_user_prompt(query, hits)
     # 回答缓存命中：直接回放完整答案（仍走 token 事件，前端体验一致）
+    # 缓存值为 {answer, source_list}；兼容旧纯字符串缓存。
     ans_key = cache_key("ans", user_prompt)
     cached = await cache_get(ans_key)
     if cached is not None:
-        yield {"type": "token", "text": cached}
-        yield {"type": "done", "answer": cached}
+        cached_answer = cached.get("answer") if isinstance(cached, dict) else cached
+        yield {"type": "token", "text": cached_answer}
+        yield {"type": "done", "answer": cached_answer}
         return
 
     parts: List[str] = []
@@ -318,5 +333,12 @@ async def chat_stream(
         yield {"type": "error", "message": _friendly_model_error(exc)}
         return
     answer = "".join(parts)
-    await cache_set(ans_key, answer, ANSWER_CACHE_TTL)
+    await cache_set(
+        ans_key,
+        {
+            "answer": answer,
+            "source_list": [hit.get("source") for hit in hits],
+        },
+        ANSWER_CACHE_TTL,
+    )
     yield {"type": "done", "answer": answer}

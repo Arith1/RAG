@@ -106,12 +106,17 @@ async def archive_local_file(local_path: str) -> bool:
         return False
 
 
-async def delete_source_artifact(source: str) -> None:
-    """删除文档时同步删除 OSS 中的原件（source 为相对路径，OSS key 带前缀）。"""
+async def delete_source_artifact(source: str) -> bool:
+    """删除文档时同步删除 OSS 中的原件（source 为相对路径，OSS key 带前缀）。
+
+    返回 True 表示该 source 不需要删 OSS 或已成功删除；False 表示删除失败，
+    调用方（如账户删除队列）应视为失败，不能继续删除 MySQL 用户。
+    原有文档删除逻辑会忽略返回值，因此该改动向后兼容。
+    """
     if not source or not source.startswith("uploads/"):
-        return
+        return True
     if not is_oss_enabled():
-        return
+        return True
     key = oss_key_from_source(source)
     try:
         def _del():
@@ -119,8 +124,10 @@ async def delete_source_artifact(source: str) -> None:
             _bucket().delete_object(key)
         await asyncio.to_thread(_del)
         logger.info("[oss_archive] 已从 OSS 删除对象：%s", key)
+        return True
     except Exception as e:
-        logger.warning("[oss_archive] OSS 删除失败（不影响库内删除）：%s（%s）", key, e)
+        logger.warning("[oss_archive] OSS 删除失败（将重试）：%s（%s）", key, e)
+        return False
 
 
 async def build_download_url(source: str, ttl: int = 3600) -> str:

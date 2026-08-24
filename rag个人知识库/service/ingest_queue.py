@@ -39,17 +39,26 @@ MAX_RETRIES = 3
 CONSUMER = f"worker-{os.getpid()}"
 
 
-async def enqueue_ingest(file_path: str) -> str | None:
+async def enqueue_ingest(
+    file_path: str,
+    owner_id: Optional[int] = None,
+    is_public: bool = False,
+) -> str | None:
     """把文件路径加入入库队列，返回消息 ID；Redis 不可用时返回 None。
 
     inflight 集合统一存**相对 source**（uploads/{user_id}/file），与记录 source 口径一致，
     否则删除接口按 source 判断 in-flight 会对不上。
+    owner_id / is_public: 上传归属与共享标记，随消息透传给 worker 入库。
     """
     if not await redis_available():
         return None
     r = get_redis()
     await r.sadd(INFLIGHT_KEY, rel_source_from_local(file_path))
-    return await r.xadd(STREAM, {"path": file_path})
+    msg: dict = {"path": file_path}
+    if owner_id is not None:
+        msg["owner_id"] = str(owner_id)
+        msg["is_public"] = "1" if is_public else "0"
+    return await r.xadd(STREAM, msg)
 
 
 async def is_inflight(file_path: str) -> bool:
@@ -113,7 +122,9 @@ async def process_message(msg_id: str, fields: dict) -> bool:
         logger.info("[ingest_queue] 任务 %s 文件已不存在，丢弃：%s", msg_id, path)
         return True
     try:
-        result = await ingest_files([path])
+        owner_id = int(fields["owner_id"]) if fields.get("owner_id") else None
+        is_public = fields.get("is_public") == "1"
+        result = await ingest_files([path], owner_id=owner_id, is_public=is_public)
         # 缓存失效（search/ans）已下沉到 service.ingest_files 统一处理
         if any(r.get("status") == "error" for r in result):
             # 入库失败：不归档、不删原件，走重试（本地文件仍在）

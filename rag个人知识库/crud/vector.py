@@ -32,6 +32,8 @@ async def insert_file(
     source: str,
     content_hash: str,
     version: str = "1.0",
+    owner_id: Optional[int] = None,
+    is_public: bool = False,
 ) -> VectorFile:
     """新增文件记录，返回带 id 的 VectorFile（调用方负责 commit）"""
     file = VectorFile(
@@ -42,6 +44,8 @@ async def insert_file(
         version=Decimal(version),
         chunk_count=0,
         sync_status=SYNC_PENDING,
+        owner_id=owner_id,
+        is_public=is_public,
     )
     db.add(file)
     await db.flush()
@@ -144,13 +148,39 @@ async def update_chunk_count(db: AsyncSession, file_id: int) -> None:
         .values(chunk_count=result.scalar_one())
     )
 
+async def select_visible_file_ids(
+    db: AsyncSession,
+    user_id: int,
+) -> List[int]:
+    """查当前用户可见的文件 id 集合：本人文档（owner_id=user_id）或共享文档（is_public=1）。
+
+    admin 与普通用户共用此规则（admin 仅额外拥有"取消他人共享"权限，不扩大检索范围）。
+    返回空列表表示无可见文档。
+    """
+    result = await db.execute(
+        select(VectorFile.id).where(
+            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True))
+        )
+    )
+    return [r for r in result.scalars().all()]
+
+
 async def select_file_names(
     db: AsyncSession,
     limit: Optional[int] = None,
     offset: int = 0,
+    user_id: Optional[int] = None,
 ):
-    """按 updated_at 倒序列出文件记录，支持可选分页。"""
+    """按 updated_at 倒序列出文件记录，支持可选分页与可见性过滤。
+
+    user_id 非 None 时仅返回该用户可见的文件（本人或共享）；
+    user_id 为 None 返回全部（CLI/管理场景）。
+    """
     stmt = select(VectorFile).order_by(VectorFile.updated_at.desc())
+    if user_id is not None:
+        stmt = stmt.where(
+            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True))
+        )
     if limit is not None:
         stmt = stmt.limit(limit)
     if offset:
