@@ -16,7 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -35,7 +35,7 @@ from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.chat import chat, chat_stream
 from rag个人知识库.service.delete_queue import (
-    enqueue_delete, process_delete_message,
+    enqueue_delete,
     run_worker as run_delete_worker,
 )
 from rag个人知识库.service.document_admin import delete_document, revoke_document_public
@@ -104,6 +104,8 @@ class DocumentOut(BaseModel):
     source: str
     chunk_count: int
     sync_status: str
+    owner_id: Optional[int] = None
+    is_public: bool = False
 
 
 # ── 生命周期：建表（幂等）+ 种子管理员 + 对话记忆清理后台任务 ──
@@ -179,6 +181,9 @@ app.add_middleware(
 async def _sse_events(gen):
     """把 chat_stream 的 JSON 事件封装为 SSE 帧：data: {json}\n\n"""
     async for event in gen:
+        # 流式事件同样需要脱敏 source，避免暴露服务器本地绝对路径
+        if event.get("sources"):
+            _sanitize_source_paths(event["sources"])
         yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
@@ -211,17 +216,19 @@ async def register(body: RegisterIn, request: Request, db: AsyncSession = Depend
     reg_key = f"reg|{_client_ip(request)}"
     if not await check_allowed(reg_key):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "注册过于频繁，请稍后再试")
-    await record_failure(reg_key)  # 注册按尝试次数计数（无失败概念），窗口内最多 LOGIN_MAX_ATTEMPTS 次
     username = body.username.strip()
     if len(username) < 2 or len(body.password) < 6:
+        await record_failure(reg_key)  # 注册只按失败次数计数
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "用户名至少 2 个字符，密码至少 6 位")
     result = await db.execute(select(User).where(User.username == username))
     if result.scalar_one_or_none() is not None:
+        await record_failure(reg_key)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "用户名已存在")
     user = User(username=username, password_hash=hash_password(body.password), role="user")
     db.add(user)
     await db.flush()
     audit(db, user, "register", target=username)
+    await clear_key(reg_key)  # 注册成功后清空失败计数
     return UserOut(id=user.id, username=user.username, role=user.role)
 
 
@@ -237,9 +244,8 @@ async def login(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "尝试过于频繁，请 1 分钟后再试")
     result = await db.execute(select(User).where(User.username == form.username))
     user = result.scalar_one_or_none()
-    if user is not None and user.status != "active":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "账号已删除/删除中/禁用，无法登录")
-    if user is None or not verify_password(form.password, user.password_hash):
+    # 非 active 账号与不存在/密码错误统一返回 401，避免暴露账号状态
+    if user is None or user.status != "active" or not verify_password(form.password, user.password_hash):
         await record_failure(key)
         await write_audit("login_failed", username=form.username, detail=f"ip={_client_ip(request)}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
@@ -250,9 +256,10 @@ async def login(
 @app.get("/api/auth/me", response_model=UserOut)
 async def me(user: User = Depends(get_current_user)):
     return UserOut(id=user.id, username=user.username, role=user.role)
+
+
 @app.post("/api/auth/delete-account", status_code=status.HTTP_202_ACCEPTED)
 async def delete_account(
-    background: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -262,10 +269,16 @@ async def delete_account(
       1. 当前用户 status 置为 deleting
       2. 该用户所有文档 is_public 置为 0（防止删除队列执行期间共享文档仍被他人检索）
       3. 进入 delete_queue（Redis Streams），队列内先删 Milvus，再删 OSS，最后删 MySQL 用户
-    Redis 不可用时回退进程内异步任务，保证删除请求不中断。
+
+    删除请求必须先成功进入 Redis Streams 再提交 DB，避免 status=deleting 但没有可靠任务导致账号卡死。
     """
     if user.status != "active":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "当前账号状态不可删除")
+
+    source_result = await db.execute(
+        select(VectorFile.source).where(VectorFile.owner_id == user.id)
+    )
+    user_sources = list(source_result.scalars().all())
 
     user.status = "deleting"
     await db.execute(
@@ -274,28 +287,28 @@ async def delete_account(
         .values(is_public=False)
     )
     audit(db, user, "delete_account_request", target=user.username, detail="status=deleting, docs is_public=0")
-    await db.commit()
 
     msg_id = await enqueue_delete(user.id)
-    if msg_id is not None:
-        return {
-            "status": "deleting",
-            "queued": True,
-            "message": "已提交账户删除队列，删除完成后账号将无法登录",
-        }
+    if msg_id is None:
+        await db.rollback()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Redis 不可用，暂时无法提交账户删除请求")
 
-    background.add_task(process_delete_message, None, {"user_id": str(user.id)})
+    await db.commit()
+
+    # 文档私有化后立即清理相关缓存，避免其他用户在删除队列执行前仍命中旧共享结果
+    for source in user_sources:
+        await cache_clear_source(source)
+
     return {
         "status": "deleting",
-        "queued": False,
-        "message": "Redis 未启用，已启动进程内账户删除任务",
+        "queued": True,
+        "message": "已提交账户删除队列，删除完成后账号将无法登录",
     }
 
 
 # ══ 文档管理（上传：登录用户可上传自己的文档；删除：本人或管理员）══
 @app.post("/api/documents/upload")
 async def upload_document(
-    background: BackgroundTasks,
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
     is_public: bool = Form(False),
@@ -328,20 +341,24 @@ async def upload_document(
     # 保留原始文件名：同名重复上传 = 同一文档（同 source/identity）→ 指纹增量更新语义；
     # basename 已剥离路径，无路径穿越风险
     path = os.path.join(user_dir, file_name)
+    # 写盘/入队前先检查是否已有同一文件正在入库，避免并发重复任务
+    if await is_inflight(path):
+        raise HTTPException(status.HTTP_409_CONFLICT, "文档正在入库中，请勿重复上传")
     with open(path, "wb") as f:
         f.write(content)
-    audit(db, user, "upload", target=file_name, detail=path)
-    # 优先走 Redis Streams 任务队列（可靠、可重试、崩溃恢复）；
-    # Redis 不可用时回退进程内后台任务，保证系统不中断
+    audit(db, user, "upload", target=file_name, detail=_sanitize_source(path))
+    # 入库任务必须进入 Redis Streams 持久队列，避免进程内存任务在崩溃时丢失
     msg_id = await enqueue_ingest(path, owner_id=user.id, is_public=is_public)
-    if msg_id is not None:
-        return {"status": "processing", "file_name": file_name, "path": path,
-                "is_public": is_public,
-                "message": "已提交入库队列，稍后刷新文档列表查看结果（sync_status 变为 in_sync 即完成）"}
-    background.add_task(ingest_files, [path], owner_id=user.id, is_public=is_public)
-    return {"status": "processing", "file_name": file_name, "path": path,
+    if msg_id is None:
+        # 任务未入队时不能保留半成品文件，清理后返回 503 由前端重试
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Redis 不可用，暂时无法提交入库任务")
+    return {"status": "processing", "file_name": file_name, "source": _sanitize_source(path),
             "is_public": is_public,
-            "message": "已提交入库（进程内任务，Redis 未启用），稍后刷新文档列表查看结果"}
+            "message": "已提交入库队列，稍后刷新文档列表查看结果（sync_status 变为 in_sync 即完成）"}
 
 
 def _sanitize_source(path: str) -> str:
@@ -379,9 +396,18 @@ def _sanitize_source_paths(items: List[dict]) -> None:
 
 
 @app.get("/api/documents", response_model=List[DocumentOut])
-async def list_docs(user: User = Depends(get_current_user)):
-    """文档列表（登录用户可见：自己的 + 共享的；source 已脱敏不暴露本地路径）。"""
-    docs = await list_documents(user_id=user.id)
+async def list_docs(
+    user: User = Depends(get_current_user),
+    limit: int = 100,
+    offset: int = 0,
+):
+    """文档列表（登录用户可见：自己的 + 共享的；source 已脱敏不暴露本地路径）。
+
+    默认分页 limit=100，单次最多 500 条，避免返回全量数据。
+    """
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    docs = await list_documents(limit=limit, offset=offset, user_id=user.id)
     for d in docs:
         d["source"] = _sanitize_source(d["source"])
     return docs
@@ -390,20 +416,29 @@ async def list_docs(user: User = Depends(get_current_user)):
 @app.delete("/api/documents/{file_id}")
 async def remove_document(
     file_id: int,
-    admin: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """删除文档：Milvus 向量 + MySQL 元数据（级联 chunk）+ 磁盘文件 + 审计。
+    """删除自己的文档：Milvus 向量 + MySQL 元数据（级联 chunk）+ 磁盘文件 + 审计。
 
+    普通用户和管理员都只能删除自己的文档；他人文档不可删除。
     若文档正在入库队列中处理，返回 409，避免"删除先执行、入库后写完向量"的孤儿向量竞态。
     """
     result = await db.execute(select(VectorFile).where(VectorFile.id == file_id))
     record = result.scalar_one_or_none()
     if record is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+    if record.owner_id != user.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "只能删除自己的文档")
+    # Redis 不可用时无法可靠判断入库状态，删除操作保守拒绝
+    if not await redis_available():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Redis 不可用，暂时无法执行删除")
     if await is_inflight(record.source):
         raise HTTPException(status.HTTP_409_CONFLICT, "文档正在入库中，请稍后重试删除")
-    ok = await delete_document(db, file_id, admin, upload_dir=UPLOAD_DIR)
+    try:
+        ok = await delete_document(db, file_id, user, upload_dir=UPLOAD_DIR)
+    except RuntimeError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
     # 删除后只清理包含该文档 source 的检索/回答缓存，避免 TTL 内继续返回已删文档的旧结果
@@ -438,8 +473,9 @@ async def download_document(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """下载文档原件：优先返回 OSS 签名/公有 URL；OSS 未启用且本地原件还在时直接回文件。
+    """下载文档原件：仅 owner 或 is_public=1 的共享文档可下载。
 
+    优先返回 OSS 签名/公有 URL；OSS 未启用且本地原件还在时直接回文件。
     服务器环境下原始文件已归档到 OSS，此接口提供可下载的链接（或直接流式返回本地副本）。
     """
     result = await db.execute(select(VectorFile).where(VectorFile.id == file_id))
@@ -447,10 +483,14 @@ async def download_document(
     if record is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
 
+    # 下载权限：仅 owner 或共享文档（is_public=1）可下载；无权限与不存在统一 404，避免探测 file_id
+    if record.owner_id != user.id and not record.is_public:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+
     # 1) OSS 启用的场景：返回会过期的签名 URL / 公有 URL，前端直接打开
     url = await build_download_url(record.source)
     if url:
-        return {"file_name": record.file_name, "source": record.source, "url": url, "expires_in": 3600}
+        return {"file_name": record.file_name, "source": _sanitize_source(record.source), "url": url, "expires_in": 3600}
 
     # 2) OSS 未启用且本地原件保留：直接流式返回本地文件
     media_type = {

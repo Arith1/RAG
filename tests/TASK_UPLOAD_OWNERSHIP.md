@@ -94,8 +94,8 @@
 
 - [ ] is_public 开关接口：文档所有者修改私有/共享状态
 - [x] admin 可把他人共享文档取消为私有（`POST /api/documents/{id}/revoke`）
-- [ ] 删除权限：owner 可删自己的
-- [ ] 下载接口权限：校验「owner 或 is_public=1」
+- [x] 删除权限：owner 可删自己的
+- [x] 下载接口权限：校验「owner 或 is_public=1」
 - [x] 账户删除：users.status=deleting → delete_queue 队列 → 先删 Milvus → 再删 OSS → 后删 SQL → deleted
 - [ ] guest 角色开放注册与权限矩阵
 - [ ] 存量数据 owner_id 回填迁移脚本（现有 8 篇文档 → admin）
@@ -124,3 +124,9 @@
 - [x] `service/chat.py`：回答缓存改为 `{answer, source_list}`，支持按 source 精准失效
 - [x] 端到端验证：普通用户上传共享文档，其他用户可见；admin revoke 后 `is_public=0`，其他用户不可见，owner 自己仍可见
 - [x] 端到端验证：新用户上传私有+共享文档后提交删除，状态变为 `deleting`、共享文档立即私有化；随后 Milvus 向量、OSS 原件、MySQL 用户依次删除，账号无法再登录
+---
+
+## 十二、已完成：下载接口越权修复
+
+- [x] `api/main.py`：`download_document` 增加权限校验，仅 `owner_id=user.id` 或 `is_public=1` 可下载
+- [x] 端到端验证：非 owner 访问私有文档下载返回 403，owner 下载返回 200

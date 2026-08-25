@@ -11,6 +11,7 @@
 失败重试与 ingest_queue 保持一致：Consumer Group + PEL 崩溃恢复、指数退避、死信队列。
 """
 import asyncio
+import json
 import logging
 import os
 import time
@@ -18,10 +19,10 @@ import time
 from sqlalchemy import delete, select
 
 from rag个人知识库.config.db_config import async_session
-from rag个人知识库.config.redis import get_redis, redis_available
+from rag个人知识库.config.redis import cache_clear_source, get_redis, redis_available
 from rag个人知识库.models.user import AuditLog, User
 from rag个人知识库.models.vector import VectorFile
-from rag个人知识库.service.oss_archive import delete_source_artifact
+from rag个人知识库.service.oss_archive import delete_source_artifact, local_source_exists
 from rag个人知识库.vector_store.milvus_store import adelete_chunks_by_owner
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ DEAD_LETTER = "delete_queue:dead"
 GROUP = "delete_workers"
 INFLIGHT_KEY = "delete:inflight"
 RETRY_HASH = "delete:retry"
+RETRY_DELAY_KEY = "delete:retry:delayed"
 MAX_RETRIES = 3
 CONSUMER = f"delete-worker-{os.getpid()}"
 
@@ -58,6 +60,42 @@ async def _ensure_group() -> None:
     except Exception as e:
         if "BUSYGROUP" not in str(e):
             raise
+async def _schedule_retry(fields: dict, delay: float) -> None:
+    """把删除失败任务写入 Redis ZSET 延迟队列，避免进程崩溃丢任务。"""
+    r = get_redis()
+    member = json.dumps(fields, ensure_ascii=False)
+    await r.zadd(RETRY_DELAY_KEY, {member: time.time() + delay})
+
+
+async def _flush_due_retries() -> None:
+    """把已到期的账户删除延迟重试任务重新入队。"""
+    try:
+        r = get_redis()
+        lock_key = f"{RETRY_DELAY_KEY}:lock"
+        locked = await r.set(lock_key, "1", nx=True, ex=5)
+        if not locked:
+            return
+        try:
+            now = time.time()
+            members = await r.zrangebyscore(RETRY_DELAY_KEY, "-inf", now)
+            for member in members:
+                try:
+                    fields = json.loads(member)
+                    user_id = fields.get("user_id")
+                    if not user_id:
+                        await r.zrem(RETRY_DELAY_KEY, member)
+                        continue
+                    msg_id = await enqueue_delete(int(user_id))
+                    if msg_id is not None:
+                        await r.zrem(RETRY_DELAY_KEY, member)
+                    else:
+                        logger.warning("[delete_queue] 延迟重试 Redis 不可用，保留 ZSET 等待下次：%s", user_id)
+                except Exception as e:
+                    logger.warning("[delete_queue] 延迟重试处理失败，保留 ZSET：%s（%s）", member, e)
+        finally:
+            await r.delete(lock_key)
+    except Exception as e:
+        logger.warning("[delete_queue] 扫描延迟重试队列失败：%s", e)
 
 
 async def _recover_pending() -> None:
@@ -107,6 +145,7 @@ async def process_delete_message(msg_id: str, fields: dict) -> bool:
         return True
 
     try:
+        # 第一步：只读 DB 获取用户状态和待删 OSS source 列表，尽快释放连接
         async with async_session() as db:
             result = await db.execute(select(User).where(User.id == user_id))
             user = result.scalar_one_or_none()
@@ -119,44 +158,65 @@ async def process_delete_message(msg_id: str, fields: dict) -> bool:
                     msg_id, user_id, user.status,
                 )
                 return True
-
-            # 1. 删除 Milvus 向量（按 owner_id 幂等；失败抛异常走重试）
-            await adelete_chunks_by_owner(user_id)
-
-            # 2. 删除 OSS 原件：任一失败都不进入 MySQL 删除
-            sources = (await db.execute(
+            username = user.username
+            sources = list((await db.execute(
                 select(VectorFile.source).where(VectorFile.owner_id == user_id)
-            )).scalars().all()
-            for source in sources:
-                ok = await delete_source_artifact(source)
-                if not ok:
+            )).scalars().all())
+
+        # 第二步：外部资源删除（Milvus / OSS / 本地 uploads 原件），不再占用 DB 连接
+        await adelete_chunks_by_owner(user_id)
+        for source in sources:
+            if not await delete_source_artifact(source):
+                logger.warning(
+                    "[delete_queue] 用户 %s 的 OSS 原件删除失败：%s，保留 MySQL 等待重试",
+                    user_id, source,
+                )
+                return False
+            # OSS 未启用或本地仍保留副本时，必须删除本地 uploads 原件
+            local_path = local_source_exists(source)
+            if local_path:
+                try:
+                    os.remove(local_path)
+                except OSError as e:
                     logger.warning(
-                        "[delete_queue] 用户 %s 的 OSS 原件删除失败：%s，保留 MySQL 等待重试",
-                        user_id, source,
+                        "[delete_queue] 用户 %s 的本地原件删除失败：%s（%s），保留 MySQL 等待重试",
+                        user_id, local_path, e,
                     )
                     return False
 
-            # 3. Milvus + OSS 都成功后才删 MySQL 用户（vector_files/chunks 级联删除）
+        # 第三步：Milvus + OSS 都成功后才删 MySQL 用户（vector_files/chunks 级联删除）
+        async with async_session() as db:
+            # 再次确认用户仍处于 deleting，避免误删已被恢复/重新激活的账号
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            if user is None:
+                logger.info("[delete_queue] 任务 %s 用户 %s 在外部删除期间已消失，丢弃", msg_id, user_id)
+                return True
+            if user.status != "deleting":
+                logger.warning(
+                    "[delete_queue] 任务 %s 用户 %s 状态已变为 %s，不再删除",
+                    msg_id, user_id, user.status,
+                )
+                return True
             db.add(AuditLog(
                 user_id=user_id,
-                username=user.username,
+                username=username,
                 action="delete_account",
-                target=user.username,
+                target=username,
                 detail="delete_queue completed: milvus+oss+mysql",
             ))
             await db.execute(delete(User).where(User.id == user_id))
             await db.commit()
+
+            # 账户删除后清理该用户所有文档的检索/回答缓存，避免他人仍命中旧共享结果
+            for source in sources:
+                await cache_clear_source(source)
+
             logger.info("[delete_queue] 用户 %s 已删除（Milvus+OSS+MySQL 完成）", user_id)
             return True
     except Exception as e:
         logger.warning("[delete_queue] 任务 %s 处理失败：%s", msg_id, e)
         return False
-
-
-async def _delayed_requeue(user_id: int, delay: float) -> None:
-    """独立后台任务：延迟后重新入队，不阻塞 worker 主消费循环。"""
-    await asyncio.sleep(delay)
-    await enqueue_delete(user_id)
 
 
 async def _handle_failure(msg_id: str, fields: dict) -> None:
@@ -173,18 +233,21 @@ async def _handle_failure(msg_id: str, fields: dict) -> None:
         return
     delay = 2 ** int(retries)
     logger.warning("[delete_queue] 任务 %s 第 %d 次失败，%ds 后重试：user_id=%s", msg_id, retries, delay, user_id)
-    asyncio.create_task(_delayed_requeue(user_id, delay))
+    await _schedule_retry(fields, delay)
 
 
 async def run_worker(stop: "asyncio.Event | None" = None) -> None:
     """账户删除队列消费循环，可由 FastAPI lifespan 内嵌或独立进程启动。"""
     await _ensure_group()
     await _recover_pending()
+    await _flush_due_retries()
     r = get_redis()
     logger.info("[delete_queue] worker 启动（consumer=%s）", CONSUMER)
     last_recover = time.monotonic()
     while not (stop is not None and stop.is_set()):
         try:
+            # 先处理 Redis ZSET 中的到期延迟重试，再消费新消息
+            await _flush_due_retries()
             resp = await r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=1, block=2000)
             if not resp:
                 if time.monotonic() - last_recover > 60:

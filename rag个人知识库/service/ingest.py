@@ -103,7 +103,7 @@ async def _stage_insert(
     file_path: str,
     content_hash: str,
     chunks: List[Document],
-    owner_id: Optional[int] = None,
+    owner_id: int,
     is_public: bool = False,
 ) -> Tuple[int, Decimal, Dict[str, int]]:
     """阶段一（仅 MySQL）：全新入库，落库期望状态（status=pending）。
@@ -132,9 +132,11 @@ async def _stage_update(
     record: VectorFile,
     content_hash: str,
     chunks: List[Document],
+    is_public: Optional[bool] = None,
 ) -> Tuple[int, Decimal, List[Document], List[str], Dict[str, int]]:
     """阶段一（仅 MySQL）：内容已变，先升文件版本，再按指纹差集更新 chunk 记录。
 
+    is_public 非 None 时同步更新共享状态（同名重新上传时 is_public 生效）。
     返回 (file_id, new_version, added_chunks, removed_ids, summary)。
     Milvus 写入/删除由调用方在阶段二执行。
     """
@@ -143,7 +145,7 @@ async def _stage_update(
     new_version = _next_version(record.version)
 
     # 1. 先更新文件表版本号 + 内容哈希（置 pending，表示期望状态已变更）
-    await update_file_version(db, file_id, new_version, content_hash)
+    await update_file_version(db, file_id, new_version, content_hash, is_public=is_public)
 
     # 2. 取旧 chunk 指纹集合（MySQL 是 chunk 清单的权威来源）
     old_records = await get_chunks_by_file_id(db, file_id)
@@ -219,9 +221,9 @@ async def _sync_milvus(
 async def process_file(
     db: AsyncSession,
     file_path: str,
+    owner_id: int,
     mineru_result: Optional[dict] = None,
-    owner_id: Optional[int] = None,
-    is_public: bool = False,
+    is_public: Optional[bool] = None,
 ) -> dict:
     """单文件完整流程：校验 → 预检 → 按需加载/切分 → MySQL 落期望状态 → 同步 Milvus。
 
@@ -236,6 +238,16 @@ async def process_file(
     # 2. 预检（加载前）：内容未变且已同步 → 直接跳过
     action, content_hash, record = await precheck(db, file_path)
     if action == "skip":
+        # 内容未变时仍允许更新 is_public（例如改为私有/共享）
+        if is_public is not None and record.is_public != is_public:
+            record.is_public = is_public
+            await db.commit()
+            logger.info("[Ingest] %s 内容未变化，但已更新共享状态 is_public=%s", file_path, is_public)
+            return {
+                "file_path": file_path,
+                "status": "updated",
+                "version": record.version,
+            }
         logger.info("[Ingest] %s 内容未变化且已同步，跳过加载与入库", file_path)
         return {
             "file_path": file_path,
@@ -294,13 +306,13 @@ async def process_file(
             if action == "insert":
                 file_id, version, summary = await _stage_insert(
                     db, file_path, content_hash, chunks,
-                    owner_id=owner_id, is_public=is_public,
+                    owner_id=owner_id, is_public=bool(is_public),
                 )
                 added_chunks = chunks
                 removed_ids = []
             else:
                 file_id, version, added_chunks, removed_ids, summary = await _stage_update(
-                    db, record, content_hash, chunks
+                    db, record, content_hash, chunks, is_public=is_public,
                 )
                 owner_id = owner_id or record.owner_id  # 更新沿用已有 owner
             await db.commit()
@@ -337,8 +349,8 @@ async def process_file(
 async def ingest_files_batched(
     db: AsyncSession,
     file_paths: List[str],
-    owner_id: Optional[int] = None,
-    is_public: bool = False,
+    owner_id: int,
+    is_public: Optional[bool] = None,
 ) -> List[dict]:
     """批量入库编排：先过滤 skip，把复杂文档批量交给 MinerU，再按原始顺序回填结果。
 

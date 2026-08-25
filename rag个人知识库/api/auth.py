@@ -28,8 +28,10 @@ from rag个人知识库.models.user import AuditLog, User
 
 logger = logging.getLogger(__name__)
 
-# JWT 配置（生产环境务必在 .env 中覆盖 JWT_SECRET）
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production")
+# JWT 配置：生产环境必须设置强密钥，缺失/过短直接拒绝启动，避免默认密钥被伪造 token
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+if len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET 未配置或长度不足 32 位，已拒绝启动（请设置强随机密钥）")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))  # 默认 24h
 
@@ -74,10 +76,13 @@ async def get_current_user(
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError:
         raise credentials_error
-    user_id = payload.get("sub")
-    if user_id is None:
+    # sub 是 token 里用户可控的字段：解析必须容错，非数字统一按无效凭证处理（401），
+    # 否则 int() 抛 ValueError 会让接口返回 500 而不是 401。
+    try:
+        user_id = int(payload.get("sub", ""))
+    except (TypeError, ValueError):
         raise credentials_error
-    result = await db.execute(select(User).where(User.id == int(user_id)))
+    result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None:
         raise credentials_error

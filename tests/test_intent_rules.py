@@ -1,7 +1,7 @@
 """意图规则层单元测试：问候 / 元问题 / 闲聊 / 正常问题分流。"""
 import pytest
 
-from rag个人知识库.agent.intent import classify_by_rules, _normalize_rule_text
+from rag个人知识库.agent.intent import Intent, analyze, classify_by_rules, _normalize_rule_text
 
 
 class TestIntentRules:
@@ -31,6 +31,16 @@ class TestIntentRules:
     ])
     def test_normal_questions_not_rule_hit(self, text):
         assert classify_by_rules(text) is None  # 交给 LLM
+
+    def test_intent_model_supports_questions(self):
+        intent = Intent(intent="rag_ask", query="LangChain 是什么", questions=["LangChain 是什么", "LangGraph 是什么"], confidence=0.9, reason="test")
+        assert intent.questions == ["LangChain 是什么", "LangGraph 是什么"]
+
+    def test_rule_chat_questions_empty(self):
+        result = analyze("你好")
+        assert result.intent == "chat"
+        assert result.query is None
+        assert result.questions == []
 
     def test_normalize_fullwidth_punct(self):
         assert _normalize_rule_text("你好！") == "你好!"

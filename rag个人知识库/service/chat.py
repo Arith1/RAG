@@ -20,7 +20,7 @@ from langchain_core.messages import HumanMessage
 
 from rag个人知识库.agent.ai_assist import ask, astream, get_checkpointer
 from rag个人知识库.agent.intent import analyze
-from rag个人知识库.config.redis import cache_get, cache_key, cache_set
+from rag个人知识库.config.redis import cache_get, cache_index_sources, cache_key, cache_set
 from rag个人知识库.service.service import search_documents
 from rag个人知识库.vector_store.milvus_store import ANSWER_CACHE_TTL
 
@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 # analyze 用到的历史：最多取最近 N 轮（每轮 user+assistant 两条），单条截断长度
 HISTORY_MAX_TURNS = 3
 HISTORY_MAX_CHARS = 150
+# 多问题编排时最多拆分的子问题数，防止一次请求触发过多检索/LLM 调用
+MAX_QUESTIONS = 5
 
 
 def _msg_type(msg) -> Optional[str]:
@@ -120,6 +122,38 @@ def _build_user_prompt(query: str, hits: List[dict]) -> str:
     """检索内容与 query 拼接成发给 Agent 的 user_prompt。"""
     context = _build_context(hits)
     return f"用户问题：{query}\n\n参考资料：\n{context}"
+def _build_multi_user_prompt(
+    questions: List[str],
+    hits_by_question: List[List[dict]],
+) -> str:
+    """把多个子问题及其检索结果拼成一个汇总 user_prompt。
+
+    格式：
+      用户输入了多个问题，请按编号逐一回答：
+      1. 问题1
+      2. 问题2
+
+      参考资料：
+      [1] 对应问题1；来源：...
+      ...
+    """
+    lines = [
+        "用户输入了多个问题，请按编号逐一回答：",
+        *[f"{i}. {q}" for i, q in enumerate(questions, start=1)],
+        "",
+        "参考资料：",
+    ]
+    ref_no = 1
+    for q_idx, hits in enumerate(hits_by_question, start=1):
+        if not hits:
+            lines.append(f"[问题{q_idx}] 没有检索到相关资料")
+            continue
+        for hit in hits:
+            source = hit.get("source") or "未知来源"
+            content = (hit.get("content") or "").strip()
+            lines.append(f"[{ref_no}] 对应问题{q_idx}；来源：{source}\n{content}")
+            ref_no += 1
+    return "\n\n".join(lines)
 
 
 async def chat(
@@ -173,10 +207,51 @@ async def chat(
             "hits": [],
         }
 
-    # 问答环节：用提炼后的 query 向量检索 → 拼接 user_prompt → Agent
-    query = analysis.query or content
-    hits = await search_documents(query, k=k, source=source, expr=expr, user_id=user_id)
-    if not hits:
+    # 问答环节：先把用户输入规范成可检索子问题列表
+    questions = [q.strip() for q in (analysis.questions or []) if q.strip()]
+    if not questions:
+        questions = [analysis.query or content]
+    if len(questions) > MAX_QUESTIONS:
+        logger.warning("[chat] 子问题数量超过上限 %d，截断处理", MAX_QUESTIONS)
+        questions = questions[:MAX_QUESTIONS]
+    query = questions[0] if questions else (analysis.query or content)
+
+    if len(questions) == 1:
+        single_q = questions[0]
+        hits = await search_documents(single_q, k=k, source=source, expr=expr, user_id=user_id)
+        all_hits = hits
+        hits_by_question = [hits]
+        user_prompt = _build_user_prompt(single_q, hits)
+        sources = [
+            {
+                "index": index,
+                "source": hit.get("source"),
+                "score": hit.get("score"),
+                "content": hit.get("content"),
+            }
+            for index, hit in enumerate(all_hits, start=1)
+        ]
+    else:
+        # 多问题并行检索，减少整体响应时间
+        hits_by_question = list(await asyncio.gather(
+            *(search_documents(q, k=k, source=source, expr=expr, user_id=user_id) for q in questions)
+        ))
+        all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
+        user_prompt = _build_multi_user_prompt(questions, hits_by_question)
+        sources = []
+        index = 1
+        for qi, q_hits in enumerate(hits_by_question, start=1):
+            for hit in q_hits:
+                sources.append({
+                    "index": index,
+                    "question": questions[qi - 1],
+                    "source": hit.get("source"),
+                    "score": hit.get("score"),
+                    "content": hit.get("content"),
+                })
+                index += 1
+
+    if not all_hits:
         return {
             "answer": "知识库中未找到相关资料，请换个问法，或确认文档已入库。",
             "intent": analysis.intent,
@@ -185,7 +260,6 @@ async def chat(
             "hits": [],
         }
 
-    user_prompt = _build_user_prompt(query, hits)
     # 回答缓存：同一 user_prompt（query + 相同参考资料）→ 复用 LLM 回答（TTL 1 小时）。
     # 缓存值改为 {answer, source_list}，便于按文档 source 精准失效。
     # 兼容旧缓存：如果缓存还是纯字符串，直接作为 answer 使用。
@@ -204,44 +278,27 @@ async def chat(
                 ans_key,
                 {
                     "answer": answer,
-                    "source_list": [hit.get("source") for hit in hits],
+                    "source_list": [hit.get("source") for hit in all_hits],
                 },
                 ANSWER_CACHE_TTL,
             )
+            await cache_index_sources(ans_key, [hit.get("source") for hit in all_hits])
         except Exception as exc:
-            sources = [
-                {
-                    "index": index,
-                    "source": hit.get("source"),
-                    "score": hit.get("score"),
-                    "content": hit.get("content"),
-                }
-                for index, hit in enumerate(hits, start=1)
-            ]
             return {
                 "answer": _friendly_model_error(exc),
                 "intent": analysis.intent,
                 "query": query,
                 "sources": sources,
-                "hits": hits,
+                "hits": all_hits,
                 "error": str(exc),
             }
 
-    sources = [
-        {
-            "index": index,
-            "source": hit.get("source"),
-            "score": hit.get("score"),
-            "content": hit.get("content"),
-        }
-        for index, hit in enumerate(hits, start=1)
-    ]
     return {
         "answer": answer,
         "intent": analysis.intent,
         "query": query,
         "sources": sources,
-        "hits": hits,
+        "hits": all_hits,
     }
 
 
@@ -291,29 +348,60 @@ async def chat_stream(
                "sources": []}
         return
 
-    query = analysis.query or content
+    questions = [q.strip() for q in (analysis.questions or []) if q.strip()]
+    if not questions:
+        questions = [analysis.query or content]
+    if len(questions) > MAX_QUESTIONS:
+        logger.warning("[chat_stream] 子问题数量超过上限 %d，截断处理", MAX_QUESTIONS)
+        questions = questions[:MAX_QUESTIONS]
+    query = questions[0] if questions else (analysis.query or content)
+
     try:
-        hits = await search_documents(query, k=k, source=source, expr=expr, user_id=user_id)
+        if len(questions) == 1:
+            single_q = questions[0]
+            hits = await search_documents(single_q, k=k, source=source, expr=expr, user_id=user_id)
+            all_hits = hits
+            hits_by_question = [hits]
+            user_prompt = _build_user_prompt(single_q, hits)
+            sources = [
+                {"index": index, "source": hit.get("source"),
+                 "score": hit.get("score"), "content": hit.get("content")}
+                for index, hit in enumerate(all_hits, start=1)
+            ]
+        else:
+            # 多问题并行检索，减少整体响应时间
+            hits_by_question = list(await asyncio.gather(
+                *(search_documents(q, k=k, source=source, expr=expr, user_id=user_id) for q in questions)
+            ))
+            all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
+            user_prompt = _build_multi_user_prompt(questions, hits_by_question)
+            sources = []
+            index = 1
+            for qi, q_hits in enumerate(hits_by_question, start=1):
+                for hit in q_hits:
+                    sources.append({
+                        "index": index,
+                        "question": questions[qi - 1],
+                        "source": hit.get("source"),
+                        "score": hit.get("score"),
+                        "content": hit.get("content"),
+                    })
+                    index += 1
     except Exception as exc:
         # 检索失败（如 Milvus 不可用）：发 error 事件而非直接断流，前端可提示重试
         yield {"type": "error", "session_id": session_id, "message": f"检索服务异常：{exc}"}
         return
-    sources = [
-        {"index": index, "source": hit.get("source"),
-         "score": hit.get("score"), "content": hit.get("content")}
-        for index, hit in enumerate(hits, start=1)
-    ]
+
     # meta 事件回传 session_id：前端据此维持多轮会话（服务端生成的 id 必须返回）
     yield {"type": "meta", "session_id": session_id, "intent": analysis.intent,
-           "query": query, "sources": sources}
+           "query": query, "questions": questions, "sources": sources}
 
-    if not hits:
+    if not all_hits:
         yield {"type": "answer", "intent": analysis.intent, "query": query,
                "answer": "知识库中未找到相关资料，请换个问法，或确认文档已入库。",
                "sources": []}
         return
 
-    user_prompt = _build_user_prompt(query, hits)
     # 回答缓存命中：直接回放完整答案（仍走 token 事件，前端体验一致）
     # 缓存值为 {answer, source_list}；兼容旧纯字符串缓存。
     ans_key = cache_key("ans", user_prompt)
@@ -337,8 +425,9 @@ async def chat_stream(
         ans_key,
         {
             "answer": answer,
-            "source_list": [hit.get("source") for hit in hits],
+            "source_list": [hit.get("source") for hit in all_hits],
         },
         ANSWER_CACHE_TTL,
     )
+    await cache_index_sources(ans_key, [hit.get("source") for hit in all_hits])
     yield {"type": "done", "answer": answer}

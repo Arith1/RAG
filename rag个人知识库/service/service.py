@@ -7,7 +7,7 @@
 from typing import List, Optional
 
 from rag个人知识库.config.db_config import async_session
-from rag个人知识库.config.redis import cache_clear_prefix, cache_get, cache_key, cache_set
+from rag个人知识库.config.redis import cache_clear_prefix, cache_get, cache_index_sources, cache_key, cache_set
 from rag个人知识库.crud.vector import select_file_names, select_visible_file_ids
 from rag个人知识库.service.ingest import ingest_files_batched
 from rag个人知识库.vector_store.milvus_store import SEARCH_CACHE_TTL, asearch_with_rerank
@@ -19,8 +19,8 @@ _CHANGED_STATUSES = {"inserted", "updated", "retried"}
 
 async def ingest_files(
     file_paths: List[str],
-    owner_id: Optional[int] = None,
-    is_public: bool = False,
+    owner_id: int,
+    is_public: Optional[bool] = None,
 ) -> List[dict]:
     """入库一组文件：先预检过滤 skip，再把复杂文档批量解析，按原始顺序返回结果。
 
@@ -56,6 +56,11 @@ async def search_documents(
       - 用 file_id in (...) 作为 Milvus 过滤条件，只召回可见文档的 chunk。
     user_id 为 None（CLI/评测）不做可见性过滤，行为与旧版一致。
     """
+    cache_key_ = cache_key("search", query, k, source or "", expr or "", user_id if user_id is not None else "")
+    cached = await cache_get(cache_key_)
+    if cached is not None:
+        return cached
+
     file_ids: Optional[List[int]] = None
     if user_id is not None:
         async with async_session() as db:
@@ -63,11 +68,6 @@ async def search_documents(
         if not file_ids:
             # 当前用户无任何可见文档，直接返回空，不发起 Milvus 检索
             return []
-
-    cache_key_ = cache_key("search", query, k, source or "", expr or "", user_id if user_id is not None else "")
-    cached = await cache_get(cache_key_)
-    if cached is not None:
-        return cached
 
     hits = await asearch_with_rerank(query, k=k, expr=expr, source=source, file_ids=file_ids)
     result = [
@@ -80,6 +80,7 @@ async def search_documents(
         for hit in hits
     ]
     await cache_set(cache_key_, result, SEARCH_CACHE_TTL)
+    await cache_index_sources(cache_key_, [h.get("source") for h in result])
     return result
 
 

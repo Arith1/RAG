@@ -2,7 +2,7 @@
 
 基于**文件指纹增量同步 + MySQL/Milvus 双库协作**的 RAG 问答系统：文档入库自动判定同名同源与内容变化（未变跳过 / 变更增量更新 / 失败可重试），检索侧双路召回 + 重排精排，接入 Agent 生成带来源引用的回答；配套完整 Web 服务（JWT + RBAC）、会话记忆（Postgres 持久化）、可靠入库任务队列（Redis Streams）。
 
-> 核心亮点：**四存储各司其职**——MySQL（元数据权威）、Milvus（向量检索）、Postgres（对话记忆）、Redis（任务队列/限流）；两阶段落库 + 状态机保障跨库一致性，杜绝孤儿向量；Redis/PG 故障优雅降级，系统不中断。
+> 核心亮点：**四存储各司其职**——MySQL（元数据权威）、Milvus（向量检索）、Postgres（对话记忆）、Redis（任务队列/限流/缓存索引）；两阶段落库 + 状态机保障跨库一致性，杜绝孤儿向量；上传/删除/账户删除等写操作依赖 Redis Streams 保证任务不丢，检索问答在依赖不可用时尽量降级。
 
 ---
 
@@ -14,9 +14,13 @@
 - **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤；**检索结果 / embedding / 回答三层 Redis 缓存**（相同问题秒回、省 API 调用）。
 - **Agent 问答**：意图识别（规则层 + LLM 查询重构，多轮指代补全）→ 检索 → DeepSeek Agent 生成带来源引用回答；对话记忆按用户隔离。
 - **会话记忆**：Postgres 持久化（跨重启/多 worker），TTL 按"最后活跃时间"自动清理，~20 轮对话自动摘要压缩。
-- **可靠入库队列**：Redis Streams（Consumer Group + PEL 崩溃恢复、指数退避重试、死信队列、inflight 竞态防护 409）。
-- **Web 服务**：FastAPI + JWT 认证 + RBAC（管理员管理文档 / 普通用户只读问答）+ 操作审计 + 登录限流 + 路径脱敏。
-- **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索对比实验、43 个 pytest 用例。
+- **可靠入库队列**：Redis Streams（Consumer Group + PEL 崩溃恢复、持久化延迟重试、死信队列、inflight 竞态防护 409）。
+- **可靠删除队列**：账户删除同样走 Redis Streams，按 Milvus → OSS → 本地文件 → MySQL → 缓存清理顺序执行，失败持久化重试，不卡账号。
+- **权限模型**：普通用户可上传/删除自己的文档；管理员可把共享文档取消为私有；下载仅 owner 或共享文档可访问。
+- **多问题问答**：意图识别支持拆分多个子问题，逐个检索后汇总分点回答，并限制最大子问题数。
+- **精准缓存失效**：维护 `src_idx:{source}` 缓存索引，文档取消共享/删除/账户删除时 O(1) 定位清理相关缓存。
+- **Web 服务**：FastAPI + JWT 认证 + RBAC + 操作审计 + 登录/注册失败限流 + 路径脱敏。
+- **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索对比实验、52 个 pytest 用例。
 
 ## 系统架构
 
@@ -78,7 +82,7 @@ stateDiagram-v2
 | Embedding / Rerank | SiliconFlow：`BAAI/bge-m3`、`BAAI/bge-reranker-v2-m3` |
 | 文档解析 | MinerU（复杂文档）+ Unstructured（简单文档）+ python-docx |
 | LLM / Agent | DeepSeek + langchain 1.x（create_agent / LangGraph checkpointer） |
-| 测试 | pytest（43 用例） |
+| 测试 | pytest（52 用例） |
 
 ## 快速开始
 
@@ -136,7 +140,7 @@ cp .env.example .env   # 填写各密钥（见下表）
 | `MEMORY_DATABASE_URL` | Postgres 连接串（对话记忆），如 `postgresql://root:root@localhost:5432/rag-demo` |
 | `REDIS_URL` | Redis 连接串，默认 `redis://localhost:6379/0` |
 | `DEEPSEEK_API_KEY` | DeepSeek 密钥（问答生成） |
-| `JWT_SECRET` | JWT 签名密钥（生产环境务必改为强随机串） |
+| `JWT_SECRET` | JWT 签名密钥（必填，且长度至少 32 位） |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 首次启动播种的管理员账号 |
 
 ### 初始化数据库
@@ -174,17 +178,14 @@ npm run dev          # http://localhost:5173（/api 自动代理到 8010）
 npm run build        # 类型检查 + 产物构建
 ```
 
-前端功能：登录（JWT）、**SSE 流式问答**（打字机效果 + 来源引用）、文档管理（管理员上传/删除 + 队列状态）。
+前端功能：登录（JWT）、**SSE 流式问答**（打字机效果 + 来源引用）、文档管理（登录用户上传/删除自己的文档 + 队列状态）。
 
-### 入库文档（两种方式）
+### 入库文档（API 上传）
 
 ```bash
-# 方式一：API 上传（走 Redis 队列，管理员）
+# 登录用户通过 API 上传（走 Redis 队列）
 curl -X POST http://localhost:8010/api/documents/upload \
   -H "Authorization: Bearer <token>" -F "file=@path/to/doc.md"
-
-# 方式二：CLI 批量入库（修改 main.py 的 file_path_list 后）
-python -m rag个人知识库.main ingest
 ```
 
 输出示例：`全新入库 v1.0` / `内容变更，已更新（新增 3 / 未变 20 / 删除 1）` / `内容未变，已跳过`。
@@ -237,8 +238,8 @@ python -m rag个人知识库.main ingest
      └─ 崩溃 → PEL 残留任务由 XAUTOCLAIM 重启回收
 ```
 
-- `ingest:inflight` 集合标记"正在入库"，删除接口返回 **409**，防"上传后立刻删除"的孤儿向量竞态；
-- Redis 不可用 → 自动回退进程内后台任务，系统不中断。
+- `ingest:inflight` 集合标记"正在入库"，上传/删除接口返回 **409**，防"上传后立刻删除"的孤儿向量竞态；
+- Redis 不可用 → 上传、删除、账户删除等写操作返回 **503**，避免进程内任务因崩溃丢失。
 
 ### 会话记忆（Postgres + TTL + 摘要）
 
@@ -268,10 +269,13 @@ python -m pytest tests/
 | POST | `/api/auth/register` | 公开 | 注册（默认普通用户） |
 | POST | `/api/auth/login` | 公开 | 登录，返回 JWT |
 | GET | `/api/auth/me` | 登录 | 当前用户信息 |
-| POST | `/api/documents/upload` | 管理员 | 上传文档（异步队列入库） |
-| GET | `/api/documents` | 登录 | 文档列表（source 脱敏） |
-| DELETE | `/api/documents/{id}` | 管理员 | 删除文档（正在入库返回 409） |
-| POST | `/api/chat` | 登录 | 知识库问答（多轮记忆） |
+| POST | `/api/documents/upload` | 登录 | 上传自己的文档（异步队列入库，默认私有，可指定 `is_public`） |
+| GET | `/api/documents` | 登录 | 文档列表（仅自己 + 共享，source 脱敏） |
+| DELETE | `/api/documents/{id}` | 文档 owner | 删除自己的文档（正在入库返回 409） |
+| POST | `/api/documents/{id}/revoke` | 管理员 | 把共享文档取消为私有 |
+| GET | `/api/documents/{id}/download` | owner 或共享 | 下载文档原件（私有他人文档返回 404） |
+| POST | `/api/auth/delete-account` | 登录 | 提交账户删除（状态 deleting，进入删除队列） |
+| POST | `/api/chat` | 登录 | 知识库问答（多问题拆分 + 多轮记忆） |
 | POST | `/api/chat/stream` | 登录 | **SSE 流式问答**（meta → token×N → done） |
 | POST | `/api/search` | 登录 | 语义检索 |
 | GET | `/api/ingest/stats` | 登录 | 入库队列状态 |
@@ -286,7 +290,7 @@ rag_project/
 │  ├─ api/                  # FastAPI：main(路由) / auth(JWT+RBAC+限流) / static(问答页)
 │  ├─ agent/                # ai_assist(Agent+记忆) / intent(意图+查询重构) / model(DeepSeek)
 │  ├─ service/              # ingest(入库编排) / chat(问答编排) / document_admin(删除)
-│  │                        # ingest_queue(Redis Streams) / memory_maintenance(TTL清理)
+│  │                        # ingest_queue(入库队列) / delete_queue(账户删除队列) / memory_maintenance(TTL清理)
 │  ├─ loader/               # 文档加载（docx/pdf/md/txt，复杂度评估 + MinerU 分流）
 │  ├─ spliter/              # 结构感知切分（标题分节 + 原子块保护）
 │  ├─ vector_store/         # Milvus 存取 + 双路召回 + rerank
@@ -295,7 +299,7 @@ rag_project/
 │  ├─ config/               # db_config(MySQL) / redis(Redis)
 │  └─ utils/                # 指纹哈希
 ├─ evaluation/              # golden 评测集 + 评测/实验脚本 + 报告
-├─ tests/                   # pytest 单元测试（43 用例）
+├─ tests/                   # pytest 单元测试（52 用例）
 └─ .env.example             # 环境变量模板
 ```
 
@@ -308,5 +312,9 @@ rag_project/
 - [x] golden 评测集 + 分层检索对比实验 + pytest 套件
 - [x] docker-compose 一键编排（MySQL/Milvus/Redis/Postgres/API）
 - [x] SSE 流式输出 + Vue 3 + TypeScript 前端
+- [x] 文档归属/共享/取消共享/下载权限
+- [x] 账户删除队列（Milvus → OSS → 本地 → MySQL → 缓存清理）
+- [x] 多问题问答编排
+- [x] 精准缓存失效（src_idx 索引）
 - [ ] 分层检索（Parent-Child）落地（实验结论已具备）
 - [ ] Agentic RAG（检索工具化，多轮反思检索）

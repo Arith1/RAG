@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.models.user import AuditLog, User
 from rag个人知识库.models.vector import VectorFile
-from rag个人知识库.service.oss_archive import delete_source_artifact, local_source_exists
+from rag个人知识库.service.oss_archive import delete_source_artifact, local_source_exists, rel_source_from_local
 from rag个人知识库.vector_store.milvus_store import adelete_chunks_by_source
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,9 @@ async def delete_document(
         return False
 
     # 1. 原件：优先删 OSS 对象（source 为相对路径 key），再删本地 upload 副本
-    await delete_source_artifact(record.source)
+    #    OSS 删除失败时中止删除，避免 MySQL/Milvus 已删但 OSS 对象残留
+    if not await delete_source_artifact(record.source):
+        raise RuntimeError(f"OSS 删除失败，已中止文档删除：{record.source}")
     local_path = local_source_exists(record.source)
     if local_path:
         try:
@@ -50,7 +52,7 @@ async def delete_document(
         username=actor.username,
         action="delete",
         target=record.file_name,
-        detail=record.source,
+        detail=rel_source_from_local(record.source),
     ))
 
     logger.info("[document_admin] 已删除文档：%s (id=%d)", record.file_name, file_id)

@@ -20,9 +20,11 @@
   await run_worker()
 """
 import asyncio
+import json
 import logging
 import os
 import time
+from typing import Optional
 
 from rag个人知识库.config.redis import get_redis, redis_available
 from rag个人知识库.service.oss_archive import archive_local_file, rel_source_from_local
@@ -35,29 +37,31 @@ DEAD_LETTER = "ingest_queue:dead"
 GROUP = "ingest_workers"
 INFLIGHT_KEY = "ingest:inflight"
 RETRY_HASH = "ingest:retry"
+RETRY_DELAY_KEY = "ingest:retry:delayed"
 MAX_RETRIES = 3
 CONSUMER = f"worker-{os.getpid()}"
 
 
 async def enqueue_ingest(
     file_path: str,
-    owner_id: Optional[int] = None,
+    owner_id: int,
     is_public: bool = False,
 ) -> str | None:
     """把文件路径加入入库队列，返回消息 ID；Redis 不可用时返回 None。
 
+    owner_id 为必填参数，从队列接口层面杜绝无主入库。
     inflight 集合统一存**相对 source**（uploads/{user_id}/file），与记录 source 口径一致，
     否则删除接口按 source 判断 in-flight 会对不上。
-    owner_id / is_public: 上传归属与共享标记，随消息透传给 worker 入库。
     """
     if not await redis_available():
         return None
     r = get_redis()
     await r.sadd(INFLIGHT_KEY, rel_source_from_local(file_path))
-    msg: dict = {"path": file_path}
-    if owner_id is not None:
-        msg["owner_id"] = str(owner_id)
-        msg["is_public"] = "1" if is_public else "0"
+    msg: dict = {
+        "path": file_path,
+        "owner_id": str(owner_id),
+        "is_public": "1" if is_public else "0",
+    }
     return await r.xadd(STREAM, msg)
 
 
@@ -76,6 +80,56 @@ async def _ensure_group() -> None:
         if "BUSYGROUP" not in str(e):
             raise
 
+async def _schedule_retry(fields: dict, delay: float) -> None:
+    """把失败任务写入 Redis ZSET 延迟队列。
+
+    之前用 asyncio.create_task 在进程内 sleep，进程崩溃会丢掉重试任务；
+    改为持久化到 Redis，worker 重启后仍然能继续重试。
+    """
+    r = get_redis()
+    member = json.dumps(fields, ensure_ascii=False)
+    await r.zadd(RETRY_DELAY_KEY, {member: time.time() + delay})
+
+
+async def _flush_due_retries() -> None:
+    """把已到期的延迟重试任务重新入队。
+
+    先入队，再删除 ZSET 成员：如果进程在入队前崩溃，任务仍在 ZSET 中不会丢；
+    如果入队后崩溃，最多导致重复入队，但由于入库语义幂等，不会造成数据错误。
+    使用 Redis 锁减少多 worker 并发扫描导致的重复入队。
+    """
+    try:
+        r = get_redis()
+        lock_key = f"{RETRY_DELAY_KEY}:lock"
+        locked = await r.set(lock_key, "1", nx=True, ex=5)
+        if not locked:
+            return
+        try:
+            now = time.time()
+            members = await r.zrangebyscore(RETRY_DELAY_KEY, "-inf", now)
+            for member in members:
+                try:
+                    fields = json.loads(member)
+                    path = fields.get("path")
+                    if not path:
+                        await r.zrem(RETRY_DELAY_KEY, member)
+                        continue
+                    if not fields.get("owner_id"):
+                        logger.warning("[ingest_queue] 延迟重试任务缺少 owner_id，保留 ZSET：%s", path)
+                        continue
+                    owner_id = int(fields["owner_id"])
+                    is_public = fields.get("is_public") == "1"
+                    msg_id = await enqueue_ingest(path, owner_id=owner_id, is_public=is_public)
+                    if msg_id is not None:
+                        await r.zrem(RETRY_DELAY_KEY, member)
+                    else:
+                        logger.warning("[ingest_queue] 延迟重试 Redis 不可用，保留 ZSET 等待下次：%s", path)
+                except Exception as e:
+                    logger.warning("[ingest_queue] 延迟重试处理失败，保留 ZSET：%s（%s）", member, e)
+        finally:
+            await r.delete(lock_key)
+    except Exception as e:
+        logger.warning("[ingest_queue] 扫描延迟重试队列失败：%s", e)
 
 async def _recover_pending() -> None:
     """回收上次崩溃未 ACK 的任务并**立即重新处理**（PEL 中的残留，空闲 > 10s）。
@@ -122,7 +176,10 @@ async def process_message(msg_id: str, fields: dict) -> bool:
         logger.info("[ingest_queue] 任务 %s 文件已不存在，丢弃：%s", msg_id, path)
         return True
     try:
-        owner_id = int(fields["owner_id"]) if fields.get("owner_id") else None
+        if not fields.get("owner_id"):
+            logger.warning("[ingest_queue] 任务 %s 缺少 owner_id，拒绝无主入库：%s", msg_id, path)
+            return False
+        owner_id = int(fields["owner_id"])
         is_public = fields.get("is_public") == "1"
         result = await ingest_files([path], owner_id=owner_id, is_public=is_public)
         # 缓存失效（search/ans）已下沉到 service.ingest_files 统一处理
@@ -139,31 +196,36 @@ async def process_message(msg_id: str, fields: dict) -> bool:
         return False
 
 
-async def _delayed_requeue(path: str, delay: float) -> None:
-    """独立后台任务：延迟后重入队，不阻塞 worker 主消费循环。"""
-    await asyncio.sleep(delay)
-    await enqueue_ingest(path)
-
-
 async def _handle_failure(msg_id: str, fields: dict) -> None:
     """失败重试：指数退避重入队，超限进死信。
 
-    延迟重入队用**派生后台任务**执行（asyncio.create_task），避免 sleep 阻塞
-    worker 消费循环、连累队列后续消息的处理。
+    延迟重试先写入 Redis ZSET，由 worker 定期扫描到期任务重新入队，
+    避免进程崩溃导致重试任务丢失。
+
+    注意：必须从 fields 中保留 owner_id / is_public 并透传给重试消息，
+    否则重试写入 vector_files 时因 owner_id NOT NULL 而必然失败。
     """
     r = get_redis()
     path = fields.get("path", "")
+    owner_id = int(fields["owner_id"]) if fields.get("owner_id") else None
+    is_public = fields.get("is_public") == "1"
     retries = await r.hincrby(RETRY_HASH, path, 1)
     await r.xack(STREAM, GROUP, msg_id)  # 先确认，再由重试机制重新入队
     await r.xdel(STREAM, msg_id)  # 原消息删除，防止 stream 增长
     if retries >= MAX_RETRIES:
-        await r.xadd(DEAD_LETTER, {"path": path, "error": f"重试 {retries} 次仍失败", "origin": msg_id})
+        await r.xadd(DEAD_LETTER, {
+            "path": path,
+            "owner_id": fields.get("owner_id", ""),
+            "is_public": fields.get("is_public", ""),
+            "error": f"重试 {retries} 次仍失败",
+            "origin": msg_id,
+        })
         await r.hdel(RETRY_HASH, path)
         logger.warning("[ingest_queue] 任务 %s 进入死信队列：%s", msg_id, path)
         return
     delay = 2 ** int(retries)  # 指数退避 2s / 4s
     logger.warning("[ingest_queue] 任务 %s 第 %d 次失败，%ds 后重试：%s", msg_id, retries, delay, path)
-    asyncio.create_task(_delayed_requeue(path, delay))
+    await _schedule_retry(fields, delay)
 
 
 async def run_worker(stop: "asyncio.Event | None" = None) -> None:
@@ -175,11 +237,14 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
     """
     await _ensure_group()
     await _recover_pending()
+    await _flush_due_retries()
     r = get_redis()
     logger.info("[ingest_queue] worker 启动（consumer=%s）", CONSUMER)
     last_recover = time.monotonic()
     while not (stop is not None and stop.is_set()):
         try:
+            # 先处理 Redis ZSET 中的到期延迟重试，再消费新消息
+            await _flush_due_retries()
             # BLOCK 2s 等新消息；">" 只读尚未投递的新消息
             resp = await r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=1, block=2000)
             if not resp:

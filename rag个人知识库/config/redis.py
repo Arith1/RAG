@@ -118,38 +118,43 @@ def _cache_value_has_source(value, source: str) -> bool:
     return False
 
 
-async def cache_clear_source(source: str) -> int:
-    """只清理包含指定文档 source 的检索/回答缓存。
+def _source_index_key(source: str) -> str:
+    """返回 source 索引 key：src_idx:{source} -> Set[缓存 key]"""
+    return f"src_idx:{source}"
 
-    用于共享文档被取消共享后，精准删除引用该文档的缓存，而不是清空所有用户缓存。
+
+async def cache_index_sources(key: str, sources) -> None:
+    """把缓存 key 登记到其引用的每个 source 索引集合中。"""
+    unique_sources = {s for s in sources if s}
+    if not unique_sources:
+        return
+    try:
+        r = get_redis()
+        pipe = r.pipeline(transaction=False)
+        for source in unique_sources:
+            pipe.sadd(_source_index_key(source), key)
+        await pipe.execute()
+    except Exception:
+        pass
+
+
+async def cache_clear_source(source: str) -> int:
+    """按 source 索引清理包含该文档的检索/回答缓存。
+
+    通过 src_idx:{source} 集合直接定位缓存 key，无需全库扫描。
     返回删除的 key 数；Redis 不可用返回 0。
     """
     if not source:
         return 0
     try:
         r = get_redis()
-        deleted = 0
-        for prefix in ("search:", "ans:"):
-            batch: list = []
-            async for key in r.scan_iter(f"{prefix}*", count=200):
-                raw = await r.get(key)
-                if raw is None:
-                    continue
-                try:
-                    value = json.loads(raw)
-                except Exception:
-                    value = raw
-                if not _cache_value_has_source(value, source):
-                    continue
-                batch.append(key)
-                if len(batch) >= 200:
-                    deleted += len(batch)
-                    await r.unlink(*batch)
-                    batch.clear()
-            if batch:
-                deleted += len(batch)
-                await r.unlink(*batch)
-        return deleted
+        index_key = _source_index_key(source)
+        keys = list(await r.smembers(index_key))
+        if not keys:
+            return 0
+        await r.unlink(*keys)
+        await r.delete(index_key)
+        return len(keys)
     except Exception:
         return 0
 

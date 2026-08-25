@@ -31,8 +31,8 @@ async def insert_file(
     file_name: str,
     source: str,
     content_hash: str,
+    owner_id: int,
     version: str = "1.0",
-    owner_id: Optional[int] = None,
     is_public: bool = False,
 ) -> VectorFile:
     """新增文件记录，返回带 id 的 VectorFile（调用方负责 commit）"""
@@ -57,17 +57,24 @@ async def update_file_version(
     file_id: int,
     new_version: Decimal,
     new_content_hash: str,
+    is_public: Optional[bool] = None,
 ) -> None:
-    """更新文件版本号与内容哈希，并置为 pending（期望状态已变更，待同步 Milvus）"""
+    """更新文件版本号与内容哈希，并置为 pending（期望状态已变更，待同步 Milvus）。
+
+    is_public 非 None 时同时更新共享状态，保证同名文件重新上传时 is_public 生效。
+    """
+    values = {
+        "version": new_version,
+        "file_content_hash": new_content_hash,
+        "sync_status": SYNC_PENDING,
+        "last_error": None,
+    }
+    if is_public is not None:
+        values["is_public"] = is_public
     await db.execute(
         update(VectorFile)
         .where(VectorFile.id == file_id)
-        .values(
-            version=new_version,
-            file_content_hash=new_content_hash,
-            sync_status=SYNC_PENDING,
-            last_error=None,
-        )
+        .values(**values)
     )
 
 
