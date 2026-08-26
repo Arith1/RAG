@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
+
 from typing import Optional
 
 from rag个人知识库.config.redis import get_redis, redis_available
@@ -300,6 +302,166 @@ async def queue_stats() -> dict:
         }
     except Exception as e:
         return {"enabled": True, "error": str(e)}
+
+
+
+# ── 队列管理（供 /api/ingest/* 展示与管理：待处理/入库中/死信/重试/清理）──
+
+def _msg_time(msg_id: str) -> str:
+    """把 Redis Stream 消息 ID 的毫秒时间戳转成本地 ISO 时间。"""
+    try:
+        ms = int(msg_id.split("-", 1)[0])
+        return datetime.fromtimestamp(ms / 1000).isoformat(sep=" ", timespec="seconds")
+    except Exception:
+        return ""
+
+
+async def list_pending(limit: int = 100) -> list[dict]:
+    """列出待处理队列条目（最新 limit 条），附带重试次数与入队时间。"""
+    if not await redis_available():
+        return []
+    r = get_redis()
+    try:
+        entries = await r.xrevrange(STREAM, "+", "-", count=limit)
+    except Exception as e:
+        logger.warning("[ingest_queue] 读取待处理队列失败：%s", e)
+        return []
+    result = []
+    for msg_id, fields in entries:
+        path = fields.get("path", "")
+        owner_id = fields.get("owner_id")
+        result.append({
+            "msg_id": msg_id,
+            "path": path,
+            "file_name": os.path.basename(path.replace("\\", "/")),
+            "owner_id": int(owner_id) if str(owner_id or "").isdigit() else None,
+            "is_public": fields.get("is_public") == "1",
+            "retries": int(await r.hget(RETRY_HASH, path) or 0),
+            "enqueued_at": _msg_time(msg_id),
+        })
+    return result
+
+
+async def list_inflight() -> list[dict]:
+    """列出正在入库的文件（inflight 集合）。"""
+    if not await redis_available():
+        return []
+    r = get_redis()
+    try:
+        paths = await r.smembers(INFLIGHT_KEY)
+    except Exception as e:
+        logger.warning("[ingest_queue] 读取入库中集合失败：%s", e)
+        return []
+    return [
+        {
+            "path": p,
+            "file_name": os.path.basename(p.replace("\\", "/")),
+        }
+        for p in sorted(paths)
+    ]
+
+
+async def list_dead(limit: int = 100) -> list[dict]:
+    """列出死信队列条目（最新 limit 条）：含失败原因与原始消息 ID。"""
+    if not await redis_available():
+        return []
+    r = get_redis()
+    try:
+        entries = await r.xrevrange(DEAD_LETTER, "+", "-", count=limit)
+    except Exception as e:
+        logger.warning("[ingest_queue] 读取死信队列失败：%s", e)
+        return []
+    result = []
+    for msg_id, fields in entries:
+        path = fields.get("path", "")
+        owner_id = fields.get("owner_id")
+        result.append({
+            "msg_id": msg_id,
+            "path": path,
+            "file_name": os.path.basename(path.replace("\\", "/")),
+            "owner_id": int(owner_id) if str(owner_id or "").isdigit() else None,
+            "is_public": fields.get("is_public") == "1",
+            "error": fields.get("error", ""),
+            "origin": fields.get("origin", ""),
+            "dead_at": _msg_time(msg_id),
+        })
+    return result
+
+
+async def retry_dead(msg_id: str) -> str | None:
+    """把死信队列中的单条任务重新入队（保留 owner_id / is_public），返回新消息 ID。
+
+    重试前从死信流删除原条目并重置该文件的重试计数；Redis 不可用或任务非法返回 None。
+    """
+    if not await redis_available():
+        return None
+    r = get_redis()
+    try:
+        entries = await r.xrange(DEAD_LETTER, msg_id, msg_id)
+    except Exception as e:
+        logger.warning("[ingest_queue] 读取死信条目失败：%s（%s）", msg_id, e)
+        return None
+    if not entries:
+        return None
+    fields = entries[0][1]
+    path = fields.get("path", "")
+    owner_id = fields.get("owner_id")
+    if not path or not str(owner_id or "").isdigit():
+        logger.warning("[ingest_queue] 死信条目缺少必要字段，删除：%s", msg_id)
+        await r.xdel(DEAD_LETTER, msg_id)
+        return None
+    is_public = fields.get("is_public") == "1"
+    new_id = await enqueue_ingest(path, owner_id=int(owner_id), is_public=is_public)
+    if new_id is None:
+        logger.warning("[ingest_queue] 死信重试入队失败（Redis 不可用）：%s", path)
+        return None
+    await r.xdel(DEAD_LETTER, msg_id)
+    await r.hdel(RETRY_HASH, path)  # 重置重试计数，重新从 0 开始
+    return new_id
+
+
+async def retry_all_dead() -> dict:
+    """把死信队列全部重新入队，返回成功/失败计数。"""
+    if not await redis_available():
+        return {"retried": 0, "failed": 0}
+    r = get_redis()
+    try:
+        entries = await r.xrange(DEAD_LETTER, "-", "+")
+    except Exception as e:
+        logger.warning("[ingest_queue] 读取死信队列失败：%s", e)
+        return {"retried": 0, "failed": 0}
+    retried = failed = 0
+    for msg_id, fields in entries:
+        path = fields.get("path", "")
+        owner_id = fields.get("owner_id")
+        if not path or not str(owner_id or "").isdigit():
+            await r.xdel(DEAD_LETTER, msg_id)
+            failed += 1
+            continue
+        new_id = await enqueue_ingest(
+            path, owner_id=int(owner_id), is_public=fields.get("is_public") == "1",
+        )
+        if new_id is not None:
+            await r.xdel(DEAD_LETTER, msg_id)
+            await r.hdel(RETRY_HASH, path)
+            retried += 1
+        else:
+            failed += 1
+    return {"retried": retried, "failed": failed}
+
+
+async def clear_dead() -> dict:
+    """清空死信队列，返回清理条数。"""
+    if not await redis_available():
+        return {"cleared": 0}
+    r = get_redis()
+    try:
+        n = await r.xlen(DEAD_LETTER)
+        await r.delete(DEAD_LETTER)
+        return {"cleared": n}
+    except Exception as e:
+        logger.warning("[ingest_queue] 清空死信队列失败：%s", e)
+        return {"cleared": 0}
 
 
 if __name__ == "__main__":

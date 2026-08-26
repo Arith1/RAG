@@ -8,7 +8,7 @@ from typing import List, Optional
 
 from rag个人知识库.config.db_config import async_session
 from rag个人知识库.config.redis import cache_clear_prefix, cache_get, cache_index_sources, cache_key, cache_set
-from rag个人知识库.crud.vector import select_file_names, select_visible_file_ids
+from rag个人知识库.crud.vector import count_file_names, select_file_names, select_visible_file_ids
 from rag个人知识库.service.ingest import ingest_files_batched
 from rag个人知识库.vector_store.milvus_store import SEARCH_CACHE_TTL, asearch_with_rerank
 
@@ -88,16 +88,20 @@ async def list_documents(
     limit: Optional[int] = None,
     offset: int = 0,
     user_id: Optional[int] = None,
-) -> List[dict]:
+    with_total: bool = False,
+):
     """列出已入库文档（读 vector_files），供用户选择检索范围。
 
     user_id 非 None 时只返回该用户可见的文档（本人或共享）；None 返回全部（CLI/管理）。
     按 updated_at 倒序返回；limit 为空时返回全部，offset 用于分页。
-    返回 [{id, file_name, version, source, chunk_count, sync_status, owner_id, is_public}, ...]
+    with_total=True 时返回 (docs, total)：docs 为 [{id, file_name, version, source,
+    chunk_count, sync_status, owner_id, is_public, download_count, updated_at}, ...]，
+    total 为同一可见性规则下的文档总数（供前端分页统计）。
     """
     async with async_session() as db:
         files = await select_file_names(db, limit=limit, offset=offset, user_id=user_id)
-    return [
+        total = await count_file_names(db, user_id=user_id) if with_total else None
+    docs = [
         {
             "id": f.id,
             "file_name": f.file_name,
@@ -107,6 +111,11 @@ async def list_documents(
             "sync_status": f.sync_status,
             "owner_id": f.owner_id,
             "is_public": f.is_public,
+            "download_count": f.download_count,
+            "updated_at": f.updated_at.isoformat() if f.updated_at else None,
         }
         for f in files
     ]
+    if with_total:
+        return docs, total
+    return docs

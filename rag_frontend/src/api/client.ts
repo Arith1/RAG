@@ -5,9 +5,80 @@ export interface SourceItem {
   source: string | null
   score: number | null
   content: string
+  /** 复杂问题被拆分成多问题检索时，该来源命中的子问题 */
+  question?: string | null
 }
 
-/** SSE 流式事件（与后端 chat_stream 产出的 JSON 一一对应） */
+export type SyncStatus = 'pending' | 'in_sync' | 'failed'
+
+export interface DocItem {
+  id: number
+  file_name: string
+  version: string
+  source: string
+  chunk_count: number
+  sync_status: SyncStatus
+  owner_id: number | null
+  is_public: boolean
+  /** 下载量（后端可能未提供，缺失时前端按 0 处理） */
+  download_count?: number
+  /** 最近更新时间（后端可能未提供，缺失时前端按 id 兜底倒序） */
+  updated_at?: string
+}
+
+export interface QueueStats {
+  enabled: boolean
+  stream_len: number
+  pending: number
+  dead_letter: number
+  inflight: number
+  [k: string]: unknown
+}
+
+export interface QueuePendingItem {
+  msg_id: string
+  path: string
+  file_name: string
+  owner_id: number | null
+  is_public: boolean
+  retries: number
+  enqueued_at: string
+}
+
+export interface QueueInflightItem {
+  path: string
+  file_name: string
+}
+
+export interface QueueDeadItem {
+  msg_id: string
+  path: string
+  file_name: string
+  owner_id: number | null
+  is_public: boolean
+  error: string
+  origin: string
+  dead_at: string
+}
+
+/** 批量上传接口逐文件结果（/api/documents/upload） */
+export interface BatchUploadItem {
+  file_name: string
+  status: 'processing' | 'error'
+  source?: string
+  is_public?: boolean
+  message: string
+}
+
+export interface BatchUploadResult {
+  status: string
+  results: BatchUploadItem[]
+  accepted: number
+  failed: number
+  message: string
+}
+
+/** SSE 流式事件（与后端 /api/chat/stream 产出的 JSON 一一对应） */
 export type ChatStreamEvent =
   | { type: 'meta'; session_id: string | null; intent: string; query: string; sources: SourceItem[] }
   | { type: 'token'; text: string }
@@ -33,6 +104,15 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
   return (await res.json()) as T
 }
 
+function decodeFrame(frame: string): ChatStreamEvent | null {
+  if (!frame.startsWith('data: ')) return null
+  try {
+    return JSON.parse(frame.slice(6)) as ChatStreamEvent
+  } catch {
+    return null
+  }
+}
+
 /** SSE 流式问答：逐事件回调 onEvent（fetch ReadableStream 解析，非 EventSource——POST 不支持）。 */
 export async function streamChat(
   body: { content: string; session_id: string | null },
@@ -47,10 +127,13 @@ export async function streamChat(
     },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { detail?: string }
+    throw new Error(data.detail ?? `HTTP ${res.status}`)
+  }
 
   const reader = res.body!.getReader()
-  const decoder = new TextDecoder('utf-8') // stream:true 处理跨帧半截字符
+  const decoder = new TextDecoder('utf-8')
   let buffer = ''
   for (;;) {
     const { done, value } = await reader.read()
@@ -60,9 +143,62 @@ export async function streamChat(
     while ((idx = buffer.indexOf('\n\n')) >= 0) {
       const frame = buffer.slice(0, idx).trim()
       buffer = buffer.slice(idx + 2)
-      if (frame.startsWith('data: ')) {
-        onEvent(JSON.parse(frame.slice(6)) as ChatStreamEvent)
+      if (frame.startsWith('data:')) {
+        const evt = decodeFrame(frame)
+        if (evt) onEvent(evt)
       }
     }
   }
+}
+
+
+/** 历史会话元信息（MySQL chat_sessions，侧边栏列表） */
+export interface ChatSessionInfo {
+  session_id: string
+  title: string
+  message_count: number
+  last_message_at: string | null
+  /** 最后一条用户消息摘要（过长已截断） */
+  last_message_preview: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+/** 会话内一条消息（完整消息从 Postgres checkpoint 加载） */
+export interface ChatMessageItem {
+  role: 'user' | 'assistant'
+  content: string
+  sources?: SourceItem[]
+  intent?: string | null
+  created_at?: string | null
+}
+
+export interface ChatSessionDetail {
+  session_id: string
+  title: string
+  messages: ChatMessageItem[]
+}
+
+/** 历史会话列表（按最近活跃时间倒序） */
+export async function listChatSessions(): Promise<ChatSessionInfo[]> {
+  return api<ChatSessionInfo[]>('/api/chat/sessions')
+}
+
+/** 点进会话后加载完整消息 */
+export async function getChatSession(sessionId: string): Promise<ChatSessionDetail> {
+  return api<ChatSessionDetail>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`)
+}
+
+export async function renameChatSession(sessionId: string, title: string): Promise<ChatSessionInfo> {
+  return api<ChatSessionInfo>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })
+}
+
+export async function deleteChatSession(sessionId: string): Promise<{ status: string; session_id: string }> {
+  return api<{ status: string; session_id: string }>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  })
 }

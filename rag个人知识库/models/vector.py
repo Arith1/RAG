@@ -91,6 +91,15 @@ class VectorFile(Base):
         server_default="0",
         comment='该文件的 chunk 总数'
     )
+
+    # 下载量：非所有者（陌生人）下载成功后 +1，知识库「下载最多」排序依据
+    download_count: Mapped[int] = mapped_column(
+        Integer(),
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment='下载量（非所有者下载 +1）'
+    )
     sync_status: Mapped[str] = mapped_column(
         String(16),
         nullable=False,

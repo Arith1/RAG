@@ -18,7 +18,12 @@ from typing import List, Optional
 import openai
 from langchain_core.messages import HumanMessage
 
-from rag个人知识库.agent.ai_assist import ask, astream, get_checkpointer
+from rag个人知识库.agent.ai_assist import (
+    ask,
+    astream,
+    append_thread_exchange,
+    get_checkpointer,
+)
 from rag个人知识库.agent.intent import analyze
 from rag个人知识库.config.redis import cache_get, cache_index_sources, cache_key, cache_set
 from rag个人知识库.service.service import search_documents
@@ -199,8 +204,10 @@ async def chat(
 
     # 当前没有文档上传/修改/删除等管理功能，遇到 other 直接明确提示，不触发检索
     if analysis.intent == "other":
+        answer = "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。"
+        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
         return {
-            "answer": "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。",
+            "answer": answer,
             "intent": analysis.intent,
             "query": None,
             "sources": [],
@@ -252,8 +259,10 @@ async def chat(
                 index += 1
 
     if not all_hits:
+        answer = "知识库中未找到相关资料，请换个问法，或确认文档已入库。"
+        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
         return {
-            "answer": "知识库中未找到相关资料，请换个问法，或确认文档已入库。",
+            "answer": answer,
             "intent": analysis.intent,
             "query": query,
             "sources": [],
@@ -267,6 +276,8 @@ async def chat(
     cached_answer = await cache_get(ans_key)
     if cached_answer is not None:
         answer = cached_answer.get("answer") if isinstance(cached_answer, dict) else cached_answer
+        # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
+        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
     else:
         try:
             answer = await asyncio.to_thread(
@@ -343,8 +354,10 @@ async def chat_stream(
         return
 
     if analysis.intent == "other":
+        answer = "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。"
+        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
         yield {"type": "answer", "session_id": session_id, "intent": "other", "query": None,
-               "answer": "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。",
+               "answer": answer,
                "sources": []}
         return
 
@@ -397,8 +410,10 @@ async def chat_stream(
            "query": query, "questions": questions, "sources": sources}
 
     if not all_hits:
+        answer = "知识库中未找到相关资料，请换个问法，或确认文档已入库。"
+        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
         yield {"type": "answer", "intent": analysis.intent, "query": query,
-               "answer": "知识库中未找到相关资料，请换个问法，或确认文档已入库。",
+               "answer": answer,
                "sources": []}
         return
 
@@ -408,6 +423,8 @@ async def chat_stream(
     cached = await cache_get(ans_key)
     if cached is not None:
         cached_answer = cached.get("answer") if isinstance(cached, dict) else cached
+        # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
+        await asyncio.to_thread(append_thread_exchange, thread_id, content, cached_answer)
         yield {"type": "token", "text": cached_answer}
         yield {"type": "done", "answer": cached_answer}
         return

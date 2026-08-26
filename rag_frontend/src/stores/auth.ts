@@ -27,7 +27,8 @@ export const useAuthStore = defineStore('auth', {
         body: form,
       })
       if (!res.ok) {
-        throw new Error(res.status === 401 ? '用户名或密码错误' : '登录失败')
+        const data = (await res.json().catch(() => ({}))) as { detail?: string }
+        throw new Error(data.detail ?? (res.status === 401 ? '用户名或密码错误' : '登录失败'))
       }
       const data = (await res.json()) as { access_token: string; role: string }
       this.token = data.access_token

@@ -16,7 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -34,13 +34,22 @@ from rag个人知识库.config.redis import cache_clear_source, redis_available
 from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.chat import chat, chat_stream
+from rag个人知识库.agent.ai_assist import clear_thread, load_thread_messages
+from rag个人知识库.service.chat_history import (
+    delete_session as delete_chat_session,
+    get_session_info,
+    list_sessions as list_chat_sessions,
+    rename_session as rename_chat_session,
+    upsert_chat_session,
+)
 from rag个人知识库.service.delete_queue import (
     enqueue_delete,
     run_worker as run_delete_worker,
 )
-from rag个人知识库.service.document_admin import delete_document, revoke_document_public
+from rag个人知识库.service.document_admin import delete_document, revoke_document_public, share_document_public
 from rag个人知识库.service.ingest_queue import (
-    enqueue_ingest, is_inflight, queue_stats,
+    clear_dead, enqueue_ingest, is_inflight, list_dead, list_inflight,
+    list_pending, queue_stats, retry_all_dead, retry_dead,
     run_worker as run_ingest_worker,
 )
 from rag个人知识库.service.memory_maintenance import (
@@ -56,6 +65,7 @@ logger = logging.getLogger(__name__)
 # ── 上传目录与限制（与 loader/oss_archive 的校验口径一致）──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_FILE_SIZE", 10*1024*1024))
+MAX_BATCH_UPLOAD = int(os.getenv("MAX_BATCH_UPLOAD", 10))  # 单次批量上传文件数上限
 ALLOWED_EXT = {".pdf", ".docx", ".txt", ".md"}
 
 
@@ -96,6 +106,33 @@ class SearchIn(BaseModel):
     k: int = Field(default=3, ge=1, le=50)  # 限制召回/精排条数，防超限请求
     source: Optional[str] = Field(default=None, max_length=512)
 
+class ChatSessionOut(BaseModel):
+    session_id: str
+    title: str
+    message_count: int
+    last_message_at: Optional[str] = None
+    last_message_preview: str = ''
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class ChatMessageOut(BaseModel):
+    role: str
+    content: str
+    sources: List[dict] = Field(default_factory=list)
+    intent: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class ChatSessionDetailOut(BaseModel):
+    session_id: str
+    title: str
+    messages: List[ChatMessageOut]
+
+
+class ChatRenameIn(BaseModel):
+    title: str = Field(..., min_length=1, max_length=128)
+
 
 class DocumentOut(BaseModel):
     id: int
@@ -106,6 +143,16 @@ class DocumentOut(BaseModel):
     sync_status: str
     owner_id: Optional[int] = None
     is_public: bool = False
+    # 下载量（非所有者下载 +1）与最近更新时间（知识库排序用；后端已提供，缺省兼容旧数据）
+    download_count: int = 0
+    updated_at: Optional[str] = None
+
+
+class DocumentListOut(BaseModel):
+    """文档列表分页响应：items 为当前页文档，total 为可见文档总数（供分页统计）。"""
+
+    total: int
+    items: List[DocumentOut]
 
 
 # ── 生命周期：建表（幂等）+ 种子管理员 + 对话记忆清理后台任务 ──
@@ -113,7 +160,7 @@ async def _memory_cleanup_loop() -> None:
     """后台循环：定期清理过期的对话记忆（Postgres checkpoints）。"""
     while True:
         try:
-            await asyncio.to_thread(cleanup_expired_memory, MEMORY_TTL_DAYS)
+            await cleanup_expired_memory(MEMORY_TTL_DAYS)
         except Exception as e:
             logger.warning("[api] 对话记忆清理任务异常：%s", e)
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
@@ -308,57 +355,94 @@ async def delete_account(
 
 # ══ 文档管理（上传：登录用户可上传自己的文档；删除：本人或管理员）══
 @app.post("/api/documents/upload")
-async def upload_document(
-    file: UploadFile = File(...),
+async def upload_documents(
+    files: List[UploadFile] = File(...),
     user: User = Depends(get_current_user),
     is_public: bool = Form(False),
     db: AsyncSession = Depends(get_db),
 ):
-    """上传文档并异步入库（加载→切分→MySQL→Milvus）。MinerU 解析在后台执行，不阻塞响应。
+    """批量上传文档并异步入库（加载→切分→MySQL→Milvus，MinerU 解析后台执行）。
 
     普通用户/管理员均可上传；文档归属当前用户（owner_id=user.id），
-    is_public 控制是否共享（默认私有）。上传按用户分目录隔离：
-    uploads/{user_id}/{file_name}；source 采用相对路径，便于与 OSS 归档及下载 URL 保持一致。
+    is_public 控制是否共享（默认私有）。一次最多 MAX_BATCH_UPLOAD 个文件，
+    逐个校验/写盘/入队，返回每个文件的独立结果，文件之间互不影响；
+    所有文件成功提交后整体返回 200，单个文件失败不影响其他文件入库。
     """
-    # 跨平台安全取文件名：统一先转正斜杠再取最后一段，兼容 Windows/Linux 部署
-    file_name = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
-    if not file_name:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "文件名不能为空")
-    ext = os.path.splitext(file_name)[1].lower()
-    if ext not in ALLOWED_EXT:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                            f"不支持的格式 {ext or '(无扩展名)'}，支持: {sorted(ALLOWED_EXT)}")
-    if ext == ".doc":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "暂不支持旧版 .doc，请用 WPS/Word 另存为 .docx 后上传")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "文件为空")
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "文件超过 10MB 上限")
-    # 按用户分目录隔离：uploads/{user_id}/{file_name}（不同用户同名文件互不覆盖）
+    if not files:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "请至少选择一个文件")
+    if len(files) > MAX_BATCH_UPLOAD:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"一次最多上传 {MAX_BATCH_UPLOAD} 个文件，当前选择了 {len(files)} 个",
+        )
+    # 按用户分目录隔离：uploads/{user_id}/{file_name}
     user_dir = os.path.join(UPLOAD_DIR, str(user.id))
     os.makedirs(user_dir, exist_ok=True)
-    # 保留原始文件名：同名重复上传 = 同一文档（同 source/identity）→ 指纹增量更新语义；
-    # basename 已剥离路径，无路径穿越风险
-    path = os.path.join(user_dir, file_name)
-    # 写盘/入队前先检查是否已有同一文件正在入库，避免并发重复任务
-    if await is_inflight(path):
-        raise HTTPException(status.HTTP_409_CONFLICT, "文档正在入库中，请勿重复上传")
-    with open(path, "wb") as f:
-        f.write(content)
-    audit(db, user, "upload", target=file_name, detail=_sanitize_source(path))
-    # 入库任务必须进入 Redis Streams 持久队列，避免进程内存任务在崩溃时丢失
-    msg_id = await enqueue_ingest(path, owner_id=user.id, is_public=is_public)
-    if msg_id is None:
-        # 任务未入队时不能保留半成品文件，清理后返回 503 由前端重试
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Redis 不可用，暂时无法提交入库任务")
-    return {"status": "processing", "file_name": file_name, "source": _sanitize_source(path),
+
+    results: List[dict] = []
+    accepted = 0
+    for file in files:
+        # 跨平台安全取文件名：统一先转正斜杠再取最后一段，兼容 Windows/Linux 部署
+        file_name = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+        if not file_name:
+            results.append({"file_name": file_name, "status": "error", "message": "文件名不能为空"})
+            continue
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext not in ALLOWED_EXT:
+            results.append({
+                "file_name": file_name, "status": "error",
+                "message": f"不支持的格式 {ext or '(无扩展名)'}，支持: {sorted(ALLOWED_EXT)}",
+            })
+            continue
+        if ext == ".doc":
+            results.append({
+                "file_name": file_name, "status": "error",
+                "message": "暂不支持旧版 .doc，请用 WPS/Word 另存为 .docx 后上传",
+            })
+            continue
+        content = await file.read()
+        if not content:
+            results.append({"file_name": file_name, "status": "error", "message": "文件为空"})
+            continue
+        if len(content) > MAX_UPLOAD_SIZE:
+            results.append({"file_name": file_name, "status": "error", "message": "文件超过 10MB 上限"})
+            continue
+        path = os.path.join(user_dir, file_name)
+        # 写盘/入队前先检查是否已有同一文件正在入库，避免并发重复任务
+        if await is_inflight(path):
+            results.append({"file_name": file_name, "status": "error", "message": "文档正在入库中，请勿重复上传"})
+            continue
+        with open(path, "wb") as f:
+            f.write(content)
+        audit(db, user, "upload", target=file_name, detail=_sanitize_source(path))
+        # 入库任务必须进入 Redis Streams 持久队列，避免进程内存任务在崩溃时丢失
+        msg_id = await enqueue_ingest(path, owner_id=user.id, is_public=is_public)
+        if msg_id is None:
+            # 任务未入队时不能保留半成品文件，清理后按失败返回
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            results.append({"file_name": file_name, "status": "error", "message": "Redis 不可用，暂时无法提交入库任务"})
+            continue
+        accepted += 1
+        results.append({
+            "file_name": file_name,
+            "status": "processing",
+            "source": _sanitize_source(path),
             "is_public": is_public,
-            "message": "已提交入库队列，稍后刷新文档列表查看结果（sync_status 变为 in_sync 即完成）"}
+            "message": "已提交入库队列，稍后刷新文档列表查看结果",
+        })
+
+    failed = len(results) - accepted
+    summary = f"{accepted} 个文件已提交入库，{failed} 个文件失败" if failed else f"{accepted} 个文件已提交入库"
+    return {
+        "status": "processing",
+        "results": results,
+        "accepted": accepted,
+        "failed": failed,
+        "message": summary,
+    }
 
 
 def _sanitize_source(path: str) -> str:
@@ -395,7 +479,7 @@ def _sanitize_source_paths(items: List[dict]) -> None:
                 meta["md_path"] = _sanitize_source(meta["md_path"])
 
 
-@app.get("/api/documents", response_model=List[DocumentOut])
+@app.get("/api/documents", response_model=DocumentListOut)
 async def list_docs(
     user: User = Depends(get_current_user),
     limit: int = 100,
@@ -403,14 +487,15 @@ async def list_docs(
 ):
     """文档列表（登录用户可见：自己的 + 共享的；source 已脱敏不暴露本地路径）。
 
-    默认分页 limit=100，单次最多 500 条，避免返回全量数据。
+    返回 {total, items} 分页结构：total 为同一可见性规则下的文档总数，
+    items 为当前页文档。默认 limit=100，单次最多 500 条。
     """
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    docs = await list_documents(limit=limit, offset=offset, user_id=user.id)
+    docs, total = await list_documents(limit=limit, offset=offset, user_id=user.id, with_total=True)
     for d in docs:
         d["source"] = _sanitize_source(d["source"])
-    return docs
+    return {"total": total, "items": docs}
 
 
 @app.delete("/api/documents/{file_id}")
@@ -447,20 +532,52 @@ async def remove_document(
 @app.post("/api/documents/{file_id}/revoke")
 async def revoke_document(
     file_id: int,
-    admin: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """管理员把共享文档取消为私有（is_public=1 → 0）。
+    """把共享文档取消为私有（is_public=1 → 0）。
 
-    普通用户不受影响；文档不存在时返回 404。
+    文档所有者可把自己的共享文档改回私有；管理员可把任意公开文档设为私有（审核）。
+    文档不存在返回 404，越权返回 403。
     """
-    record = await revoke_document_public(db, file_id, admin)
+    try:
+        record = await revoke_document_public(db, file_id, user)
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
     if record is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
     # 取消共享后只清理包含该文档 source 的检索/回答缓存，不影响其他文档缓存
     await cache_clear_source(record.source)
     return {
         "status": "revoked",
+        "file_id": file_id,
+        "file_name": record.file_name,
+        "is_public": record.is_public,
+    }
+
+
+
+
+@app.post("/api/documents/{file_id}/share")
+async def share_document(
+    file_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """把文档设为公开共享（is_public=0 -> 1）。
+
+    仅文档所有者或管理员可操作；文档不存在返回 404，越权返回 403。
+    """
+    try:
+        record = await share_document_public(db, file_id, user)
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+    # 设为公开后清理包含该文档的检索/回答缓存，让其他用户尽快检索到
+    await cache_clear_source(record.source)
+    return {
+        "status": "shared",
         "file_id": file_id,
         "file_name": record.file_name,
         "is_public": record.is_public,
@@ -486,6 +603,10 @@ async def download_document(
     # 下载权限：仅 owner 或共享文档（is_public=1）可下载；无权限与不存在统一 404，避免探测 file_id
     if record.owner_id != user.id and not record.is_public:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+
+    # 下载量统计：仅「非所有者（陌生人）」下载成功时 +1（owner 自己下载不计）
+    if record.owner_id != user.id:
+        record.download_count = (record.download_count or 0) + 1
 
     # 1) OSS 启用的场景：返回会过期的签名 URL / 公有 URL，前端直接打开
     url = await build_download_url(record.source)
@@ -516,7 +637,100 @@ async def ingest_stats(user: User = Depends(get_current_user)):
     return await queue_stats()
 
 
+@app.get("/api/ingest/queue")
+async def ingest_queue_list(
+    limit: int = Query(100, ge=1, le=500),
+    user: User = Depends(get_current_user),
+):
+    """入库队列：列出待处理任务（最新 limit 条，含重试次数与入队时间）。"""
+    return await list_pending(limit)
+
+
+@app.get("/api/ingest/inflight")
+async def ingest_inflight_list(user: User = Depends(get_current_user)):
+    """入库队列：列出正在入库的文件。"""
+    return await list_inflight()
+
+
+@app.get("/api/ingest/dead")
+async def ingest_dead_list(
+    limit: int = Query(100, ge=1, le=500),
+    user: User = Depends(get_current_user),
+):
+    """入库队列：列出失败（死信）任务（含失败原因）。"""
+    return await list_dead(limit)
+
+
+@app.post("/api/ingest/dead/retry-all")
+async def ingest_dead_retry_all(admin: User = Depends(require_admin)):
+    """入库队列：全部死信任务重新入队（管理员）。"""
+    return await retry_all_dead()
+
+
+@app.post("/api/ingest/dead/{msg_id}/retry")
+async def ingest_dead_retry(msg_id: str, admin: User = Depends(require_admin)):
+    """入库队列：单条死信任务重新入队（管理员）。"""
+    new_id = await retry_dead(msg_id)
+    if new_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "死信任务不存在或缺少必要字段，无法重试")
+    return {"status": "retried", "msg_id": msg_id, "new_msg_id": new_id}
+
+
+@app.delete("/api/ingest/dead")
+async def ingest_dead_clear(admin: User = Depends(require_admin)):
+    """入库队列：清空死信队列（管理员）。"""
+    return await clear_dead()
+
+
 # ══ 问答 / 检索（所有登录用户）══
+# ══ 问答 / 检索（所有登录用户）══
+@app.get("/api/chat/sessions", response_model=List[ChatSessionOut])
+async def chat_sessions(user: User = Depends(get_current_user)):
+    """历史会话列表（问答侧边栏），按最后消息时间倒序。"""
+    return await list_chat_sessions(user.id)
+
+
+@app.get("/api/chat/sessions/{session_id}", response_model=ChatSessionDetailOut)
+async def chat_session_detail(session_id: str, user: User = Depends(get_current_user)):
+    """读取单个历史会话及完整消息（消息从 Postgres checkpoint 加载，元信息从 MySQL）。"""
+    info = await get_session_info(user.id, session_id)
+    messages = await asyncio.to_thread(load_thread_messages, f"{user.id}:{session_id}")
+    # 来源引用中的本地路径与实时问答一致做脱敏（绝对路径归一为 uploads/ 相对形式）
+    for m in messages:
+        if m.get("sources"):
+            _sanitize_source_paths(m["sources"])
+    if info is None and not messages:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
+    return {
+        "session_id": session_id,
+        "title": (info or {}).get("title") or "新会话",
+        "messages": messages,
+    }
+
+
+@app.patch("/api/chat/sessions/{session_id}", response_model=ChatSessionOut)
+async def chat_session_rename(session_id: str, body: ChatRenameIn, user: User = Depends(get_current_user)):
+    """重命名会话（侧边栏编辑标题）。"""
+    ok = await rename_chat_session(user.id, session_id, body.title)
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
+    info = await get_session_info(user.id, session_id)
+    return ChatSessionOut(**info)
+
+
+@app.delete("/api/chat/sessions/{session_id}")
+async def chat_session_delete(session_id: str, user: User = Depends(get_current_user)):
+    """删除会话：先删 MySQL 元信息，再同步清除 Postgres 完整记忆。"""
+    ok = await delete_chat_session(user.id, session_id)
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
+    try:
+        await asyncio.to_thread(clear_thread, f"{user.id}:{session_id}")
+    except Exception as e:
+        logger.warning("[chat] 清除会话记忆失败（不影响删除）：%s", e)
+    return {"status": "deleted", "session_id": session_id}
+
+
 @app.post("/api/chat", response_model=ChatOut)
 async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
     """知识库问答。thread_id 按用户隔离：{user_id}:{session_id}，同一 session 保持多轮记忆。"""
@@ -528,6 +742,14 @@ async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"问答服务异常：{e}")
     sources = result.get("sources", [])
     _sanitize_source_paths(sources)
+    # 完成一轮对话后写入会话历史（失败不影响回答本身）
+    try:
+        await upsert_chat_session(
+            user.id, session_id, body.content,
+            result["answer"], result.get("intent"),
+        )
+    except Exception as e:
+        logger.warning("[chat] 会话历史落库失败（不影响回答）：%s", e)
     return ChatOut(
         answer=result["answer"],
         intent=result.get("intent", ""),
@@ -543,13 +765,43 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
     """知识库问答（SSE 流式）：meta 事件 → 逐 token → done 事件。
 
     前端用 fetch ReadableStream 消费（SSE POST 不支持 EventSource），
-    禁用缓冲保证逐段即时到达。
+    禁用缓冲保证逐段即时到达。流结束后把整轮对话落库（会话历史）。
     """
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
     gen = chat_stream(body.content, thread_id=thread_id, session_id=session_id, user_id=user.id)
+
+    async def _stream_with_persist():
+        final_answer = None
+        final_sources = []
+        final_intent = None
+        async for event in gen:
+            if event.get("sources"):
+                _sanitize_source_paths(event["sources"])
+            etype = event.get("type")
+            if etype == "meta":
+                final_sources = event.get("sources") or []
+                final_intent = event.get("intent")
+            elif etype in ("answer", "done") and event.get("answer"):
+                final_answer = event["answer"]
+                final_sources = event.get("sources") or final_sources
+                final_intent = event.get("intent") or final_intent
+            elif etype == "error":
+                final_answer = event.get("message") or "回答失败，请重试。"
+                final_sources = []
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        # 流结束：有产出即落库（失败不影响已推送的回答）
+        if final_answer is not None:
+            try:
+                await upsert_chat_session(
+                    user.id, session_id, body.content,
+                    final_answer, final_intent,
+                )
+            except Exception as e:
+                logger.warning("[chat] 会话历史落库失败（不影响回答）：%s", e)
+
     return StreamingResponse(
-        _sse_events(gen),
+        _stream_with_persist(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

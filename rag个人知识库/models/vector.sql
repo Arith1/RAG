@@ -52,6 +52,7 @@ CREATE TABLE `vector_files` (
     `file_content_hash` CHAR(64) NOT NULL COMMENT '整个文件内容的 SHA256,用来判断文件内容是否修改',
     `version` DECIMAL(5,1) NOT NULL DEFAULT 1.0 COMMENT '当前版本号（如 1.0, 2.0）',
     `chunk_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该文件的 chunk 总数',
+    `download_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '下载量（非所有者下载 +1）',
     `sync_status` VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT 'Milvus 同步状态: pending(待同步)/in_sync(一致)/failed(失败可重试)',
     `last_error` TEXT COMMENT '最近一次 Milvus 同步失败原因',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -81,3 +82,42 @@ CREATE TABLE `chunk_records` (
     KEY `idx_file_version` (`file_id`, `version`) COMMENT '创建索引加快查找速度',
     CONSTRAINT `fk_chunk_records_file_id` FOREIGN KEY (`file_id`) REFERENCES `vector_files` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文件分块指纹记录';
+-- ============================================
+-- 3. 迁移脚本（已有数据库执行）
+--    说明：新环境执行上面 CREATE TABLE 已含 download_count；
+--          老库手动执行下面 ALTER 一次即可（MySQL 不支持 ADD COLUMN IF NOT EXISTS）。
+--    执行：mysql -u root -p rag_demo -e "ALTER TABLE `vector_files` ADD COLUMN `download_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '下载量（非所有者下载 +1）' AFTER `chunk_count`;"
+-- ============================================
+-- ALTER TABLE `vector_files`
+--     ADD COLUMN `download_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '下载量（非所有者下载 +1）' AFTER `chunk_count`;
+
+-- ============================================
+-- ============================================
+-- 4. 会话表 (chat_sessions) —— 问答历史会话（侧边栏）
+--    方案：MySQL 只存「会话列表 + 摘要」，完整消息由 Postgres（langgraph checkpoint）持有。
+-- ============================================
+CREATE TABLE `chat_sessions` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `user_id` BIGINT UNSIGNED NOT NULL COMMENT '所属用户 id（users.id，用户删除时级联删除）',
+    `session_id` VARCHAR(64) NOT NULL COMMENT '会话标识（agent 记忆 thread_id={user_id}:{session_id} 共用）',
+    `title` VARCHAR(128) NOT NULL DEFAULT '新会话' COMMENT '会话标题（首问自动生成，可重命名）',
+    `message_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '消息条数（user+assistant 都算）',
+    `last_message_preview` VARCHAR(256) NOT NULL DEFAULT '' COMMENT '最后一条用户消息摘要（侧边栏展示，过长截断）',
+    `last_message_at` DATETIME NULL COMMENT '最后一条消息时间（侧边栏按此倒序 / TTL 清理依据）',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_chat_sessions_user_session` (`user_id`, `session_id`) COMMENT '用户内会话唯一',
+    KEY `idx_chat_sessions_last_message` (`user_id`, `last_message_at`) COMMENT '按用户+最近消息排序',
+    CONSTRAINT `fk_chat_sessions_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='问答历史会话（会话元信息，完整消息在 Postgres）';
+
+-- ============================================
+-- 4.1 迁移说明（已有数据库执行）
+--    新环境执行上面的 CREATE TABLE 已含 last_message_preview；
+--    老库手动执行下面两条 SQL 一次即可：
+--      1) ALTER TABLE `chat_sessions`
+--             ADD COLUMN `last_message_preview` VARCHAR(256) NOT NULL DEFAULT '' COMMENT '最后一条用户消息摘要' AFTER `message_count`;
+--      2) DROP TABLE IF EXISTS `chat_messages`;  -- 旧方案遗留的消息表已废弃（完整消息改由 Postgres 持有）
+-- ============================================

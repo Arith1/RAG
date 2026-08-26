@@ -172,6 +172,23 @@ async def select_visible_file_ids(
     return [r for r in result.scalars().all()]
 
 
+async def count_file_names(
+    db: AsyncSession,
+    user_id: Optional[int] = None,
+) -> int:
+    """统计可见文档总数（与 select_file_names 使用同一可见性规则）。
+
+    user_id 非 None 时统计"本人或共享"的可见文档；None 统计全部（CLI/管理场景）。
+    """
+    stmt = select(func.count(VectorFile.id))
+    if user_id is not None:
+        stmt = stmt.where(
+            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True))
+        )
+    result = await db.execute(stmt)
+    return int(result.scalar() or 0)
+
+
 async def select_file_names(
     db: AsyncSession,
     limit: Optional[int] = None,

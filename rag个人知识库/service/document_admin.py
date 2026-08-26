@@ -70,6 +70,8 @@ async def revoke_document_public(
     record = result.scalar_one_or_none()
     if record is None:
         return None
+    if record.owner_id != actor.id and actor.role != "admin":
+        raise PermissionError("只有文档所有者或管理员可以取消共享")
 
     record.is_public = False
     db.add(AuditLog(
@@ -77,7 +79,35 @@ async def revoke_document_public(
         username=actor.username,
         action="revoke_public",
         target=record.file_name,
-        detail=f"{record.source} (is_public=1 -> 0 by admin)",
+        detail=f"{record.source} (is_public=1 -> 0 by {actor.username})",
     ))
-    logger.info("[document_admin] 管理员 %s 已将共享文档取消共享：%s (id=%d)", actor.username, record.file_name, file_id)
+    logger.info("[document_admin] %s 已将共享文档取消共享：%s (id=%d)", actor.username, record.file_name, file_id)
     return record
+
+async def share_document_public(
+    db: AsyncSession,
+    file_id: int,
+    actor: User,
+) -> VectorFile | None:
+    """文档所有者（或管理员）把私有文档设为公开共享（is_public=0 -> 1）。
+
+    返回 None 表示文档不存在；否则返回已更新的 VectorFile（事务由调用方提交）。
+    非所有者/管理员访问时抛 PermissionError（由 API 层转为 403）。
+    """
+    result = await db.execute(select(VectorFile).where(VectorFile.id == file_id))
+    record = result.scalar_one_or_none()
+    if record is None:
+        return None
+    if record.owner_id != actor.id:
+        raise PermissionError("只有文档所有者可以设置共享")
+    record.is_public = True
+    db.add(AuditLog(
+        user_id=actor.id,
+        username=actor.username,
+        action="share_public",
+        target=record.file_name,
+        detail=f"{record.source} (is_public=0 -> 1 by {actor.username})",
+    ))
+    logger.info("[document_admin] %s 已把文档设为共享：%s (id=%d)", actor.username, record.file_name, file_id)
+    return record
+

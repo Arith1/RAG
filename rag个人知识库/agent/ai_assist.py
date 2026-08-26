@@ -12,13 +12,14 @@
 """
 import asyncio
 import logging
+import re
 from typing import List
 
 import os
 
 from langchain.agents import create_agent
 from langchain.agents.middleware.summarization import SummarizationMiddleware
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from rag个人知识库.agent.model import get_chat_model
@@ -167,6 +168,156 @@ async def astream(messages: List[BaseMessage], thread_id: str = "default"):
 def clear_thread(thread_id: str = "default") -> None:
     """清除指定会话的短期记忆。"""
     get_checkpointer().delete_thread(thread_id)
+
+def append_thread_exchange(thread_id: str, user_text: str, assistant_text: str) -> None:
+    """把一轮未经过 LLM 的问答（无资料命中 / other / 回答缓存命中）写入对话记忆。
+
+    这些分支不会触发 agent.invoke，若不补写，会话历史将缺失该轮问答。
+    通过编译图的 update_state 直接追加消息（as_node='model'），不消耗 LLM 调用。
+    失败仅告警，不影响主流程。
+    """
+    if not thread_id or not user_text or not assistant_text:
+        return
+    try:
+        get_agent().update_state(
+            {"configurable": {"thread_id": thread_id}},
+            {"messages": [
+                HumanMessage(content=user_text),
+                AIMessage(content=assistant_text),
+            ]},
+            as_node="model",
+        )
+    except Exception as e:
+        logger.warning("[ai_assist] 补写对话记忆失败（不影响回答）：%s", e)
+
+
+def _clean_human_text(text: str) -> str:
+    """把发给 Agent 的 user_prompt（含参考资料）还原为用户原始提问，供前端展示。
+
+    单问题格式：用户问题：{query}\n\n参考资料：...
+    多问题格式：用户输入了多个问题，请按编号逐一回答：\n1. ...\n2. ...\n\n参考资料：...
+    """
+    text = (text or "").strip()
+    if not text:
+        return text
+    if text.startswith("用户问题："):
+        body = text[len("用户问题："):]
+        idx = body.find("参考资料：")
+        return body[:idx].strip() if idx != -1 else body.strip()
+    if text.startswith("用户输入了多个问题，请按编号逐一回答："):
+        body = text[len("用户输入了多个问题，请按编号逐一回答："):]
+        idx = body.find("参考资料：")
+        if idx != -1:
+            body = body[:idx]
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        qs = []
+        for ln in lines:
+            if ". " in ln:
+                ln = ln.split(". ", 1)[1]
+            qs.append(ln)
+        return "\n".join(qs).strip() or text
+    return text
+
+
+def _parse_sources_from_human_text(raw: str) -> list:
+    """从发给 Agent 的原始 user_prompt（含参考资料）反解析出来源引用列表。
+
+    单问题块：  [N] 来源：{source}\n{content}
+    多问题块：  [N] 对应问题{M}；来源：{source}\n{content}
+    score 无法从 prompt 还原，置 None（前端对 score == null 不渲染分数）。
+
+    无法解析（闲聊/无资料命中/回答缓存命中，prompt 中没有参考资料）时返回 []。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+    marker = "参考资料："
+    idx = text.find(marker)
+    if idx == -1:
+        return []
+    refs = text[idx + len(marker):]
+    # 多问题头部可还原问题文本，用于给每个来源标注所属子问题
+    questions = []
+    header = "用户输入了多个问题，请按编号逐一回答："
+    if text.startswith(header):
+        body = text[len(header):]
+        end = body.find(marker)
+        if end != -1:
+            body = body[:end]
+        for ln in body.splitlines():
+            m = re.match(r"^\s*(\d+)\.\s*(.*)$", ln.strip())
+            if m:
+                questions.append(m.group(2).strip())
+    sources = []
+    # 块首格式：[N] 来源： 或 [N] 对应问题M；来源：；块间以 \n\n 分隔
+    pattern = re.compile(
+        r"\[(\d+)\](?:\s*对应问题(\d+)；)?\s*来源：([^\r\n]+)\r?\n([\s\S]*?)"
+        r"(?=\n\s*\[\d+\](?:\s*对应问题\d+；)?\s*来源：|\Z)"
+    )
+    for m in pattern.finditer(refs):
+        index = int(m.group(1))
+        q_no = int(m.group(2)) if m.group(2) else None
+        content = m.group(4).strip()
+        # 去掉多问题中"某子问题无命中"的占位行，避免混入来源内容
+        content = re.sub(r"(?m)^\[问题\d+\]\s*没有检索到相关资料\s*$", "", content).strip()
+        item = {
+            "index": index,
+            "source": m.group(3).strip(),
+            "score": None,
+            "content": content,
+        }
+        if q_no is not None and 1 <= q_no <= len(questions):
+            item["question"] = questions[q_no - 1]
+        sources.append(item)
+    return sources
+
+
+def load_thread_messages(thread_id: str):
+    """从对话记忆（checkpointer）读取完整消息列表，供前端点进会话后恢复。
+
+    返回 [{role: 'user'|'assistant', content: str, sources?: [...]}, ...]（按对话顺序）；无记忆返回 []。
+    只保留 human/ai 消息，跳过 tool/system；human 内容还原为用户原始提问；
+    ai 消息附带来源引用（从紧随其后的 human 原始 prompt 中的参考资料反解析）。
+    """
+    try:
+        tup = get_checkpointer().get_tuple({"configurable": {"thread_id": thread_id}})
+    except Exception as e:
+        logger.warning("[ai_assist] 读取会话消息失败：%s", e)
+        return []
+    if tup is None:
+        return []
+    messages = tup.checkpoint.get("channel_values", {}).get("messages")
+    if not messages:
+        return []
+    result = []
+    pending_sources = []  # 最近一条 human 携带的参考来源，配给紧随其后的 ai
+    for msg in messages:
+        mtype = getattr(msg, "type", None)
+        content = getattr(msg, "content", "")
+        if isinstance(content, list):  # 多模态 content 块
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            content = " ".join(parts)
+        text = str(content or "").strip()
+        if not text:
+            continue
+        if mtype == "human":
+            # 原始内容含参考资料，可反解析来源；闲聊/缓存命中为普通文本则返回 []
+            pending_sources = _parse_sources_from_human_text(text)
+            result.append({"role": "user", "content": _clean_human_text(text)})
+        elif mtype == "ai":
+            item = {"role": "assistant", "content": text}
+            if pending_sources:
+                item["sources"] = pending_sources
+            result.append(item)
+            pending_sources = []
+    return result
+
+
 
 
 if __name__ == "__main__":

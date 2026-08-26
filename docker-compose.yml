@@ -117,7 +117,7 @@ services:
       POSTGRES_PASSWORD: root
       POSTGRES_DB: rag-demo
     ports:
-      - "15432:5432"  # 宿主机 15432 → 容器 5432（与 .env 的 MEMORY_DATABASE_URL 一致）
+      - "5432:5432"  # 宿主机 5432 → 容器 5432（与 .env 的 MEMORY_DATABASE_URL 一致）
     volumes:
       - pg-data:/var/lib/postgresql/data
       - ./rag个人知识库/models/postgres_memory.sql:/init-sql/postgres_memory.sql:ro

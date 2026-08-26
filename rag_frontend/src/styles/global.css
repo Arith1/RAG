@@ -1,0 +1,254 @@
+/* ─────────────────────────────────────────────────────────────
+   共享知识库 · The Calm Reading Room
+   Global design tokens + shared primitives
+   ───────────────────────────────────────────────────────────── */
+
+:root {
+  /* Ground */
+  --bg: #f5f6f8;
+  --bg-soft: #f0f1f4;
+  --surface: #ffffff;
+  --surface-2: #fafbfc;
+  --surface-3: #f3f4f7;
+
+  /* Ink */
+  --text: #17203a;
+  --text-2: #5b6472;
+  --text-3: #929baa;
+  --text-on-accent: #ffffff;
+
+  /* Accent (single restrained blue) */
+  --accent: #4d6bef;
+  --accent-strong: #3a56d4;
+  --accent-soft: rgba(77, 107, 239, 0.08);
+  --accent-softer: rgba(77, 107, 239, 0.05);
+  --accent-ring: rgba(77, 107, 239, 0.24);
+
+  /* Lines */
+  --border: #e6e8ee;
+  --border-strong: #d7dae2;
+
+  /* Status (low saturation) */
+  --ok: #16a06a;
+  --ok-soft: rgba(22, 160, 106, 0.10);
+  --warn: #c7741a;
+  --warn-soft: rgba(199, 116, 26, 0.12);
+  --err: #d94040;
+  --err-soft: rgba(217, 64, 64, 0.10);
+  --neutral: #7a8394;
+  --neutral-soft: rgba(122, 131, 148, 0.12);
+
+  /* Radii */
+  --radius-xs: 6px;
+  --radius-sm: 9px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
+  --radius-pill: 999px;
+
+  /* Elevation (quiet) */
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.04);
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 2px 6px rgba(16, 24, 40, 0.03);
+  --shadow-md: 0 2px 8px rgba(16, 24, 40, 0.05), 0 10px 28px rgba(16, 24, 40, 0.07);
+  --shadow-focus: 0 0 0 3px var(--accent-ring);
+
+  /* Type */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Layout */
+  --content-max: 880px;
+  --nav-h: 56px;
+  --page-pad: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+button,
+input,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+button {
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+  border-radius: var(--radius-xs);
+}
+
+/* ── Buttons ─────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-weight: 500;
+  font-size: 14px;
+  line-height: 1;
+  padding: 10px 16px;
+  border-radius: var(--radius-sm);
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease,
+    box-shadow 0.16s ease, transform 0.08s ease;
+  white-space: nowrap;
+  user-select: none;
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+}
+
+.btn-subtle {
+  background: var(--surface);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+.btn-subtle:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+}
+
+.btn-ghost {
+  color: var(--text-2);
+  padding: 8px 12px;
+}
+.btn-ghost:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.btn-danger {
+  color: var(--err);
+  background: var(--err-soft);
+}
+.btn-danger:hover:not(:disabled) {
+  background: rgba(217, 64, 64, 0.16);
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  transition: background 0.16s ease, color 0.16s ease;
+}
+.icon-btn:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+/* ── Inputs ──────────────────────────────────────────────── */
+.field {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 11px 14px;
+  font-size: 14px;
+  color: var(--text);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.field::placeholder {
+  color: var(--text-3);
+}
+.field:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-focus);
+}
+
+/* ── Badges / dots ───────────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 5px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  color: var(--text-2);
+}
+.badge .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.badge.ok { color: var(--ok); background: var(--ok-soft); border-color: rgba(22,160,106,0.18); }
+.badge.warn { color: var(--warn); background: var(--warn-soft); border-color: rgba(199,116,26,0.20); }
+.badge.err { color: var(--err); background: var(--err-soft); border-color: rgba(217,64,64,0.16); }
+.badge.neutral { color: var(--neutral); background: var(--neutral-soft); border-color: rgba(122,131,148,0.18); }
+.badge.accent { color: var(--accent); background: var(--accent-soft); border-color: rgba(77,107,239,0.20); }
+
+/* ── Scrollbars (tasteful) ───────────────────────────────── */
+.scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: #d3d6dd; border-radius: 999px; }
+.scroll-thin::-webkit-scrollbar-thumb:hover { background: #bfc3cc; }
+.scroll-thin::-webkit-scrollbar-track { background: transparent; }
+
+/* ── Motion feels optional ───────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
