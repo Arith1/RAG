@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Optional
 
 from rag个人知识库.config.redis import get_redis, redis_available
+from rag个人知识库.utils.sanitize import sanitize_source
 from rag个人知识库.service.oss_archive import archive_local_file, rel_source_from_local
 from rag个人知识库.service.service import ingest_files
 
@@ -332,7 +333,8 @@ async def list_pending(limit: int = 100) -> list[dict]:
         owner_id = fields.get("owner_id")
         result.append({
             "msg_id": msg_id,
-            "path": path,
+            # 路径脱敏：只返回相对 source / 文件名，避免向客户端泄露服务器绝对路径
+            "path": sanitize_source(path),
             "file_name": os.path.basename(path.replace("\\", "/")),
             "owner_id": int(owner_id) if str(owner_id or "").isdigit() else None,
             "is_public": fields.get("is_public") == "1",
@@ -377,7 +379,8 @@ async def list_dead(limit: int = 100) -> list[dict]:
         owner_id = fields.get("owner_id")
         result.append({
             "msg_id": msg_id,
-            "path": path,
+            # 路径脱敏：只返回相对 source / 文件名，避免向客户端泄露服务器绝对路径
+            "path": sanitize_source(path),
             "file_name": os.path.basename(path.replace("\\", "/")),
             "owner_id": int(owner_id) if str(owner_id or "").isdigit() else None,
             "is_public": fields.get("is_public") == "1",

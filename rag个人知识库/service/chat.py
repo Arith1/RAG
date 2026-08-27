@@ -25,7 +25,9 @@ from rag个人知识库.agent.ai_assist import (
     get_checkpointer,
 )
 from rag个人知识库.agent.intent import analyze
+from rag个人知识库.config.db_config import async_session
 from rag个人知识库.config.redis import cache_get, cache_index_sources, cache_key, cache_set
+from rag个人知识库.crud.vector import select_visible_file_ids
 from rag个人知识库.service.service import search_documents
 from rag个人知识库.vector_store.milvus_store import ANSWER_CACHE_TTL
 
@@ -168,13 +170,22 @@ async def chat(
     expr: Optional[str] = None,
     thread_id: str = "default",
     user_id: Optional[int] = None,
+    retrieve_own_private: bool = True,
+    retrieve_own_public: bool = True,
+    retrieve_kb_public: bool = True,
+    retrieve_owner_ids: Optional[List[int]] = None,
+    file_ids: Optional[List[int]] = None,
+    load_history: bool = True,
 ) -> dict:
     """对话统一入口：意图识别 → （闲聊直答 | 问答环节）。
 
     user_id: 检索可见性过滤（仅返回当前用户可见文档），传 None 不过滤（CLI 场景）。
+    检索范围（会话首问锁定）：retrieve_own_private/own_public/kb_public/retrieve_owner_ids，
+    透传给每个 search_documents 调用。
     """
     # 第一步：意图识别 + 查询提炼（结合最近对话补全指代；读取失败则退化为无历史）
-    history = await asyncio.to_thread(load_recent_history, thread_id)
+    # 新会话（load_history=False）没有 checkpoint，跳过历史读取省一次 Postgres 往返
+    history = await asyncio.to_thread(load_recent_history, thread_id) if load_history else None
     analysis = await asyncio.to_thread(analyze, content, history)
 
     # 闲聊：只进入 LLM 对话，不做检索
@@ -214,6 +225,18 @@ async def chat(
             "hits": [],
         }
 
+    # 可见文件 id 每个请求只查一次：单问题/多问题并行检索复用，避免重复查 MySQL
+    if user_id is not None and file_ids is None:
+        async with async_session() as db:
+            file_ids = await select_visible_file_ids(
+                db,
+                user_id,
+                retrieve_own_private=retrieve_own_private,
+                retrieve_own_public=retrieve_own_public,
+                retrieve_kb_public=retrieve_kb_public,
+                retrieve_owner_ids=retrieve_owner_ids,
+            )
+
     # 问答环节：先把用户输入规范成可检索子问题列表
     questions = [q.strip() for q in (analysis.questions or []) if q.strip()]
     if not questions:
@@ -225,7 +248,13 @@ async def chat(
 
     if len(questions) == 1:
         single_q = questions[0]
-        hits = await search_documents(single_q, k=k, source=source, expr=expr, user_id=user_id)
+        hits = await search_documents(
+            single_q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
+            retrieve_own_private=retrieve_own_private,
+            retrieve_own_public=retrieve_own_public,
+            retrieve_kb_public=retrieve_kb_public,
+            retrieve_owner_ids=retrieve_owner_ids,
+        )
         all_hits = hits
         hits_by_question = [hits]
         user_prompt = _build_user_prompt(single_q, hits)
@@ -241,7 +270,16 @@ async def chat(
     else:
         # 多问题并行检索，减少整体响应时间
         hits_by_question = list(await asyncio.gather(
-            *(search_documents(q, k=k, source=source, expr=expr, user_id=user_id) for q in questions)
+            *(
+                search_documents(
+                    q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
+                    retrieve_own_private=retrieve_own_private,
+                    retrieve_own_public=retrieve_own_public,
+                    retrieve_kb_public=retrieve_kb_public,
+                    retrieve_owner_ids=retrieve_owner_ids,
+                )
+                for q in questions
+            )
         ))
         all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
         user_prompt = _build_multi_user_prompt(questions, hits_by_question)
@@ -321,6 +359,12 @@ async def chat_stream(
     source: Optional[str] = None,
     expr: Optional[str] = None,
     user_id: Optional[int] = None,
+    retrieve_own_private: bool = True,
+    retrieve_own_public: bool = True,
+    retrieve_kb_public: bool = True,
+    retrieve_owner_ids: Optional[List[int]] = None,
+    file_ids: Optional[List[int]] = None,
+    load_history: bool = True,
 ):
     """流式问答：analyze + 检索为前置步骤（普通 await），LLM 生成段逐 token 产出。
 
@@ -334,7 +378,8 @@ async def chat_stream(
     session_id 由 API 层生成并回传（meta 事件带上），前端据此维持多轮会话；
     与 chat() 共用 analyze/检索/缓存逻辑，仅 LLM 生成段改为流式。
     """
-    history = await asyncio.to_thread(load_recent_history, thread_id)
+    # 新会话（load_history=False）没有 checkpoint，跳过历史读取省一次 Postgres 往返
+    history = await asyncio.to_thread(load_recent_history, thread_id) if load_history else None
     analysis = await asyncio.to_thread(analyze, content, history)
 
     # 闲聊：不走检索，直接完整回答
@@ -361,6 +406,18 @@ async def chat_stream(
                "sources": []}
         return
 
+    # 可见文件 id 每个请求只查一次：单问题/多问题并行检索复用，避免重复查 MySQL
+    if user_id is not None and file_ids is None:
+        async with async_session() as db:
+            file_ids = await select_visible_file_ids(
+                db,
+                user_id,
+                retrieve_own_private=retrieve_own_private,
+                retrieve_own_public=retrieve_own_public,
+                retrieve_kb_public=retrieve_kb_public,
+                retrieve_owner_ids=retrieve_owner_ids,
+            )
+
     questions = [q.strip() for q in (analysis.questions or []) if q.strip()]
     if not questions:
         questions = [analysis.query or content]
@@ -372,7 +429,13 @@ async def chat_stream(
     try:
         if len(questions) == 1:
             single_q = questions[0]
-            hits = await search_documents(single_q, k=k, source=source, expr=expr, user_id=user_id)
+            hits = await search_documents(
+                single_q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
+                retrieve_own_private=retrieve_own_private,
+                retrieve_own_public=retrieve_own_public,
+                retrieve_kb_public=retrieve_kb_public,
+                retrieve_owner_ids=retrieve_owner_ids,
+            )
             all_hits = hits
             hits_by_question = [hits]
             user_prompt = _build_user_prompt(single_q, hits)
@@ -384,7 +447,16 @@ async def chat_stream(
         else:
             # 多问题并行检索，减少整体响应时间
             hits_by_question = list(await asyncio.gather(
-                *(search_documents(q, k=k, source=source, expr=expr, user_id=user_id) for q in questions)
+                *(
+                    search_documents(
+                        q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
+                        retrieve_own_private=retrieve_own_private,
+                        retrieve_own_public=retrieve_own_public,
+                        retrieve_kb_public=retrieve_kb_public,
+                        retrieve_owner_ids=retrieve_owner_ids,
+                    )
+                    for q in questions
+                )
             ))
             all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
             user_prompt = _build_multi_user_prompt(questions, hits_by_question)

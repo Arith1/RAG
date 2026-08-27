@@ -1,0 +1,7 @@
+# Milvus 安全配置：开启认证（授权）。
+# 启用后默认超级用户 root 的默认密码是 "Milvus"，建议启动后立即修改：
+#   docker compose exec milvus bash -lc "milvus user update --old-password Milvus --new-password <强口令> --user root"
+# 修改后同步更新 docker-compose.yml 中 api 的 MILVUS_URI。
+common:
+  security:
+    authorizationEnabled: true

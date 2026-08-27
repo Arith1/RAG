@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag个人知识库.config.redis import get_redis
 
 from rag个人知识库.config.db_config import async_session, get_db
+from rag个人知识库.service.session_cache import get_cached_user, set_user
 from rag个人知识库.models.user import AuditLog, User
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,13 @@ async def get_current_user(
         user_id = int(payload.get("sub", ""))
     except (TypeError, ValueError):
         raise credentials_error
+
+    # 用户行缓存：同一用户高频请求（每次页面加载/每个接口）免一次 DB 查询；
+    # 状态/角色/密码变更（改密、删号）时显式失效，TTL 60s 兜底。
+    cached_user = await get_cached_user(user_id)
+    if cached_user is not None:
+        return cached_user
+
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None:
@@ -91,6 +99,7 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="账号已删除/删除中/禁用，无法继续访问",
         )
+    await set_user(user)
     return user
 
 

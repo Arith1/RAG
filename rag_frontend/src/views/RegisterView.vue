@@ -2,23 +2,37 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import { useFeedback } from '../composables/feedback'
 
 const auth = useAuthStore()
 const router = useRouter()
+const feedback = useFeedback()
+
 const username = ref('')
 const password = ref('')
+const confirmPassword = ref('')
 const error = ref('')
 const loading = ref(false)
 
 async function submit() {
   error.value = ''
-  if (!username.value.trim() || !password.value) {
-    error.value = '请输入用户名和密码'
+  const name = username.value.trim()
+  if (name.length < 2) {
+    error.value = '用户名至少 2 个字符'
+    return
+  }
+  if (password.value.length < 6) {
+    error.value = '密码至少 6 位'
+    return
+  }
+  if (password.value !== confirmPassword.value) {
+    error.value = '两次输入的密码不一致'
     return
   }
   loading.value = true
   try {
-    await auth.login(username.value.trim(), password.value)
+    await auth.register(name, password.value)
+    feedback.notify('注册成功，欢迎使用共享知识库', 'success')
     router.push('/')
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -39,10 +53,10 @@ async function submit() {
           <path d="M38 7l1.1 3.1L42 11l-2.9.9L38 15l-1.1-3.1L34 11l2.9-.9L38 7Z" fill="#bcd0ff" />
         </svg>
       </div>
-      <h1>共享知识库</h1>
-      <p class="sub">登录后即可向自己的文档提问，也能检索到他人共享的材料。</p>
+      <h1>创建账号</h1>
+      <p class="sub">注册后即可上传自己的文档并向智能体提问，也能检索他人共享的材料。</p>
 
-      <form class="form" @submit.prevent="submit">
+      <form class="form" @submit.prevent="submit" novalidate>
         <label class="field-label" for="username">用户名</label>
         <input
           id="username"
@@ -50,17 +64,32 @@ async function submit() {
           class="field"
           type="text"
           autocomplete="username"
-          placeholder="请输入用户名"
+          placeholder="至少 2 个字符"
+          maxlength="32"
           @keyup.enter="submit"
         />
+
         <label class="field-label" for="password">密码</label>
         <input
           id="password"
           v-model="password"
           class="field"
           type="password"
-          autocomplete="current-password"
-          placeholder="请输入密码"
+          autocomplete="new-password"
+          placeholder="至少 6 位"
+          maxlength="64"
+          @keyup.enter="submit"
+        />
+
+        <label class="field-label" for="confirm">确认密码</label>
+        <input
+          id="confirm"
+          v-model="confirmPassword"
+          class="field"
+          type="password"
+          autocomplete="new-password"
+          placeholder="再次输入密码"
+          maxlength="64"
           @keyup.enter="submit"
         />
 
@@ -68,13 +97,13 @@ async function submit() {
 
         <button class="btn btn-primary submit" type="submit" :disabled="loading">
           <span v-if="loading" class="spinner" aria-hidden="true"></span>
-          {{ loading ? '登录中…' : '登录' }}
+          {{ loading ? '注册中…' : '注册' }}
         </button>
       </form>
 
       <p class="switch-line">
-        <span>还没有账号？</span>
-        <RouterLink to="/register">注册新账号</RouterLink>
+        <span>已有账号？</span>
+        <RouterLink to="/login">去登录</RouterLink>
       </p>
       <RouterLink to="/" class="back">← 先逛逛问答界面</RouterLink>
     </div>
@@ -143,7 +172,7 @@ h1 {
 .back {
   display: block;
   text-align: center;
-  margin-top: 20px;
+  margin-top: 12px;
   font-size: 13px;
   color: var(--text-3);
 }

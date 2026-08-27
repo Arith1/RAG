@@ -13,10 +13,11 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -30,18 +31,37 @@ from rag个人知识库.api.auth import (
     write_audit,
 )
 from rag个人知识库.config.db_config import engine, get_db
-from rag个人知识库.config.redis import cache_clear_source, redis_available
+from rag个人知识库.config.redis import cache_clear_prefix, cache_clear_source, redis_available
 from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.chat import chat, chat_stream
-from rag个人知识库.agent.ai_assist import clear_thread, load_thread_messages
+from rag个人知识库.agent.ai_assist import clear_thread
 from rag个人知识库.service.chat_history import (
+    build_session_detail,
     delete_session as delete_chat_session,
-    get_session_info,
     list_sessions as list_chat_sessions,
     rename_session as rename_chat_session,
     upsert_chat_session,
 )
+from rag个人知识库.service.session_cache import (
+    get_cached_docs,
+    get_cached_session_detail,
+    get_cached_session_info,
+    get_cached_session_list,
+    get_cached_user_search,
+    invalidate_docs,
+    invalidate_session_detail,
+    invalidate_session_list,
+    invalidate_user,
+    invalidate_user_search,
+    invalidate_user_sessions,
+    set_cached_docs,
+    set_cached_user_search,
+    set_session_detail,
+    set_session_list,
+    warmup_user_sessions,
+)
+from rag个人知识库.utils.sanitize import sanitize_source, sanitize_source_paths
 from rag个人知识库.service.delete_queue import (
     enqueue_delete,
     run_worker as run_delete_worker,
@@ -81,6 +101,20 @@ class UserOut(BaseModel):
     role: str
 
 
+class ProfileOut(BaseModel):
+    """个人详情公开字段：自己与他人查看同一模型，is_self 区分是否本人。"""
+
+    id: int
+    username: str
+    role: str
+    created_at: Optional[datetime] = None
+    is_self: bool = False
+
+
+class ChangePasswordIn(BaseModel):
+    old_password: str
+    new_password: str
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -90,6 +124,11 @@ class TokenOut(BaseModel):
 class ChatIn(BaseModel):
     content: str = Field(..., min_length=1, max_length=2000, description="用户输入")
     session_id: Optional[str] = Field(default=None, max_length=64)  # 为空则服务端生成
+    # 会话检索范围（仅「新建/空白会话首问」生效，会话已有范围时以库中为准）
+    retrieve_own_private: bool = True
+    retrieve_own_public: bool = True
+    retrieve_kb_public: bool = True
+    retrieve_owner_ids: List[int] = Field(default_factory=list, max_length=50)
 
 
 class ChatOut(BaseModel):
@@ -114,6 +153,10 @@ class ChatSessionOut(BaseModel):
     last_message_preview: str = ''
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    retrieve_own_private: bool = True
+    retrieve_own_public: bool = True
+    retrieve_kb_public: bool = True
+    retrieve_owner_ids: List[int] = Field(default_factory=list)
 
 
 class ChatMessageOut(BaseModel):
@@ -128,6 +171,11 @@ class ChatSessionDetailOut(BaseModel):
     session_id: str
     title: str
     messages: List[ChatMessageOut]
+    retrieve_own_private: bool = True
+    retrieve_own_public: bool = True
+    retrieve_kb_public: bool = True
+    retrieve_owner_ids: List[int] = Field(default_factory=list)
+    retrieve_owner_names: List[str] = Field(default_factory=list)
 
 
 class ChatRenameIn(BaseModel):
@@ -230,7 +278,7 @@ async def _sse_events(gen):
     async for event in gen:
         # 流式事件同样需要脱敏 source，避免暴露服务器本地绝对路径
         if event.get("sources"):
-            _sanitize_source_paths(event["sources"])
+            sanitize_source_paths(event["sources"])
         yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
@@ -276,7 +324,87 @@ async def register(body: RegisterIn, request: Request, db: AsyncSession = Depend
     await db.flush()
     audit(db, user, "register", target=username)
     await clear_key(reg_key)  # 注册成功后清空失败计数
+    await invalidate_user_search()  # 新用户进入可检索列表，清用户搜索缓存
     return UserOut(id=user.id, username=user.username, role=user.role)
+
+
+@app.get("/api/users/{user_id}/profile", response_model=ProfileOut)
+async def user_profile(
+    user_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """查看任意用户的个人详情（仅公开安全字段）。
+
+    - 他人账号非 active 视为不存在（404），避免已删除/禁用账号仍可被浏览。
+    - 本人查看时 is_self=True，前端据此展示私有文档数与账号管理入口。
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None or (target.status != "active" and target.id != user.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "用户不存在")
+    return ProfileOut(
+        id=target.id,
+        username=target.username,
+        role=target.role,
+        created_at=target.created_at,
+        is_self=(target.id == user.id),
+    )
+
+
+@app.get("/api/users/search", response_model=List[UserOut])
+async def user_search(
+    q: str = Query(default="", max_length=64, description="用户名关键字（模糊匹配）"),
+    limit: int = Query(default=20, ge=1, le=50),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """用户搜索（供问答页「指定用户的公开文档」多选器）。
+
+    只返回 active 用户，且排除当前用户（自己的文档由「自己的私有/公开文档」覆盖）。
+    按 username 前缀优先、再按创建时间倒序，最多 limit 条。
+    """
+    keyword = (q or "").strip()
+    cached = await get_cached_user_search(user.id, limit, keyword)
+    if cached is not None:
+        return cached
+    stmt = (
+        select(User)
+        .where(User.status == "active", User.id != user.id)
+        .order_by(User.username.asc())
+        .limit(limit)
+    )
+    if keyword:
+        like = f"%{keyword}%"
+        stmt = stmt.where(User.username.like(like))
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    items = [UserOut(id=r.id, username=r.username, role=r.role) for r in rows]
+    await set_cached_user_search(user.id, limit, keyword, [i.model_dump() for i in items])
+    return items
+
+
+@app.post("/api/auth/change-password", status_code=status.HTTP_200_OK)
+async def change_password(
+    body: ChangePasswordIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """修改密码：校验原密码 → 新密码至少 6 位且不与原密码相同 → 更新 bcrypt 哈希。"""
+    if not verify_password(body.old_password, user.password_hash):
+        await write_audit("change_password_failed", username=user.username, detail="old password mismatch")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "原密码不正确")
+    if len(body.new_password) < 6:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "新密码至少 6 位")
+    if body.new_password == body.old_password:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "新密码不能与原密码相同")
+    # 显式 UPDATE 落库：user 可能来自 Redis 缓存（游离对象），直接改属性 + commit 不会生效
+    new_hash = hash_password(body.new_password)
+    await db.execute(update(User).where(User.id == user.id).values(password_hash=new_hash))
+    await db.commit()
+    await invalidate_user(user.id)  # 密码哈希已变，清鉴权用户缓存
+    audit(db, user, "change_password", target=user.username)
+    return {"message": "密码修改成功，请重新登录"}
 
 
 @app.post("/api/auth/login", response_model=TokenOut)
@@ -284,6 +412,7 @@ async def login(
     form: OAuth2PasswordRequestForm = Depends(),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks = None,
 ):
     """OAuth2 密码流登录，返回 JWT。滑动窗口限流（5 次/分钟），失败写入审计。"""
     key = f"login|{form.username}|{_client_ip(request)}"
@@ -297,12 +426,25 @@ async def login(
         await write_audit("login_failed", username=form.username, detail=f"ip={_client_ip(request)}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
     await clear_key(key)
+    # 登录后后台预热会话列表 + 最近 10 个会话记录（不阻塞登录响应）
+    if background_tasks is not None:
+        background_tasks.add_task(warmup_user_sessions, user.id)
     return TokenOut(access_token=create_access_token(user), role=user.role)
 
 
 @app.get("/api/auth/me", response_model=UserOut)
 async def me(user: User = Depends(get_current_user)):
     return UserOut(id=user.id, username=user.username, role=user.role)
+
+
+@app.post("/api/auth/logout")
+async def logout(user: User = Depends(get_current_user)):
+    """退出登录：清除该用户的鉴权用户行缓存（JWT 本身无状态，客户端丢弃 token 即可）。
+
+    多端同时在线时，任一端登出都会让其他端下一次请求回源 DB 重建缓存（无害的缓存未命中）。
+    """
+    await invalidate_user(user.id)
+    return {"status": "logged_out", "user_id": user.id}
 
 
 @app.post("/api/auth/delete-account", status_code=status.HTTP_202_ACCEPTED)
@@ -321,13 +463,17 @@ async def delete_account(
     """
     if user.status != "active":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "当前账号状态不可删除")
+    # 管理员不能删除自己的账号（防止误删唯一管理员导致系统失控）
+    if user.role == "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "管理员账号不能删除自己，请联系系统管理员处理")
 
     source_result = await db.execute(
         select(VectorFile.source).where(VectorFile.owner_id == user.id)
     )
     user_sources = list(source_result.scalars().all())
 
-    user.status = "deleting"
+    # 显式 UPDATE 落库：user 可能来自 Redis 缓存（游离对象），直接改属性 + commit 不会生效
+    await db.execute(update(User).where(User.id == user.id).values(status="deleting"))
     await db.execute(
         update(VectorFile)
         .where(VectorFile.owner_id == user.id)
@@ -335,16 +481,27 @@ async def delete_account(
     )
     audit(db, user, "delete_account_request", target=user.username, detail="status=deleting, docs is_public=0")
 
+    # 先提交事务，再入队删除任务：确保 worker 读取时 status=deleting 已可见，
+    # 避免「入队先于提交」导致 worker 读到旧状态而误判丢弃（账号卡死在 deleting）
+    await db.commit()
+
     msg_id = await enqueue_delete(user.id)
     if msg_id is None:
-        await db.rollback()
+        # Redis 不可用：补偿回滚 status=active，避免账号卡死在 deleting 且无任务可消费
+        async with async_session() as db2:
+            await db2.execute(update(User).where(User.id == user.id).values(status="active"))
+            await db2.commit()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Redis 不可用，暂时无法提交账户删除请求")
-
-    await db.commit()
 
     # 文档私有化后立即清理相关缓存，避免其他用户在删除队列执行前仍命中旧共享结果
     for source in user_sources:
         await cache_clear_source(source)
+
+    # 账号进入删除流程：清鉴权/会话缓存；文档与用户搜索缓存全量失效
+    await invalidate_user(user.id)
+    await invalidate_user_sessions(user.id)
+    await invalidate_docs()
+    await invalidate_user_search()
 
     return {
         "status": "deleting",
@@ -414,7 +571,7 @@ async def upload_documents(
             continue
         with open(path, "wb") as f:
             f.write(content)
-        audit(db, user, "upload", target=file_name, detail=_sanitize_source(path))
+        audit(db, user, "upload", target=file_name, detail=sanitize_source(path))
         # 入库任务必须进入 Redis Streams 持久队列，避免进程内存任务在崩溃时丢失
         msg_id = await enqueue_ingest(path, owner_id=user.id, is_public=is_public)
         if msg_id is None:
@@ -429,13 +586,15 @@ async def upload_documents(
         results.append({
             "file_name": file_name,
             "status": "processing",
-            "source": _sanitize_source(path),
+            "source": sanitize_source(path),
             "is_public": is_public,
             "message": "已提交入库队列，稍后刷新文档列表查看结果",
         })
 
     failed = len(results) - accepted
     summary = f"{accepted} 个文件已提交入库，{failed} 个文件失败" if failed else f"{accepted} 个文件已提交入库"
+    if accepted:
+        await invalidate_docs()  # 新文件进入队列，文档列表立即刷新（状态 processing）
     return {
         "status": "processing",
         "results": results,
@@ -443,40 +602,6 @@ async def upload_documents(
         "failed": failed,
         "message": summary,
     }
-
-
-def _sanitize_source(path: str) -> str:
-    """对外隐藏本地绝对路径；相对路径（uploads/{user_id}/文件）直接展示，不暴露服务器盘符。
-
-    相对 source 是服务器环境下与 OSS 归档/下载一致的标准口径，脱敏后原样返回；
-    绝对路径（存量/CLI 手动入库）则归一为 uploads/ 前缀的相对形式。
-    """
-    if not path:
-        return path
-    if path.startswith("uploads/"):
-        return path  # 已是相对路径，直接展示
-    abs_path = os.path.abspath(path)
-    abs_upload = os.path.abspath(UPLOAD_DIR)
-    if abs_path.startswith(abs_upload + os.sep):
-        return "uploads/" + os.path.relpath(abs_path, abs_upload).replace(os.sep, "/")
-    base = os.path.abspath(BASE_DIR)
-    if abs_path.startswith(base + os.sep):
-        return os.path.relpath(abs_path, base).replace(os.sep, "/")
-    return os.path.basename(abs_path)
-
-
-def _sanitize_source_paths(items: List[dict]) -> None:
-    """就地脱敏 items 中的本地路径字段（source / metadata.source / metadata.md_path），
-    兼容 chat 来源列表与检索命中列表，避免向客户端泄露服务器文件路径。"""
-    for item in items:
-        if item.get("source"):
-            item["source"] = _sanitize_source(item["source"])
-        meta = item.get("metadata")
-        if isinstance(meta, dict):
-            if meta.get("source"):
-                meta["source"] = _sanitize_source(meta["source"])
-            if meta.get("md_path"):
-                meta["md_path"] = _sanitize_source(meta["md_path"])
 
 
 @app.get("/api/documents", response_model=DocumentListOut)
@@ -492,10 +617,15 @@ async def list_docs(
     """
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
+    cached = await get_cached_docs(user.id, limit, offset)
+    if cached is not None:
+        return cached
     docs, total = await list_documents(limit=limit, offset=offset, user_id=user.id, with_total=True)
     for d in docs:
-        d["source"] = _sanitize_source(d["source"])
-    return {"total": total, "items": docs}
+        d["source"] = sanitize_source(d["source"])
+    payload = {"total": total, "items": docs}
+    await set_cached_docs(user.id, limit, offset, payload)
+    return payload
 
 
 @app.delete("/api/documents/{file_id}")
@@ -528,6 +658,7 @@ async def remove_document(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
     # 删除后只清理包含该文档 source 的检索/回答缓存，避免 TTL 内继续返回已删文档的旧结果
     await cache_clear_source(record.source)
+    await invalidate_docs()  # 文档列表：该文档从所有可见者的列表中移除
     return {"status": "deleted", "file_id": file_id}
 @app.post("/api/documents/{file_id}/revoke")
 async def revoke_document(
@@ -548,6 +679,7 @@ async def revoke_document(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
     # 取消共享后只清理包含该文档 source 的检索/回答缓存，不影响其他文档缓存
     await cache_clear_source(record.source)
+    await invalidate_docs()  # 可见性变化影响所有可见者的文档列表
     return {
         "status": "revoked",
         "file_id": file_id,
@@ -576,6 +708,7 @@ async def share_document(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
     # 设为公开后清理包含该文档的检索/回答缓存，让其他用户尽快检索到
     await cache_clear_source(record.source)
+    await invalidate_docs()  # 可见性变化影响所有可见者的文档列表
     return {
         "status": "shared",
         "file_id": file_id,
@@ -607,11 +740,14 @@ async def download_document(
     # 下载量统计：仅「非所有者（陌生人）」下载成功时 +1（owner 自己下载不计）
     if record.owner_id != user.id:
         record.download_count = (record.download_count or 0) + 1
+        await db.commit()  # 提交计数，否则只改内存不落库
+        # 让下载者自己的文档列表缓存立即刷新，避免 60s TTL 内刷新页面仍看到旧计数
+        await cache_clear_prefix(f"docs:{user.id}:")
 
     # 1) OSS 启用的场景：返回会过期的签名 URL / 公有 URL，前端直接打开
     url = await build_download_url(record.source)
     if url:
-        return {"file_name": record.file_name, "source": _sanitize_source(record.source), "url": url, "expires_in": 3600}
+        return {"file_name": record.file_name, "source": sanitize_source(record.source), "url": url, "expires_in": 3600}
 
     # 2) OSS 未启用且本地原件保留：直接流式返回本地文件
     media_type = {
@@ -686,26 +822,29 @@ async def ingest_dead_clear(admin: User = Depends(require_admin)):
 # ══ 问答 / 检索（所有登录用户）══
 @app.get("/api/chat/sessions", response_model=List[ChatSessionOut])
 async def chat_sessions(user: User = Depends(get_current_user)):
-    """历史会话列表（问答侧边栏），按最后消息时间倒序。"""
-    return await list_chat_sessions(user.id)
+    """历史会话列表（问答侧边栏），按最后消息时间倒序；优先读 Redis 缓存。"""
+    cached = await get_cached_session_list(user.id)
+    if cached is not None:
+        return cached
+    items = await list_chat_sessions(user.id)
+    await set_session_list(user.id, items)
+    return items
 
 
 @app.get("/api/chat/sessions/{session_id}", response_model=ChatSessionDetailOut)
 async def chat_session_detail(session_id: str, user: User = Depends(get_current_user)):
-    """读取单个历史会话及完整消息（消息从 Postgres checkpoint 加载，元信息从 MySQL）。"""
-    info = await get_session_info(user.id, session_id)
-    messages = await asyncio.to_thread(load_thread_messages, f"{user.id}:{session_id}")
-    # 来源引用中的本地路径与实时问答一致做脱敏（绝对路径归一为 uploads/ 相对形式）
-    for m in messages:
-        if m.get("sources"):
-            _sanitize_source_paths(m["sources"])
-    if info is None and not messages:
+    """读取单个历史会话及完整消息（消息从 Postgres checkpoint 加载，元信息从 MySQL）。
+
+    优先读 Redis 缓存；未命中回源 MySQL + Postgres 后写回缓存（TTL 1h）。
+    """
+    cached = await get_cached_session_detail(user.id, session_id)
+    if cached is not None:
+        return cached
+    payload = await build_session_detail(user.id, session_id)
+    if payload is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
-    return {
-        "session_id": session_id,
-        "title": (info or {}).get("title") or "新会话",
-        "messages": messages,
-    }
+    await set_session_detail(user.id, session_id, payload)
+    return payload
 
 
 @app.patch("/api/chat/sessions/{session_id}", response_model=ChatSessionOut)
@@ -714,7 +853,9 @@ async def chat_session_rename(session_id: str, body: ChatRenameIn, user: User = 
     ok = await rename_chat_session(user.id, session_id, body.title)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
-    info = await get_session_info(user.id, session_id)
+    await invalidate_session_list(user.id)
+    await invalidate_session_detail(user.id, session_id)
+    info = await get_cached_session_info(user.id, session_id)
     return ChatSessionOut(**info)
 
 
@@ -724,6 +865,8 @@ async def chat_session_delete(session_id: str, user: User = Depends(get_current_
     ok = await delete_chat_session(user.id, session_id)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "会话不存在")
+    await invalidate_session_list(user.id)
+    await invalidate_session_detail(user.id, session_id)
     try:
         await asyncio.to_thread(clear_thread, f"{user.id}:{session_id}")
     except Exception as e:
@@ -731,25 +874,79 @@ async def chat_session_delete(session_id: str, user: User = Depends(get_current_
     return {"status": "deleted", "session_id": session_id}
 
 
+
+async def _resolve_chat_scope(body: ChatIn, user: User) -> dict:
+    """解析本次问答的检索范围。
+
+    锁定规则：会话已存在（库中已有范围）→ 以库中为准（首问后不可更改）；
+    新会话 / 会话不存在 → 用请求参数并做互斥与最少一项校验。
+    """
+    if body.session_id:
+        info = await get_cached_session_info(user.id, body.session_id)
+        if info is not None:
+            return {
+                "retrieve_own_private": info["retrieve_own_private"],
+                "retrieve_own_public": info["retrieve_own_public"],
+                "retrieve_kb_public": info["retrieve_kb_public"],
+                "retrieve_owner_ids": info["retrieve_owner_ids"],
+            }
+    scope = {
+        "retrieve_own_private": bool(body.retrieve_own_private),
+        "retrieve_own_public": bool(body.retrieve_own_public),
+        "retrieve_kb_public": bool(body.retrieve_kb_public),
+        "retrieve_owner_ids": sorted({t for t in (body.retrieve_owner_ids or []) if t is not None}),
+    }
+    if scope["retrieve_kb_public"] and scope["retrieve_owner_ids"]:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "“知识库里的公开文档”与“指定用户的公开文档”互斥，请二选一",
+        )
+    if not (
+        scope["retrieve_own_private"]
+        or scope["retrieve_own_public"]
+        or scope["retrieve_kb_public"]
+        or scope["retrieve_owner_ids"]
+    ):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "至少需要选择一种检索范围",
+        )
+    return scope
+
+
 @app.post("/api/chat", response_model=ChatOut)
 async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
-    """知识库问答。thread_id 按用户隔离：{user_id}:{session_id}，同一 session 保持多轮记忆。"""
+    """知识库问答。thread_id 按用户隔离：{user_id}:{session_id}，同一 session 保持多轮记忆。
+
+    检索范围：首问（新会话）用请求参数并落库锁定；后续轮次以库中为准。
+    """
+    scope = await _resolve_chat_scope(body, user)
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
     try:
-        result = await chat(body.content, thread_id=thread_id, user_id=user.id)
+        result = await chat(
+            body.content,
+            thread_id=thread_id,
+            user_id=user.id,
+            load_history=body.session_id is not None,
+            **scope,
+        )
     except Exception as e:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"问答服务异常：{e}")
     sources = result.get("sources", [])
-    _sanitize_source_paths(sources)
+    sanitize_source_paths(sources)
     # 完成一轮对话后写入会话历史（失败不影响回答本身）
     try:
         await upsert_chat_session(
             user.id, session_id, body.content,
             result["answer"], result.get("intent"),
+            **scope,
         )
     except Exception as e:
         logger.warning("[chat] 会话历史落库失败（不影响回答）：%s", e)
+    # 会话内容/摘要变化：失效该会话的列表与详情缓存
+    await invalidate_session_list(user.id)
+    await invalidate_session_detail(user.id, session_id)
     return ChatOut(
         answer=result["answer"],
         intent=result.get("intent", ""),
@@ -767,9 +964,14 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
     前端用 fetch ReadableStream 消费（SSE POST 不支持 EventSource），
     禁用缓冲保证逐段即时到达。流结束后把整轮对话落库（会话历史）。
     """
+    scope = await _resolve_chat_scope(body, user)
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
-    gen = chat_stream(body.content, thread_id=thread_id, session_id=session_id, user_id=user.id)
+    gen = chat_stream(
+        body.content, thread_id=thread_id, session_id=session_id, user_id=user.id,
+        load_history=body.session_id is not None,
+        **scope,
+    )
 
     async def _stream_with_persist():
         final_answer = None
@@ -777,7 +979,7 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
         final_intent = None
         async for event in gen:
             if event.get("sources"):
-                _sanitize_source_paths(event["sources"])
+                sanitize_source_paths(event["sources"])
             etype = event.get("type")
             if etype == "meta":
                 final_sources = event.get("sources") or []
@@ -796,9 +998,13 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
                 await upsert_chat_session(
                     user.id, session_id, body.content,
                     final_answer, final_intent,
+                    **scope,
                 )
             except Exception as e:
                 logger.warning("[chat] 会话历史落库失败（不影响回答）：%s", e)
+            # 会话内容/摘要变化：失效该会话的列表与详情缓存
+            await invalidate_session_list(user.id)
+            await invalidate_session_detail(user.id, session_id)
 
     return StreamingResponse(
         _stream_with_persist(),
@@ -817,5 +1023,5 @@ async def search_api(body: SearchIn, user: User = Depends(get_current_user)):
         hits = await search_documents(body.query, k=body.k, source=body.source, user_id=user.id)
     except Exception as e:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"检索服务异常：{e}")
-    _sanitize_source_paths(hits)
+    sanitize_source_paths(hits)
     return {"query": body.query, "hits": hits}

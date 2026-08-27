@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   streamChat,
   listChatSessions,
   getChatSession,
   deleteChatSession,
   renameChatSession,
+  searchUsers,
+  getUserProfile,
   type SourceItem,
   type ChatSessionInfo,
+  type UserSearchItem,
 } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import SourceStrip from '../components/SourceStrip.vue'
@@ -21,9 +25,12 @@ interface MessageItem {
 }
 
 const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
 const messages = ref<MessageItem[]>([])
 const input = ref('')
 const sessionId = ref<string | null>(null)
+const loadingSession = ref(false)  // 切换历史会话时的加载占位，避免闪现新建会话空态
 const streaming = ref(false)
 const waitStart = ref(0)
 const waitSeconds = ref(0)
@@ -41,10 +48,160 @@ const suggestions = [
   '复杂问题可以拆成子问题来回答吗？',
 ]
 
-const shortSession = computed(() => (sessionId.value ? sessionId.value.slice(0, 8) : ''))
 const currentTitle = computed(
   () => sessions.value.find((s) => s.session_id === sessionId.value)?.title ?? '新会话',
 )
+
+/* ── 会话检索范围（4 复选框，首问后锁定） ───────────────── */
+interface ScopeState {
+  ownPrivate: boolean
+  ownPublic: boolean
+  kbPublic: boolean
+  ownerIds: number[]
+  ownerNames: string[]
+}
+const scope = reactive<ScopeState>({
+  ownPrivate: true,
+  ownPublic: true,
+  kbPublic: true,
+  ownerIds: [],
+  ownerNames: [],
+})
+const scopeLocked = ref(false)
+const scopeError = ref('')
+
+// 「指定用户的公开文档」搜索多选器
+const userQuery = ref('')
+const userResults = ref<UserSearchItem[]>([])
+const userSearching = ref(false)
+const userSearchOpen = ref(false)
+let userSearchTimer: number | undefined
+
+const scopeSummary = computed(() => {
+  const parts: string[] = []
+  if (scope.ownPrivate) parts.push('我的私有文档')
+  if (scope.ownPublic) parts.push('我的公开文档')
+  if (scope.kbPublic) parts.push('知识库里的公开文档')
+  if (scope.ownerIds.length) {
+    const names = scope.ownerNames.length
+      ? scope.ownerNames.join('、')
+      : scope.ownerIds.map((id) => `#${id}`).join('、')
+    parts.push(`指定用户：${names}`)
+  }
+  return parts.length ? parts.join(' · ') : '未选择任何范围'
+})
+
+const scopeValid = computed(
+  () => scope.ownPrivate || scope.ownPublic || scope.kbPublic || scope.ownerIds.length > 0,
+)
+
+// #3 与 #4 互斥：勾 #3 清空 #4；选 #4 取消 #3
+const scopeKbChecked = computed({
+  get: () => scope.kbPublic,
+  set: (v: boolean) => toggleKbPublic(v),
+})
+const scopeUserChecked = computed({
+  get: () => scope.ownerIds.length > 0 && !scope.kbPublic,
+  set: (v: boolean) => {
+    if (v) {
+      scope.kbPublic = false
+      userSearchOpen.value = true
+    } else {
+      scope.ownerIds = []
+      scope.ownerNames = []
+      userSearchOpen.value = false
+    }
+  },
+})
+
+function resetScope() {
+  scope.ownPrivate = true
+  scope.ownPublic = true
+  scope.kbPublic = true
+  scope.ownerIds = []
+  scope.ownerNames = []
+  scopeError.value = ''
+  scopeLocked.value = false
+  userSearchOpen.value = false
+}
+
+async function applyRouteScope() {
+  // 从个人主页深链进入：/?owner_id=<id> 只检索该用户公开文档；/?own=1 只检索自己的文档
+  const ownerId = Number(route.query.owner_id)
+  if (Number.isInteger(ownerId) && ownerId > 0) {
+    scope.ownPrivate = false
+    scope.ownPublic = false
+    scope.kbPublic = false
+    scope.ownerIds = [ownerId]
+    scope.ownerNames = []
+    try {
+      const p = await getUserProfile(ownerId)
+      scope.ownerNames = [p.username]
+    } catch {
+      // 拿不到用户名时用 #id 兜底
+    }
+  } else if (route.query.own !== undefined) {
+    scope.ownPrivate = true
+    scope.ownPublic = true
+    scope.kbPublic = false
+    scope.ownerIds = []
+    scope.ownerNames = []
+  }
+}
+
+function toggleKbPublic(v: boolean) {
+  scope.kbPublic = v
+  if (v) {
+    scope.ownerIds = []
+    scope.ownerNames = []
+  }
+}
+
+async function addOwner(u: UserSearchItem) {
+  if (!scope.ownerIds.includes(u.id)) {
+    scope.ownerIds.push(u.id)
+    scope.ownerNames.push(u.username)
+    scope.kbPublic = false // #3 与 #4 互斥
+  }
+  userQuery.value = ''
+  userSearchOpen.value = false
+  scopeError.value = ''
+}
+
+function removeOwner(id: number) {
+  const idx = scope.ownerIds.indexOf(id)
+  if (idx >= 0) {
+    scope.ownerIds.splice(idx, 1)
+    scope.ownerNames.splice(idx, 1)
+  }
+}
+
+async function runUserSearch() {
+  const q = userQuery.value.trim()
+  if (!q) {
+    userResults.value = []
+    userSearching.value = false
+    return
+  }
+  userSearching.value = true
+  try {
+    userResults.value = await searchUsers(q)
+    userSearchOpen.value = true
+  } catch {
+    userResults.value = []
+  } finally {
+    userSearching.value = false
+  }
+}
+
+function onUserQueryInput() {
+  if (userSearchTimer !== undefined) window.clearTimeout(userSearchTimer)
+  userSearchTimer = window.setTimeout(runUserSearch, 250)
+}
+
+function onUserFocus() {
+  if (userQuery.value.trim()) userSearchOpen.value = true
+}
 
 /* ── 侧边栏（DeepSeek 风格，可折叠） ───────────────────── */
 const sessions = ref<ChatSessionInfo[]>([])
@@ -93,19 +250,31 @@ function newConversation() {
   if (streaming.value) return
   sessionId.value = null
   messages.value = []
+  loadingSession.value = false
   input.value = ''
   confirmDeleteId.value = null
+  resetScope()
+  // 清除个人主页深链的 query（owner_id/own/session），避免刷新后检索范围被重新预置
+  if (route.query.owner_id !== undefined || route.query.own !== undefined || route.query.session !== undefined) {
+    router.replace({ path: '/', query: {} })
+  }
   nextTick(() => inputEl.value?.focus())
 }
 
 async function openSession(id: string) {
   if (streaming.value || id === sessionId.value) return
   sessionId.value = id
-  messages.value = []
   input.value = ''
-  scrollToBottom()
+  scopeLocked.value = true
+  // 加载完成前先显示「加载中」占位，避免闪现空会话（新建会话）欢迎页
+  loadingSession.value = true
   try {
     const detail = await getChatSession(id)
+    scope.ownPrivate = detail.retrieve_own_private
+    scope.ownPublic = detail.retrieve_own_public
+    scope.kbPublic = detail.retrieve_kb_public
+    scope.ownerIds = detail.retrieve_owner_ids ?? []
+    scope.ownerNames = detail.retrieve_owner_names ?? []
     messages.value = detail.messages.map((m) => ({
       role: m.role,
       content: m.content,
@@ -115,6 +284,8 @@ async function openSession(id: string) {
     }))
   } catch {
     messages.value = []
+  } finally {
+    loadingSession.value = false
   }
   scrollToBottom()
 }
@@ -160,6 +331,7 @@ async function removeSession(s: ChatSessionInfo, confirmed = false) {
     if (sessionId.value === s.session_id) {
       sessionId.value = null
       messages.value = []
+      loadingSession.value = false
     }
     sessions.value = sessions.value.filter((x) => x.session_id !== s.session_id)
   } catch {
@@ -201,6 +373,10 @@ function stopWaitTimer() {
 async function send() {
   const text = input.value.trim()
   if (!text || streaming.value || !isLoggedIn.value) return
+  if (!scopeValid.value) {
+    scopeError.value = '请至少勾选一种检索范围'
+    return
+  }
   input.value = ''
   autoGrow()
   messages.value.push({ role: 'user', content: text, sources: [] })
@@ -210,8 +386,16 @@ async function send() {
   startWaitTimer()
   scrollToBottom()
 
+  const body = {
+    content: text,
+    session_id: sessionId.value,
+    retrieve_own_private: scope.ownPrivate,
+    retrieve_own_public: scope.ownPublic,
+    retrieve_kb_public: scope.kbPublic,
+    retrieve_owner_ids: scope.ownerIds,
+  }
   try {
-    await streamChat({ content: text, session_id: sessionId.value }, (evt) => {
+    await streamChat(body, (evt) => {
       if (evt.type === 'meta') {
         if (evt.session_id) sessionId.value = evt.session_id
         assistant.sources = evt.sources
@@ -238,6 +422,7 @@ async function send() {
   } finally {
     streaming.value = false
     stopWaitTimer()
+    scopeLocked.value = true
     await refreshSessions()
     scrollToBottom()
   }
@@ -270,7 +455,15 @@ watch(isLoggedIn, (v) => {
 onMounted(() => {
   onResize()
   window.addEventListener('resize', onResize)
-  if (isLoggedIn.value) refreshSessions()
+  if (isLoggedIn.value) {
+    refreshSessions()
+    applyRouteScope()
+    // 支持从个人详情「最近会话」深链打开：/?session=<id>
+    const sid = route.query.session
+    if (typeof sid === 'string' && sid) {
+      openSession(sid)
+    }
+  }
 })
 onUnmounted(() => {
   window.removeEventListener('resize', onResize)
@@ -398,8 +591,20 @@ onUnmounted(() => {
 
       <div class="chat-inner">
         <div ref="box" class="messages scroll-thin">
+          <!-- 加载历史会话中（避免闪现新建会话空态） -->
+          <div v-if="loadingSession" class="empty loading-session">
+            <div class="loading-session-inner">
+              <span class="ls-dots">
+                <span class="waiting-dot" aria-hidden="true"></span>
+                <span class="waiting-dot" aria-hidden="true"></span>
+                <span class="waiting-dot" aria-hidden="true"></span>
+              </span>
+              <p class="ls-text">正在加载会话…</p>
+            </div>
+          </div>
+
           <!-- 空状态 / 访客态 -->
-          <div v-if="!messages.length" class="empty">
+          <div v-else-if="!messages.length" class="empty">
             <div class="empty-hero">
               <div class="empty-mark">
                 <svg viewBox="0 0 64 64" width="46" height="46" aria-hidden="true">
@@ -428,6 +633,74 @@ onUnmounted(() => {
                 </svg>
                 {{ s }}
               </button>
+            </div>
+
+            <div v-if="isLoggedIn && !scopeLocked" class="scope-picker">
+              <div class="scope-head">
+                <span class="scope-title">本次会话的检索范围</span>
+                <span class="scope-hint">首条消息发送后锁定，如需更改请新建会话</span>
+              </div>
+              <div class="scope-options">
+                <label class="scope-option">
+                  <input type="checkbox" v-model="scope.ownPrivate" />
+                  <span class="scope-label">是否检索我的私有文档</span>
+                </label>
+                <label class="scope-option">
+                  <input type="checkbox" v-model="scope.ownPublic" />
+                  <span class="scope-label">是否检索我的公开文档</span>
+                </label>
+                <label class="scope-option">
+                  <input type="checkbox" v-model="scopeKbChecked" />
+                  <span class="scope-label">是否检索知识库里的公开文档</span>
+                </label>
+                <label class="scope-option" :class="{ muted: scope.kbPublic }">
+                  <input type="checkbox" v-model="scopeUserChecked" :disabled="scope.kbPublic" />
+                  <span class="scope-label">是否检索指定用户的公开文档</span>
+                </label>
+              </div>
+
+              <div v-if="!scope.kbPublic" class="scope-user-search">
+                <div v-if="scope.ownerIds.length" class="scope-chips">
+                  <span v-for="(name, i) in scope.ownerNames" :key="scope.ownerIds[i]" class="scope-chip">
+                    {{ name || `用户 #${scope.ownerIds[i]}` }}
+                    <button type="button" class="chip-x" :aria-label="`移除 ${name}`" @click="removeOwner(scope.ownerIds[i])">×</button>
+                  </span>
+                </div>
+                <div class="scope-user-input-row">
+                  <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                    <circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                    <path d="M10.2 10.2L13 13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                  </svg>
+                  <input
+                    v-model="userQuery"
+                    class="scope-user-input"
+                    placeholder="搜索用户名以指定检索该用户的公开文档（可多选）"
+                    @input="onUserQueryInput"
+                    @focus="onUserFocus"
+                    @keydown.esc="userSearchOpen = false"
+                  />
+                </div>
+                <div v-if="userSearchOpen && (userSearching || userResults.length || userQuery.trim())" class="user-dropdown">
+                  <div v-if="userSearching" class="user-drop-tip">搜索中…</div>
+                  <template v-else>
+                    <button
+                      v-for="u in userResults"
+                      :key="u.id"
+                      type="button"
+                      class="user-option"
+                      @mousedown.prevent
+                      @click="addOwner(u)"
+                    >
+                      <span class="user-avatar">{{ u.username.slice(0, 1).toUpperCase() }}</span>
+                      <span class="user-name">{{ u.username }}</span>
+                      <span class="user-role" :class="{ admin: u.role === 'admin' }">{{ u.role === 'admin' ? '管理员' : '用户' }}</span>
+                    </button>
+                    <p v-if="!userResults.length" class="user-drop-tip">未找到匹配用户</p>
+                  </template>
+                </div>
+              </div>
+
+              <p v-if="scopeError" class="scope-error" role="alert">{{ scopeError }}</p>
             </div>
 
             <p v-if="!isLoggedIn" class="guest-note">
@@ -467,6 +740,14 @@ onUnmounted(() => {
 
         <!-- 输入 / 登录门 -->
         <div class="composer-wrap">
+          <div v-if="isLoggedIn && scopeLocked && (sessionId || messages.length)" class="scope-readonly">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M2.5 4h11M2.5 8h11M2.5 12h7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            </svg>
+            <span class="scope-ro-label">检索范围</span>
+            <span class="scope-ro-value">{{ scopeSummary }}</span>
+            <span v-if="scope.ownerIds.length || !scopeValid" class="scope-ro-tag" title="首条消息后锁定，如需更改请新建会话">已锁定</span>
+          </div>
           <div v-if="isLoggedIn" class="composer">
             <textarea
               ref="inputEl"
@@ -801,6 +1082,16 @@ onUnmounted(() => {
   margin: 0;
 }
 .hl { color: var(--text); font-weight: 600; }
+.loading-session { display: flex; }
+.loading-session-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  color: var(--text-3);
+  font-size: 13.5px;
+}
+.ls-dots { display: flex; gap: 6px; }
 
 .suggestions {
   display: flex;
@@ -999,7 +1290,201 @@ onUnmounted(() => {
 .gate-text { color: var(--text-2); font-size: 14px; }
 .gap { gap: 6px; }
 
+.scope-picker {
+  margin-top: 26px;
+  max-width: 560px;
+  margin-left: auto;
+  margin-right: auto;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-xs);
+}
+.scope-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.scope-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.scope-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.scope-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 18px;
+}
+.scope-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.scope-option.muted { opacity: 0.55; }
+.scope-option input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  flex: none;
+  margin: 0;
+  cursor: pointer;
+}
+.scope-label { line-height: 1.5; }
+.scope-user-search { margin-top: 12px; }
+.scope-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px 3px 10px;
+  font-size: 12px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: var(--radius-pill);
+}
+.chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--accent);
+  background: transparent;
+}
+.chip-x:hover { background: var(--accent); color: #fff; }
+.scope-user-input-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.scope-user-input-row svg {
+  position: absolute;
+  left: 10px;
+  color: var(--text-3);
+  pointer-events: none;
+}
+.scope-user-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  padding: 8px 12px 8px 30px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.scope-user-input::placeholder { color: var(--text-3); }
+.scope-user-input:focus {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-focus);
+}
+.user-dropdown {
+  position: absolute;
+  z-index: 40;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  padding: 4px;
+}
+.user-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+}
+.user-option:hover { background: var(--surface-3); }
+.user-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 650;
+  flex: none;
+}
+.user-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-role { font-size: 11px; color: var(--text-3); padding: 1px 7px; border-radius: var(--radius-pill); background: var(--neutral-soft); flex: none; }
+.user-role.admin { color: var(--accent); background: var(--accent-soft); }
+.user-drop-tip { margin: 0; padding: 10px 12px; font-size: 12.5px; color: var(--text-3); text-align: center; }
+.scope-error {
+  margin: 10px 0 0;
+  font-size: 12.5px;
+  color: var(--err);
+}
+.scope-readonly {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 860px;
+  margin: 0 auto 10px;
+  padding: 7px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+.scope-ro-label {
+  font-weight: 600;
+  color: var(--text-2);
+  flex: none;
+}
+.scope-ro-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+.scope-ro-tag {
+  flex: none;
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  font-weight: 500;
+}
 @media (max-width: 768px) {
+  .scope-options { grid-template-columns: 1fr; }
   .sidebar {
     position: fixed;
     left: 0;

@@ -115,7 +115,15 @@ function decodeFrame(frame: string): ChatStreamEvent | null {
 
 /** SSE 流式问答：逐事件回调 onEvent（fetch ReadableStream 解析，非 EventSource——POST 不支持）。 */
 export async function streamChat(
-  body: { content: string; session_id: string | null },
+  body: {
+    content: string
+    session_id: string | null
+    /** 会话检索范围（新会话首问生效；已存在会话后端以库中为准） */
+    retrieve_own_private?: boolean
+    retrieve_own_public?: boolean
+    retrieve_kb_public?: boolean
+    retrieve_owner_ids?: number[]
+  },
   onEvent: (evt: ChatStreamEvent) => void,
 ): Promise<void> {
   const auth = useAuthStore()
@@ -162,6 +170,14 @@ export interface ChatSessionInfo {
   last_message_preview: string
   created_at: string | null
   updated_at: string | null
+  /** 会话检索范围：是否检索自己的私有文档 */
+  retrieve_own_private: boolean
+  /** 会话检索范围：是否检索自己的公开文档 */
+  retrieve_own_public: boolean
+  /** 会话检索范围：是否检索知识库里的公开文档 */
+  retrieve_kb_public: boolean
+  /** 会话检索范围：指定用户的公开文档（与 retrieve_kb_public 互斥） */
+  retrieve_owner_ids: number[]
 }
 
 /** 会话内一条消息（完整消息从 Postgres checkpoint 加载） */
@@ -177,6 +193,11 @@ export interface ChatSessionDetail {
   session_id: string
   title: string
   messages: ChatMessageItem[]
+  retrieve_own_private: boolean
+  retrieve_own_public: boolean
+  retrieve_kb_public: boolean
+  retrieve_owner_ids: number[]
+  retrieve_owner_names: string[]
 }
 
 /** 历史会话列表（按最近活跃时间倒序） */
@@ -201,4 +222,46 @@ export async function deleteChatSession(sessionId: string): Promise<{ status: st
   return api<{ status: string; session_id: string }>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, {
     method: 'DELETE',
   })
+}
+
+/** 个人详情（GET /api/users/{user_id}/profile） */
+export interface ProfileInfo {
+  id: number
+  username: string
+  role: 'admin' | 'user'
+  created_at: string | null
+  is_self: boolean
+}
+
+/** 查看任意用户个人详情（他人仅公开字段，is_self 区分是否本人） */
+export async function getUserProfile(userId: number | string): Promise<ProfileInfo> {
+  return api<ProfileInfo>(`/api/users/${encodeURIComponent(userId)}/profile`)
+}
+
+/** 修改密码（成功后需重新登录） */
+export async function changePassword(oldPassword: string, newPassword: string): Promise<{ message: string }> {
+  return api<{ message: string }>('/api/auth/change-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+  })
+}
+
+/** 提交账号删除请求（进入删除队列，删除完成后无法登录） */
+export async function deleteAccount(): Promise<{ status: string; queued: boolean; message: string }> {
+  return api<{ status: string; queued: boolean; message: string }>('/api/auth/delete-account', {
+    method: 'POST',
+  })
+}
+
+/** 用户搜索结果（/api/users/search，供问答页「指定用户的公开文档」多选器） */
+export interface UserSearchItem {
+  id: number
+  username: string
+  role: 'admin' | 'user'
+}
+
+/** 按用户名关键字搜索 active 用户（排除自己），最多 limit 条 */
+export async function searchUsers(q: string, limit = 20): Promise<UserSearchItem[]> {
+  return api<UserSearchItem[]>(`/api/users/search?q=${encodeURIComponent(q)}&limit=${limit}`)
 }

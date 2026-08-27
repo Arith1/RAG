@@ -19,6 +19,11 @@
 - **权限模型**：普通用户可上传/删除自己的文档；管理员可把共享文档取消为私有；下载仅 owner 或共享文档可访问。
 - **多问题问答**：意图识别支持拆分多个子问题，逐个检索后汇总分点回答，并限制最大子问题数。
 - **精准缓存失效**：维护 `src_idx:{source}` 缓存索引，文档取消共享/删除/账户删除时 O(1) 定位清理相关缓存。
+- **多人共享知识库**：文档可设为私有/公开，普通用户与管理员都能管理自己的文档；管理员可把他人公开文档设为私有（审核）；知识库页支持搜索、按最近更新/最近上传/下载量/chunk 数排序与下载。
+- **会话检索范围**：新建会话时可选 4 个检索范围（自己的私有 / 自己的公开 / 知识库公开 / 指定用户公开），首问后锁定不可更改。
+- **历史会话 + Redis 缓存**：MySQL 存会话列表/摘要、Postgres 存完整消息；登录后后台预热「会话列表 + 最近 10 个会话记录」到 Redis（Cache-Aside + 1h TTL），会话变更精准失效。
+- **高频访问缓存**：鉴权用户行（登出/改密/删号失效）、文档列表、用户搜索均缓存到 Redis，显著减少高频接口 DB 查询。
+- **前端定时轮询**：文档管理页每 5s 自动刷新文档列表与入库队列状态（入库中/失败实时可见）。
 - **Web 服务**：FastAPI + JWT 认证 + RBAC + 操作审计 + 登录/注册失败限流 + 路径脱敏。
 - **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索对比实验、52 个 pytest 用例。
 
@@ -89,19 +94,24 @@ stateDiagram-v2
 ### 一键启动（Docker Compose，推荐）
 
 ```bash
-# 1. 配置密钥（复制模板后填写 SILICONFLOW_API_KEY / MINERU_API_TOKEN /
-#    DEEPSEEK_API_KEY / JWT_SECRET / ADMIN_PASSWORD 等）
+# 1. 配置密钥（复制模板后填写 SILICONFLOW_API_KEY / MINERU_API_TOKEN / DEEPSEEK_API_KEY /
+#    JWT_SECRET / ADMIN_PASSWORD，以及 MYSQL_PASSWORD / POSTGRES_PASSWORD / REDIS_PASSWORD）
 cp .env.example .env
 
 # 2. 一键启动全部服务（MySQL / Milvus(含 etcd+minio) / Redis / Postgres / API）
-docker compose -f docker/docker-compose.yml up -d --build
+#    安全说明：数据服务端口仅绑定 127.0.0.1；Redis/MySQL/Postgres 口令取自 .env（缺失拒绝启动）；
+#    Milvus 已开启认证（docker/milvus.yaml，root/Milvus，启动后建议立即改密）
+docker compose up -d --build
 
 # 3. 首次问答后，为 Postgres 对话记忆补充 created_at 列（幂等，TTL 清理的时间依据）
-docker compose exec postgres psql -U root -d rag-demo -f /init-sql/postgres_memory.sql
+docker compose exec postgres psql -U rag -d rag-demo -f /init-sql/postgres_memory.sql
 
 # 4. 访问
 #    问答页  http://localhost:8010/chat      Swagger: http://localhost:8010/docs
 ```
+
+> **生产部署建议**：API 8010 前置 Nginx/Caddy 反代 + HTTPS；如不需要宿主机直连数据库，
+> 可去掉 `docker-compose.yml` 里 MySQL/Redis/Postgres/Milvus 的端口映射（仅容器内网互通）。
 
 - 数据持久化：容器删除不丢数据（compose 数据卷）；文档/上传产物落在宿主机 `rag个人知识库/resources/`
 - 常用命令：`docker compose down`（停）、`docker compose logs -f api`（看日志）
@@ -178,7 +188,7 @@ npm run dev          # http://localhost:5173（/api 自动代理到 8010）
 npm run build        # 类型检查 + 产物构建
 ```
 
-前端功能：登录（JWT）、**SSE 流式问答**（打字机效果 + 来源引用）、文档管理（登录用户上传/删除自己的文档 + 队列状态）。
+前端功能：登录/注册（JWT）、**SSE 流式问答**（打字机效果 + 来源引用 + 历史会话侧边栏 + 检索范围选择）、知识库（公开文档搜索/排序/下载）、文档管理（私有/共享分区 + 上传队列 5s 轮询）、个人详情页。
 
 ### 入库文档（API 上传）
 
@@ -201,6 +211,8 @@ curl -X POST http://localhost:8010/api/documents/upload \
 程序自动处理：格式/大小校验 → 编码回退 → 复杂度评估分流 → 结构感知切分（标题分节、表格/公式/**问答对**原子保护）→ 增量同步。
 
 决策规则：单篇整理 < 5 分钟就人工整理；同一种脏格式出现 ≥ 3 次才写代码适配（如问答对原子保护）；偶发怪文档清洗一次或不入库。
+
+> **隐私说明**：扫描件、复杂排版的 Word/PDF 会自动调用**第三方 MinerU 云解析服务**（https://mineru.net）处理，文档原文会发送到该服务解析后再回传结果；涉及敏感/机密内容请优先转换为 md/txt（本地解析，内容不离开服务器），或评估后再上传。
 
 ## 核心设计
 
@@ -247,6 +259,20 @@ curl -X POST http://localhost:8010/api/documents/upload \
 - **TTL**：以线程"最后活跃时间"为准，超过 `MEMORY_TTL_DAYS`（默认 1 天）整线程清理（后台任务周期执行）；
 - **摘要**：约 20 轮对话（40 条消息）或 6000 tokens 触发 SummarizationMiddleware 压缩，保留最近 10 条，上下文不无限增长。
 
+### 会话与高频访问缓存（Redis Cache-Aside）
+
+| Key | 内容 | TTL | 失效时机 |
+| --- | --- | --- | --- |
+| `sess:list:{user_id}` | 会话列表（问答侧边栏） | 1h | 问答结束 / 重命名 / 删除会话 |
+| `sess:detail:{user_id}:{session_id}` | 单会话完整记录（含消息） | 1h | 该会话有新问答 / 被删除 |
+| `sess:detail_idx:{user_id}` | 已缓存详情的 session_id 集合 | 1h | 删除账号时整批清理 |
+| `usr:{user_id}` | 鉴权用户行（`get_current_user`） | 1h | 登出 / 改密 / 删除账号 |
+| `docs:{user_id}:{limit}:{offset}` | 文档列表分页 | 60s | 上传 / 删除 / 共享 / 入库完成 |
+| `users:{viewer}:{limit}:{q}` | 用户搜索（指定用户多选器） | 5min | 注册 / 删除账号 |
+
+- 登录成功后**后台预热**「会话列表 + 最近 10 个会话记录」，不阻塞登录响应；
+- 全部走 Cache-Aside：命中直接返回，未命中回源 DB/Postgres 后写回；Redis 不可用时自动降级，行为与无缓存一致。
+
 ## 评测与测试
 
 ```bash
@@ -269,16 +295,30 @@ python -m pytest tests/
 | POST | `/api/auth/register` | 公开 | 注册（默认普通用户） |
 | POST | `/api/auth/login` | 公开 | 登录，返回 JWT |
 | GET | `/api/auth/me` | 登录 | 当前用户信息 |
+| GET | `/api/users/search` | 登录 | 用户搜索（指定用户检索范围选择器） |
+| GET | `/api/users/{id}/profile` | 登录 | 用户个人详情（公开字段，他人可访问） |
 | POST | `/api/documents/upload` | 登录 | 上传自己的文档（异步队列入库，默认私有，可指定 `is_public`） |
 | GET | `/api/documents` | 登录 | 文档列表（仅自己 + 共享，source 脱敏） |
 | DELETE | `/api/documents/{id}` | 文档 owner | 删除自己的文档（正在入库返回 409） |
-| POST | `/api/documents/{id}/revoke` | 管理员 | 把共享文档取消为私有 |
+| POST | `/api/documents/{id}/revoke` | owner/管理员 | 把共享文档取消为私有（管理员可审核他人） |
+| POST | `/api/documents/{id}/share` | owner/管理员 | 把文档设为公开共享 |
 | GET | `/api/documents/{id}/download` | owner 或共享 | 下载文档原件（私有他人文档返回 404） |
 | POST | `/api/auth/delete-account` | 登录 | 提交账户删除（状态 deleting，进入删除队列） |
+| POST | `/api/auth/logout` | 登录 | 登出并清除该用户的鉴权缓存 |
 | POST | `/api/chat` | 登录 | 知识库问答（多问题拆分 + 多轮记忆） |
 | POST | `/api/chat/stream` | 登录 | **SSE 流式问答**（meta → token×N → done） |
+| GET | `/api/chat/sessions` | 登录 | 历史会话列表（Redis 缓存） |
+| GET | `/api/chat/sessions/{id}` | 登录 | 单会话完整记录（Postgres 消息 + Redis 缓存） |
+| PATCH | `/api/chat/sessions/{id}` | 登录 | 重命名会话 |
+| DELETE | `/api/chat/sessions/{id}` | 登录 | 删除会话（同步清 Postgres 记忆） |
 | POST | `/api/search` | 登录 | 语义检索 |
 | GET | `/api/ingest/stats` | 登录 | 入库队列状态 |
+| GET | `/api/ingest/queue` | 登录 | 入库队列：待处理任务 |
+| GET | `/api/ingest/inflight` | 登录 | 入库队列：正在入库 |
+| GET | `/api/ingest/dead` | 登录 | 入库队列：死信（失败）任务 |
+| POST | `/api/ingest/dead/{msg_id}/retry` | 管理员 | 死信单条重新入库 |
+| POST | `/api/ingest/dead/retry-all` | 管理员 | 死信全部重新入库 |
+| DELETE | `/api/ingest/dead` | 管理员 | 清空死信队列 |
 | GET | `/chat` | 公开 | 浏览器问答页面 |
 | GET | `/docs` | 公开 | Swagger |
 
@@ -289,15 +329,17 @@ rag_project/
 ├─ rag个人知识库/
 │  ├─ api/                  # FastAPI：main(路由) / auth(JWT+RBAC+限流) / static(问答页)
 │  ├─ agent/                # ai_assist(Agent+记忆) / intent(意图+查询重构) / model(DeepSeek)
-│  ├─ service/              # ingest(入库编排) / chat(问答编排) / document_admin(删除)
-│  │                        # ingest_queue(入库队列) / delete_queue(账户删除队列) / memory_maintenance(TTL清理)
+│  ├─ service/              # ingest(入库编排) / chat(问答编排) / chat_history(会话元信息)
+│  │                        # session_cache(会话/用户/文档缓存) / ingest_queue(入库队列)
+│  │                        # delete_queue(账户删除队列) / memory_maintenance(TTL清理)
 │  ├─ loader/               # 文档加载（docx/pdf/md/txt，复杂度评估 + MinerU 分流）
 │  ├─ spliter/              # 结构感知切分（标题分节 + 原子块保护）
 │  ├─ vector_store/         # Milvus 存取 + 双路召回 + rerank
 │  ├─ crud/                 # MySQL 数据访问
 │  ├─ models/               # SQLAlchemy 模型 + 建表 SQL（vector.sql / postgres_memory.sql）
 │  ├─ config/               # db_config(MySQL) / redis(Redis)
-│  └─ utils/                # 指纹哈希
+│  └─ utils/                # 指纹哈希 / sanitize(路径脱敏)
+├─ rag_frontend/            # Vue 3 前端（问答/知识库/文档管理/个人详情/登录注册）
 ├─ evaluation/              # golden 评测集 + 评测/实验脚本 + 报告
 ├─ tests/                   # pytest 单元测试（52 用例）
 └─ .env.example             # 环境变量模板
@@ -316,5 +358,8 @@ rag_project/
 - [x] 账户删除队列（Milvus → OSS → 本地 → MySQL → 缓存清理）
 - [x] 多问题问答编排
 - [x] 精准缓存失效（src_idx 索引）
+- [x] 多人共享知识库 + 会话检索范围（4 选，首问锁定）
+- [x] 历史会话侧边栏 + Redis 会话/用户/文档缓存 + 登出清理
+- [x] 前端定时轮询队列状态（5s）
 - [ ] 分层检索（Parent-Child）落地（实验结论已具备）
 - [ ] Agentic RAG（检索工具化，多轮反思检索）

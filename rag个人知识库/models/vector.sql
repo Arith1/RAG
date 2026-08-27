@@ -104,6 +104,9 @@ CREATE TABLE `chat_sessions` (
     `message_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '消息条数（user+assistant 都算）',
     `last_message_preview` VARCHAR(256) NOT NULL DEFAULT '' COMMENT '最后一条用户消息摘要（侧边栏展示，过长截断）',
     `last_message_at` DATETIME NULL COMMENT '最后一条消息时间（侧边栏按此倒序 / TTL 清理依据）',
+    `retrieve_own_private` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索自己的私有文档',
+    `retrieve_own_public` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索自己的公开文档',
+    `retrieve_kb_public` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索知识库里的公开文档(所有他人)',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
@@ -114,10 +117,49 @@ CREATE TABLE `chat_sessions` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='问答历史会话（会话元信息，完整消息在 Postgres）';
 
 -- ============================================
+-- 4.0 会话检索范围-指定用户集合 (chat_session_scope_users)
+--     「指定用户的公开文档」可多选，每行存一个目标用户；
+--     会话删除 / 目标用户删除时对应行级联删除。
+-- ============================================
+CREATE TABLE `chat_session_scope_users` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    `user_id` BIGINT UNSIGNED NOT NULL COMMENT '会话所属用户 id（users.id，用户删除时级联删除）',
+    `session_id` VARCHAR(64) NOT NULL COMMENT '会话标识（对应 chat_sessions.session_id）',
+    `target_user_id` BIGINT UNSIGNED NOT NULL COMMENT '指定检索的目标用户 id（仅检索其公开文档）',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_scope_session_target` (`user_id`, `session_id`, `target_user_id`) COMMENT '用户内会话+目标用户唯一',
+    KEY `idx_scope_target` (`target_user_id`) COMMENT '按目标用户查（用户删除级联）',
+    CONSTRAINT `fk_scope_session` FOREIGN KEY (`user_id`, `session_id`)
+        REFERENCES `chat_sessions` (`user_id`, `session_id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_scope_target_user` FOREIGN KEY (`target_user_id`)
+        REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话检索范围-指定用户集合（多选，仅检索其公开文档）';
+
+-- ============================================
 -- 4.1 迁移说明（已有数据库执行）
---    新环境执行上面的 CREATE TABLE 已含 last_message_preview；
---    老库手动执行下面两条 SQL 一次即可：
+--    新环境执行上面的 CREATE TABLE 已含检索范围字段与 chat_session_scope_users 表；
+--    老库手动执行下面 SQL 一次即可：
 --      1) ALTER TABLE `chat_sessions`
---             ADD COLUMN `last_message_preview` VARCHAR(256) NOT NULL DEFAULT '' COMMENT '最后一条用户消息摘要' AFTER `message_count`;
---      2) DROP TABLE IF EXISTS `chat_messages`;  -- 旧方案遗留的消息表已废弃（完整消息改由 Postgres 持有）
+--             ADD COLUMN `retrieve_own_private` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索自己的私有文档' AFTER `last_message_at`,
+--             ADD COLUMN `retrieve_own_public` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索自己的公开文档' AFTER `retrieve_own_private`,
+--             ADD COLUMN `retrieve_kb_public` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索知识库里的公开文档(所有他人)' AFTER `retrieve_own_public`;
+--      2) CREATE TABLE `chat_session_scope_users` (
+--             `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+--             `user_id` BIGINT UNSIGNED NOT NULL,
+--             `session_id` VARCHAR(64) NOT NULL,
+--             `target_user_id` BIGINT UNSIGNED NOT NULL,
+--             `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+--             `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+--             PRIMARY KEY (`id`),
+--             UNIQUE KEY `uk_scope_session_target` (`user_id`, `session_id`, `target_user_id`),
+--             KEY `idx_scope_target` (`target_user_id`),
+--             CONSTRAINT `fk_scope_session` FOREIGN KEY (`user_id`, `session_id`)
+--                 REFERENCES `chat_sessions` (`user_id`, `session_id`) ON DELETE CASCADE,
+--             CONSTRAINT `fk_scope_target_user` FOREIGN KEY (`target_user_id`)
+--                 REFERENCES `users` (`id`) ON DELETE CASCADE
+--         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+--      3) DROP TABLE IF EXISTS `chat_messages`;  -- 旧方案遗留的消息表已废弃（完整消息改由 Postgres 持有）
 -- ============================================

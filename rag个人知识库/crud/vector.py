@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import List, Optional, Sequence
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.models.vector import ChunkRecord, VectorFile
@@ -158,16 +158,44 @@ async def update_chunk_count(db: AsyncSession, file_id: int) -> None:
 async def select_visible_file_ids(
     db: AsyncSession,
     user_id: int,
+    retrieve_own_private: bool = True,
+    retrieve_own_public: bool = True,
+    retrieve_kb_public: bool = True,
+    retrieve_owner_ids: Optional[List[int]] = None,
 ) -> List[int]:
-    """查当前用户可见的文件 id 集合：本人文档（owner_id=user_id）或共享文档（is_public=1）。
+    """按会话检索范围查当前用户可见的文件 id 集合。
 
+    四项范围（互斥与兜底校验由 API 层负责）：
+      - retrieve_own_private：自己的私有文档（owner_id=user_id 且非公开）
+      - retrieve_own_public ：自己的公开文档（owner_id=user_id 且公开）
+      - retrieve_kb_public  ：知识库里的公开文档（其他所有人的公开文档）
+      - retrieve_owner_ids  ：指定用户的公开文档（多选，服务端强制 AND is_public=1 不越权）
+
+    全部为 False / 空时返回空列表（不发起检索）。
     admin 与普通用户共用此规则（admin 仅额外拥有"取消他人共享"权限，不扩大检索范围）。
-    返回空列表表示无可见文档。
     """
-    result = await db.execute(
-        select(VectorFile.id).where(
-            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True))
+    conds: list = []
+    if retrieve_own_private:
+        conds.append(
+            (VectorFile.owner_id == user_id) & (VectorFile.is_public.is_(False))
         )
+    if retrieve_own_public:
+        conds.append(
+            (VectorFile.owner_id == user_id) & (VectorFile.is_public.is_(True))
+        )
+    if retrieve_kb_public:
+        conds.append(
+            (VectorFile.owner_id != user_id) & (VectorFile.is_public.is_(True))
+        )
+    target_ids = [t for t in (retrieve_owner_ids or []) if t is not None]
+    if target_ids:
+        conds.append(
+            (VectorFile.owner_id.in_(target_ids)) & (VectorFile.is_public.is_(True))
+        )
+    if not conds:
+        return []
+    result = await db.execute(
+        select(VectorFile.id).where(or_(*conds))
     )
     return [r for r in result.scalars().all()]
 

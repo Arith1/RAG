@@ -240,7 +240,8 @@ onBeforeUnmount(() => {
               </div>
               <div class="kb-meta">
                 <span v-if="d.source" class="kb-source" :title="d.source">{{ d.source }}</span>
-                <span class="kb-owner">上传者 #{{ d.owner_id ?? '—' }}</span>
+                <RouterLink v-if="d.owner_id" :to="`/profile/${d.owner_id}`" class="kb-owner" :title="`查看该用户个人详情`">上传者 #{{ d.owner_id }}</RouterLink>
+                <span v-else class="kb-owner">上传者 —</span>
                 <span>{{ d.chunk_count ?? 0 }} 个分块</span>
               </div>
             </div>
@@ -366,6 +367,7 @@ onBeforeUnmount(() => {
 .kb-meta { display: flex; align-items: center; gap: 10px; margin-top: 7px; font-size: 12px; color: var(--text-3); flex-wrap: wrap; }
 .kb-source { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 360px; }
 .kb-owner { color: var(--text-2); }
+.kb-owner:hover { color: var(--accent); text-decoration: underline; }
 .kb-item-side { display: flex; align-items: center; gap: 14px; flex: none; }
 .kb-stats { font-size: 12px; color: var(--text-3); white-space: nowrap; }
 

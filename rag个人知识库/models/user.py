@@ -3,9 +3,10 @@
 - User：账号 + 角色（admin/user/guest）+ 状态（active/deleting/disabled），RBAC 的根
 - AuditLog：操作审计（注册/上传/删除等），用户名冗余存储，防用户删除后审计丢失
 """
+from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import BigInteger, String, Text
+from sqlalchemy import BigInteger, DateTime, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from rag个人知识库.models.vector import Base, VectorFile
@@ -31,6 +32,15 @@ class User(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active",
         comment="账号状态: active(正常)/deleting(删除处理中)/disabled(禁用)"
+    )
+
+    created_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(), nullable=False, server_default=text('CURRENT_TIMESTAMP'),
+        comment="创建时间"
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(), nullable=False, server_default=text('CURRENT_TIMESTAMP'),
+        onupdate=func.now(), comment="更新时间"
     )
 
     # 关系：该用户拥有的文档（SQL 外键 ON DELETE CASCADE 已负责级联删除）

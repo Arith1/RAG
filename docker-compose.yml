@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────
-# RAG 个人知识库 · 一键编排
+# RAG 个人知识库 · 一键编排（生产安全版）
 #
 # 启动（二选一）：
 #   docker compose up -d --build            # 项目根目录内直接启动
@@ -9,41 +9,39 @@
 #
 # 服务说明：
 #   mysql    业务元数据（users/vector_files/chunk_records/audit_logs）
-#   etcd+minio  Milvus standalone 的依赖（元数据存储 + 对象存储）
-#   milvus   向量库
-#   redis    入库任务队列 / 限流
+#   etcd+minio  Milvus standalone 的依赖（元数据存储 + 对象存储，仅容器内网）
+#   milvus   向量库（已开启认证 authorizationEnabled）
+#   redis    入库任务队列 / 限流（requirepass）
 #   postgres 对话记忆
 #   api      FastAPI 应用（构建自项目根 Dockerfile，context=项目根）
 #
-# 路径说明：本 compose 位于项目根目录，所有相对路径均以项目根为基准。
-#   .env 密钥文件 → ./.env（先 cp .env.example .env 并填写）
-#   init SQL     → ./docker/init/01-vector.sql
-#   业务模型 SQL → ./rag个人知识库/models（挂载为 /init-sql）
-#   resources    → ./rag个人知识库/resources（挂载为 /app/rag个人知识库/resources）
+# ── 安全说明（本版本相对默认 compose 的加固）──
+#   1. 所有数据服务端口只绑定 127.0.0.1，不再暴露到 0.0.0.0；
+#      生产环境建议进一步去掉宿主机映射（仅容器内网互通）。
+#   2. MySQL / Postgres / Redis 口令由 .env 注入（强口令，缺失即拒绝启动）；
+#      先 cp .env.example .env 并填写 MYSQL_PASSWORD / POSTGRES_PASSWORD / REDIS_PASSWORD。
+#   3. Milvus 通过 docker/milvus.yaml 开启认证（root/Milvus，启动后请立即改密）。
+#   4. API 8010 保持对外（服务本身有 JWT 鉴权）；生产请在前面加 Nginx/Caddy 反代 + HTTPS，
+#      或把端口改为 "127.0.0.1:8010:8010" 仅内网。
 #
-# 注意：
-#   1. 密钥从根目录 .env 注入（SILICONFLOW_API_KEY / MINERU_API_TOKEN /
-#      DEEPSEEK_API_KEY / JWT_SECRET / ADMIN_* 等）
-#   2. Postgres 对话记忆的 created_at 列：首次问答后 langgraph 自动建表，
-#      再执行一次：docker compose exec postgres psql -U root -d rag-demo \
-#        -f /init-sql/postgres_memory.sql（已挂载到容器）
+# 注意：compose 会自动读取项目根目录 .env 做变量替换，口令请填在 .env 中。
 # ─────────────────────────────────────────────────────────────
 services:
   mysql:
     image: mysql:8.0
     container_name: rag-mysql
     environment:
-      MYSQL_ROOT_PASSWORD: root
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD（强口令）}
       MYSQL_DATABASE: rag_demo
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"   # 仅本机可连；生产可去掉映射，仅容器内网使用
     volumes:
       - mysql-data:/var/lib/mysql
       - ./docker/init/01-vector.sql:/docker-entrypoint-initdb.d/01-vector.sql:ro
       - ./rag个人知识库/models:/init-sql:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h 127.0.0.1 -uroot"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -83,15 +81,16 @@ services:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
     ports:
-      - "19530:19530"
-      - "9091:9091"
+      - "127.0.0.1:19530:19530"   # 仅本机可连
+      - "127.0.0.1:9091:9091"     # metrics 端口同样仅本机
     volumes:
       - milvus-data:/var/lib/milvus
+      # 覆盖默认配置：开启认证（authorizationEnabled），见 docker/milvus.yaml
+      - ./docker/milvus.yaml:/milvus/configs/milvus.yaml:ro
     depends_on:
       - etcd
       - minio
     healthcheck:
-      # 9091 是 Milvus 的 metrics 端口，/healthz 返回 OK 表示 standalone 已就绪
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 10s
       timeout: 5s
@@ -101,10 +100,13 @@ services:
   redis:
     image: redis:7-alpine
     container_name: rag-redis
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD（强口令）}
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD（强口令）}", "--appendonly", "yes"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"   # 仅本机可连
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -113,16 +115,16 @@ services:
     image: postgres:16-alpine
     container_name: rag-postgres
     environment:
-      POSTGRES_USER: root
-      POSTGRES_PASSWORD: root
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD（强口令）}
       POSTGRES_DB: rag-demo
     ports:
-      - "5432:5432"  # 宿主机 5432 → 容器 5432（与 .env 的 MEMORY_DATABASE_URL 一致）
+      - "127.0.0.1:5432:5432"   # 仅本机可连；生产可去掉映射
     volumes:
       - pg-data:/var/lib/postgresql/data
       - ./rag个人知识库/models/postgres_memory.sql:/init-sql/postgres_memory.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U root -d rag-demo"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d rag-demo"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -132,7 +134,7 @@ services:
       context: .  # 根目录方案：compose 在项目根，Dockerfile 在项目根，context 直接 ./
     container_name: rag-api
     ports:
-      - "8010:8010"
+      - "8010:8010"   # 生产建议前置 Nginx/Caddy 反代 + HTTPS，或改 "127.0.0.1:8010:8010"
     depends_on:
       mysql:
         condition: service_healthy
@@ -145,11 +147,11 @@ services:
     env_file:
       - ./.env
     environment:
-      # 容器内通过服务名互联，覆盖 .env 里的 localhost 地址
-      ASYNC_DATABASE_URL: mysql+aiomysql://root:root@mysql:3306/rag_demo?charset=utf8
-      MEMORY_DATABASE_URL: postgresql://root:root@postgres:5432/rag-demo
-      REDIS_URL: redis://redis:6379/0
-      MILVUS_URI: http://milvus:19530
+      # 容器内通过服务名互联，口令与上面数据服务一致（.env 注入）
+      ASYNC_DATABASE_URL: mysql+aiomysql://root:${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD（强口令）}@mysql:3306/rag_demo?charset=utf8
+      MEMORY_DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD（强口令）}@postgres:5432/rag-demo
+      REDIS_URL: redis://:${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD（强口令）}@redis:6379/0
+      MILVUS_URI: http://root:Milvus@milvus:19530   # Milvus 认证 root/Milvus，启动后请立即改密
     volumes:
       # 文档与上传产物持久化到宿主机（resources 已 gitignore）
       - ./rag个人知识库/resources:/app/rag个人知识库/resources

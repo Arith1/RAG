@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, type Ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, type Ref } from 'vue'
 import { api, type BatchUploadResult, type DocItem, type QueueDeadItem, type QueueInflightItem, type QueuePendingItem, type QueueStats } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import { useFeedback } from '../composables/feedback'
@@ -282,8 +282,19 @@ async function clearDead() {
   }
 }
 
+// 定时轮询：入库是异步的，周期刷新文档列表与队列状态（文档列表有 Redis 缓存，开销低）
+const QUEUE_POLL_MS = 5000
+let pollTimer: number | undefined
+
 onMounted(() => {
   if (isLoggedIn.value) load()
+  pollTimer = window.setInterval(() => {
+    if (isLoggedIn.value) load()
+  }, QUEUE_POLL_MS)
+})
+
+onUnmounted(() => {
+  if (pollTimer !== undefined) window.clearInterval(pollTimer)
 })
 </script>
 

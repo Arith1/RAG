@@ -36,6 +36,8 @@ async def ingest_files(
     if any(r.get("status") in _CHANGED_STATUSES for r in results):
         await cache_clear_prefix("search:")
         await cache_clear_prefix("ans:")
+        # 文档列表缓存：chunk_count / sync_status 变化影响所有可见者的文档列表
+        await cache_clear_prefix("docs:")
     return results
 
 
@@ -45,29 +47,50 @@ async def search_documents(
     source: Optional[str] = None,
     expr: Optional[str] = None,
     user_id: Optional[int] = None,
+    retrieve_own_private: bool = True,
+    retrieve_own_public: bool = True,
+    retrieve_kb_public: bool = True,
+    retrieve_owner_ids: Optional[List[int]] = None,
+    file_ids: Optional[List[int]] = None,
 ) -> List[dict]:
     """检索：双路召回 Top recall_k → bge-reranker 精排 → 阈值过滤取 Top k。
 
-    结果按 (query, k, source, expr, user_id) 缓存到 Redis（SEARCH_CACHE_TTL，默认 10 分钟），
-    相同问题秒回，省 embedding + rerank 调用。返回 JSON 友好的命中列表。
+    结果按 (query, k, source, expr, user_id, 检索范围) 缓存到 Redis
+    （SEARCH_CACHE_TTL，默认 10 分钟），相同问题秒回，省 embedding + rerank 调用。
+    返回 JSON 友好的命中列表。
 
     user_id 非 None 时的可见性控制（普通用户/管理员同规则）：
-      - 先从 MySQL vector_files 查该用户可见的文件 id（本人文档 OR is_public=1）；
+      - 先从 MySQL vector_files 按「会话检索范围」查该用户可见的文件 id；
       - 用 file_id in (...) 作为 Milvus 过滤条件，只召回可见文档的 chunk。
+      检索范围四项：自己的私有文档 / 自己的公开文档 / 知识库公开文档（所有他人）/
+      指定用户的公开文档（retrieve_owner_ids，多选，服务端强制 is_public=1）。
     user_id 为 None（CLI/评测）不做可见性过滤，行为与旧版一致。
     """
-    cache_key_ = cache_key("search", query, k, source or "", expr or "", user_id if user_id is not None else "")
+    owner_ids_digest = ",".join(str(x) for x in sorted({t for t in (retrieve_owner_ids or []) if t is not None}))
+    cache_key_ = cache_key(
+        "search", query, k, source or "", expr or "",
+        user_id if user_id is not None else "",
+        int(bool(retrieve_own_private)), int(bool(retrieve_own_public)),
+        int(bool(retrieve_kb_public)), owner_ids_digest,
+    )
     cached = await cache_get(cache_key_)
     if cached is not None:
         return cached
 
-    file_ids: Optional[List[int]] = None
-    if user_id is not None:
+    # file_ids 可由调用方（chat 编排层）预先计算并复用；未传入时再查 MySQL
+    if file_ids is None and user_id is not None:
         async with async_session() as db:
-            file_ids = await select_visible_file_ids(db, user_id)
-        if not file_ids:
-            # 当前用户无任何可见文档，直接返回空，不发起 Milvus 检索
-            return []
+            file_ids = await select_visible_file_ids(
+                db,
+                user_id,
+                retrieve_own_private=retrieve_own_private,
+                retrieve_own_public=retrieve_own_public,
+                retrieve_kb_public=retrieve_kb_public,
+                retrieve_owner_ids=retrieve_owner_ids,
+            )
+    if user_id is not None and not file_ids:
+        # 当前用户在当前检索范围内无任何可见文档，直接返回空，不发起 Milvus 检索
+        return []
 
     hits = await asearch_with_rerank(query, k=k, expr=expr, source=source, file_ids=file_ids)
     result = [

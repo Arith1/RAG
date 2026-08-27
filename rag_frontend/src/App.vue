@@ -48,13 +48,21 @@ function logout() {
         <div class="user-area">
           <RouterLink to="/documents" class="nav-link docs-link" active-class="active">文档管理</RouterLink>
           <template v-if="!restoring && auth.isLoggedIn && auth.user">
-            <span class="user-chip" :title="`角色：${auth.user.role === 'admin' ? '管理员' : '普通用户'}`">
+            <RouterLink
+              to="/profile"
+              class="user-chip"
+              title="查看个人详情"
+              :aria-label="`查看 ${auth.user.username} 的个人详情`"
+            >
               <span class="avatar">{{ auth.user.username.slice(0, 1).toUpperCase() }}</span>
               <span class="user-name">{{ auth.user.username }}</span>
               <span class="role" :class="{ admin: auth.isAdmin }">
                 {{ auth.isAdmin ? '管理员' : '用户' }}
               </span>
-            </span>
+              <svg class="chip-chevron" viewBox="0 0 20 20" width="13" height="13" aria-hidden="true">
+                <path d="M7 6l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </RouterLink>
             <button class="btn btn-ghost logout-btn" @click="logout">退出</button>
           </template>
           <template v-else-if="!restoring">
@@ -146,7 +154,14 @@ function logout() {
   background: var(--surface);
   font-size: 13px;
   color: var(--text-2);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, color 0.16s ease;
 }
+.user-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+  box-shadow: var(--shadow-xs);
+}
+.chip-chevron { color: var(--text-3); }
 .avatar {
   display: inline-flex;
   align-items: center;
