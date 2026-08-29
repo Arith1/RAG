@@ -230,6 +230,10 @@ def delete_chunks_by_owner(owner_id: int) -> None:
         raise RuntimeError(f"按 owner_id 删除 Milvus 向量失败：{owner_id}")
     logger.info("[VectorStore] 已按 owner_id 删除该用户全部向量：%s", owner_id)
 
+# 单个 in 子句的 id 数上限：文档极多的用户可见集很大时，
+# 超长过滤表达式可能被 Milvus 拒绝，按此分段（500 id ≈ 4KB 表达式）
+_FILE_ID_EXPR_CHUNK = 500
+
 # RRF 融合器：按各路排名倒数 1/(k+rank) 加总打分，与两路分数量纲无关，无需调权重；
 # 无状态对象，模块级定义一次处处复用
 _RRF_RANKER = Function(
@@ -241,9 +245,20 @@ _RRF_RANKER = Function(
 
 
 def _file_ids_expr(file_ids: List[int]) -> str:
-    """构造按文件 id 过滤的 Milvus 表达式：file_id in [1,2,3]（可见性过滤的核心载体）"""
-    ids = ",".join(str(i) for i in file_ids)
-    return f"file_id in [{ids}]"
+    """构造按文件 id 过滤的 Milvus 表达式：file_id in [1,2,3]（可见性过滤的核心载体）。
+
+    超过单个 in 子句的 id 数上限时分段为 (in [...] or in [...])，语义等价，
+    避免超大可见集拼出被 Milvus 拒绝的超长表达式；
+    去重排序保证同一可见集生成确定性表达式（有利于检索缓存命中）。
+    """
+    unique_ids = sorted(set(file_ids))
+    clauses = [
+        "file_id in [" + ",".join(str(i) for i in unique_ids[start:start + _FILE_ID_EXPR_CHUNK]) + "]"
+        for start in range(0, len(unique_ids), _FILE_ID_EXPR_CHUNK)
+    ]
+    if len(clauses) == 1:
+        return clauses[0]
+    return "(" + " or ".join(clauses) + ")"
 
 
 def search(

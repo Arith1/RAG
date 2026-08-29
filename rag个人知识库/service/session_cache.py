@@ -4,7 +4,6 @@ Key 设计：
   sess:list:{user_id}                会话列表（与 /api/chat/sessions 同构），TTL 1h
   sess:detail:{user_id}:{session_id} 单会话完整记录（含 messages），TTL 1h
   sess:detail_idx:{user_id}          Set：该用户已缓存详情的 session_id（删除账号时整批清理）
-  usr:{user_id}                      用户行缓存（get_current_user 鉴权用），TTL 1h（登出/改密/删号时失效）
   docs:{user_id}:{limit}:{offset}    文档列表分页缓存，TTL 60s
   users:{viewer_id}:{limit}:{q}      用户搜索缓存（指定用户多选器），TTL 5min
 
@@ -15,17 +14,14 @@ Key 设计：
   - Redis 不可用时所有读写静默降级（get 返回 None → 回源 DB，set 忽略）
 """
 import logging
-from datetime import datetime
 from typing import List, Optional
 
 from rag个人知识库.config.redis import cache_clear_prefix, cache_get, cache_set, get_redis
-from rag个人知识库.models.user import User
 from rag个人知识库.service.chat_history import build_session_detail, get_session_info, list_sessions
 
 logger = logging.getLogger(__name__)
 
 SESSION_CACHE_TTL = 3600          # 会话列表/详情 1 小时
-USER_CACHE_TTL = 3600             # 用户行缓存 1 小时（改密/删号/登出时显式失效，TTL 兜底）
 DOCS_CACHE_TTL = 60               # 文档列表 60s（入库是异步的，短 TTL 兜底 + 变更时前缀失效）
 USER_SEARCH_CACHE_TTL = 300       # 用户搜索 5 分钟
 WARMUP_TOP_N = 10                 # 登录预热：最多预热的最近会话数
@@ -106,58 +102,6 @@ async def get_cached_session_info(user_id: int, session_id: str) -> Optional[dic
             if item.get("session_id") == session_id:
                 return item
     return await get_session_info(user_id, session_id)
-
-
-# ── 用户行缓存（get_current_user 鉴权用）──
-def _user_key(user_id: int) -> str:
-    return f"usr:{user_id}"
-
-
-def _user_to_dict(u: User) -> dict:
-    return {
-        "id": u.id,
-        "username": u.username,
-        "password_hash": u.password_hash,
-        "role": u.role,
-        "status": u.status,
-        "created_at": u.created_at.isoformat() if u.created_at else None,
-        "updated_at": u.updated_at.isoformat() if u.updated_at else None,
-    }
-
-
-def _user_from_dict(d: dict) -> User:
-    return User(
-        id=d["id"],
-        username=d["username"],
-        password_hash=d["password_hash"],
-        role=d["role"],
-        status=d["status"],
-        created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else None,
-        updated_at=datetime.fromisoformat(d["updated_at"]) if d.get("updated_at") else None,
-    )
-
-
-async def get_cached_user(user_id: int) -> Optional[User]:
-    """按 id 取缓存用户；未命中/数据损坏返回 None（调用方回源 DB）。"""
-    d = await cache_get(_user_key(user_id))
-    if d is None:
-        return None
-    try:
-        return _user_from_dict(d)
-    except Exception:
-        return None
-
-
-async def set_user(user: User) -> None:
-    """写入用户行缓存（含 bcrypt 密码哈希，TTL 1h；哈希非明文，信任级别与 DB 一致）。"""
-    await cache_set(_user_key(user.id), _user_to_dict(user), USER_CACHE_TTL)
-
-
-async def invalidate_user(user_id: int) -> None:
-    try:
-        await get_redis().delete(_user_key(user_id))
-    except Exception:
-        pass
 
 
 # ── 文档列表缓存 ──

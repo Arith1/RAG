@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 from sqlalchemy import delete, select
 
@@ -23,6 +24,7 @@ from rag个人知识库.config.redis import cache_clear_source, get_redis, redis
 from rag个人知识库.models.user import AuditLog, User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.oss_archive import delete_source_artifact, local_source_exists
+from rag个人知识库.service.operation_lock import owner_operation_lock
 from rag个人知识库.vector_store.milvus_store import adelete_chunks_by_owner
 
 logger = logging.getLogger(__name__)
@@ -31,10 +33,23 @@ STREAM = "delete_queue"
 DEAD_LETTER = "delete_queue:dead"
 GROUP = "delete_workers"
 INFLIGHT_KEY = "delete:inflight"
+INFLIGHT_LOCK_PREFIX = "delete:lock:"
+INFLIGHT_LOCK_TTL = int(os.getenv("DELETE_INFLIGHT_TTL", str(6 * 3600)))
 RETRY_HASH = "delete:retry"
 RETRY_DELAY_KEY = "delete:retry:delayed"
 MAX_RETRIES = 3
 CONSUMER = f"delete-worker-{os.getpid()}"
+# 同 ingest_queue：恢复阈值必须大于单条删除任务最长耗时（OSS/Milvus 级联删除），
+# 否则会抢占仍在处理中的任务，与原 worker 争抢用户级锁。默认 10 分钟。
+RECOVER_IDLE_MS = int(os.getenv("DELETE_RECOVER_IDLE_MS", str(10 * 60 * 1000)))
+
+# 只有持有者能释放锁，防止旧任务误删并发删除请求新建的锁。
+_RELEASE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 async def enqueue_delete(user_id: int) -> str | None:
@@ -42,15 +57,48 @@ async def enqueue_delete(user_id: int) -> str | None:
     if not await redis_available():
         return None
     r = get_redis()
-    await r.sadd(INFLIGHT_KEY, str(user_id))
-    return await r.xadd(STREAM, {"user_id": str(user_id)})
+    member = str(user_id)
+    key = f"{INFLIGHT_LOCK_PREFIX}{member}"
+    try:
+        token = uuid.uuid4().hex
+        claimed = await r.set(key, f"{member}|{token}", nx=True, ex=INFLIGHT_LOCK_TTL)
+        if not claimed:
+            logger.warning("[delete_queue] 用户 %s 已有删除任务在执行，拒绝重复入队", user_id)
+            return None
+        await r.sadd(INFLIGHT_KEY, member)
+        try:
+            return await r.xadd(STREAM, {"user_id": member, "inflight_token": token})
+        except Exception:
+            # XADD 失败时不能留下永远的删除中标记。调用方会负责恢复 DB 状态。
+            await release_delete_inflight(user_id, token)
+            logger.exception("[delete_queue] 删除任务入队失败：user_id=%s", user_id)
+            return None
+    except Exception:
+        logger.exception("[delete_queue] 声明删除任务入队权失败：user_id=%s", user_id)
+        return None
+
+
+async def release_delete_inflight(user_id: int | str, token: str | None = None) -> None:
+    """释放账户删除的入队权；token 匹配时才删除锁，同时清理旧版本集合成员。"""
+    try:
+        r = get_redis()
+        member = str(user_id)
+        key = f"{INFLIGHT_LOCK_PREFIX}{member}"
+        if token:
+            await r.eval(_RELEASE_LUA, 1, key, f"{member}|{token}")
+        else:
+            await r.delete(key)
+        if not await r.exists(key):
+            await r.srem(INFLIGHT_KEY, member)
+    except Exception as e:
+        logger.warning("[delete_queue] 释放删除入队权失败：%s（%s）", user_id, e)
 
 
 async def is_delete_inflight(user_id: int) -> bool:
     """是否已有该用户的删除任务在队列/inflight（用于幂等或状态展示）。"""
     if not await redis_available():
         return False
-    return bool(await get_redis().sismember(INFLIGHT_KEY, str(user_id)))
+    return bool(await get_redis().exists(f"{INFLIGHT_LOCK_PREFIX}{user_id}"))
 
 
 async def _ensure_group() -> None:
@@ -104,7 +152,7 @@ async def _recover_pending() -> None:
     try:
         start = "0"
         while True:
-            result = await r.xautoclaim(STREAM, GROUP, "recovery", 10000, start, count=100)
+            result = await r.xautoclaim(STREAM, GROUP, "recovery", RECOVER_IDLE_MS, start, count=100)
             claimed = result[1] if result else []
             if not claimed:
                 break
@@ -117,13 +165,30 @@ async def _recover_pending() -> None:
                     await r.xdel(STREAM, msg_id)
                 else:
                     await _handle_failure(msg_id, fields)
-                await r.srem(INFLIGHT_KEY, user_id)
+                await release_delete_inflight(user_id, fields.get("inflight_token"))
             start = result[0] if result else "0"
     except Exception as e:
         logger.warning("[delete_queue] 崩溃任务回收失败：%s", e)
 
 
 async def process_delete_message(msg_id: str, fields: dict) -> bool:
+    """在用户级锁内执行删除，和入库 worker 串行化。"""
+    raw = fields.get("user_id")
+    if raw is None:
+        return await _process_delete_message_unlocked(msg_id, fields)
+    try:
+        user_id = int(raw)
+    except (TypeError, ValueError):
+        return await _process_delete_message_unlocked(msg_id, fields)
+    try:
+        async with owner_operation_lock(user_id):
+            return await _process_delete_message_unlocked(msg_id, fields)
+    except Exception as e:
+        logger.warning("[delete_queue] 用户 %s 删除锁获取/处理失败：%s", user_id, e)
+        return False
+
+
+async def _process_delete_message_unlocked(msg_id: str, fields: dict) -> bool:
     """执行一次账户删除。
 
     返回 True 表示该任务可 ACK：
@@ -220,20 +285,24 @@ async def process_delete_message(msg_id: str, fields: dict) -> bool:
 
 
 async def _handle_failure(msg_id: str, fields: dict) -> None:
-    """失败重试：指数退避重入队，超限进死信。"""
+    """失败重试：指数退避重入队，超限进死信。
+
+    顺序与 ingest_queue 一致：先持久化重试计划（ZSET / 死信流），
+    再 ACK + XDEL 原消息，避免「已 ACK 未入重试队列」窗口内崩溃导致任务丢失。
+    """
     r = get_redis()
     user_id = int(fields.get("user_id", 0))
     retries = await r.hincrby(RETRY_HASH, user_id, 1)
-    await r.xack(STREAM, GROUP, msg_id)
-    await r.xdel(STREAM, msg_id)
     if retries >= MAX_RETRIES:
         await r.xadd(DEAD_LETTER, {"user_id": str(user_id), "error": f"重试 {retries} 次仍失败", "origin": msg_id})
         await r.hdel(RETRY_HASH, user_id)
         logger.warning("[delete_queue] 任务 %s 进入死信队列：%s", msg_id, user_id)
-        return
-    delay = 2 ** int(retries)
-    logger.warning("[delete_queue] 任务 %s 第 %d 次失败，%ds 后重试：user_id=%s", msg_id, retries, delay, user_id)
-    await _schedule_retry(fields, delay)
+    else:
+        delay = 2 ** int(retries)
+        logger.warning("[delete_queue] 任务 %s 第 %d 次失败，%ds 后重试：user_id=%s", msg_id, retries, delay, user_id)
+        await _schedule_retry(fields, delay)
+    await r.xack(STREAM, GROUP, msg_id)
+    await r.xdel(STREAM, msg_id)
 
 
 async def run_worker(stop: "asyncio.Event | None" = None) -> None:
@@ -262,7 +331,7 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
                     else:
                         await _handle_failure(msg_id, fields)
                     await r.xdel(STREAM, msg_id)
-                    await r.srem(INFLIGHT_KEY, fields.get("user_id", ""))
+                    await release_delete_inflight(fields.get("user_id", ""), fields.get("inflight_token"))
         except asyncio.CancelledError:
             logger.info("[delete_queue] worker 停止")
             raise
@@ -282,14 +351,15 @@ async def queue_stats() -> dict:
     r = get_redis()
     try:
         info = await r.xinfo_groups(STREAM)
-        pending, delivered, last_id = 0, 0, "0-0"
+        pending, last_id = 0, "0-0"
         for g in info:
             pending += g.get("pending", 0)
-            delivered += g.get("consumers", 0)
             last_id = g.get("last-delivered-id", last_id)
         n = await r.xlen(STREAM)
         dead = await r.xlen(DEAD_LETTER)
-        inflight = await r.scard(INFLIGHT_KEY)
+        inflight = 0
+        async for _key in r.scan_iter(f"{INFLIGHT_LOCK_PREFIX}*", count=200):
+            inflight += 1
         return {
             "enabled": True,
             "stream_len": n,
@@ -298,8 +368,9 @@ async def queue_stats() -> dict:
             "inflight": inflight,
             "last_delivered_id": last_id,
         }
-    except Exception as e:
-        return {"enabled": True, "error": str(e)}
+    except Exception:
+        logger.exception("[delete_queue] 队列统计失败")
+        return {"enabled": True, "error": "queue_unavailable"}
 
 
 if __name__ == "__main__":

@@ -256,7 +256,7 @@ curl -X POST http://localhost:8010/api/documents/upload \
 ### 会话记忆（Postgres + TTL + 摘要）
 
 - 记忆按 `thread_id = {user_id}:{session_id}` 隔离，Postgres 持久化（跨重启/多 worker）；
-- **TTL**：以线程"最后活跃时间"为准，超过 `MEMORY_TTL_DAYS`（默认 1 天）整线程清理（后台任务周期执行）；
+- **TTL**：以 `chat_sessions.updated_at`（会话最后活跃时间）为准，超过 `MEMORY_TTL_DAYS`（默认 1 天）整线程清理（后台任务周期执行）；
 - **摘要**：约 20 轮对话（40 条消息）或 6000 tokens 触发 SummarizationMiddleware 压缩，保留最近 10 条，上下文不无限增长。
 
 ### 会话与高频访问缓存（Redis Cache-Aside）

@@ -1,5 +1,5 @@
-"""文档管理服务：删除文档（Milvus 向量 + MySQL 元数据 + OSS/磁盘原件 + 审计）。"""
 import logging
+import os
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +19,7 @@ async def delete_document(
     upload_dir: str,
 ) -> bool:
     """删除指定文档：先删 Milvus 向量（按 source），再删 MySQL 文件行（级联 chunk_records），
-    最后删除原件（OSS 对象 + 本地 upload 内副本）。
+    删除顺序经过一致性权衡：Milvus → OSS → 本地 → MySQL。
 
     返回 False 表示文档不存在。事务由调用方提交（get_db 依赖自动 commit）。
     """
@@ -28,25 +28,29 @@ async def delete_document(
     if record is None:
         return False
 
-    # 1. 原件：优先删 OSS 对象（source 为相对路径 key），再删本地 upload 副本
-    #    OSS 删除失败时中止删除，避免 MySQL/Milvus 已删但 OSS 对象残留
+    # 1. Milvus：先删全部向量（幂等）。失败抛异常 → MySQL 回滚，
+    #    此时 OSS/本地原件未动，用户重试即可完整重来。
+    #    （旧实现先删原件：若随后 Milvus 失败回滚，会出现"文档仍 in_sync
+    #    可检索、原件已丢失"的不可逆窗口。）
+    await adelete_chunks_by_source(record.source)
+
+    # 2. OSS 对象（source 为相对路径 key）。失败中止：此时向量已清、MySQL 未删，
+    #    文档暂时搜不到但原件完好，重试本接口（Milvus 幂等删空）即可补完。
     if not await delete_source_artifact(record.source):
         raise RuntimeError(f"OSS 删除失败，已中止文档删除：{record.source}")
+
+    # 3. 本地 upload 副本
     local_path = local_source_exists(record.source)
     if local_path:
         try:
-            import os
             os.remove(local_path)
         except OSError as e:
             logger.warning("[document_admin] 删除磁盘文件失败（不影响库内删除）：%s", e)
 
-    # 2. Milvus：按 source 删除全部向量（幂等；失败会抛异常触发回滚）
-    await adelete_chunks_by_source(record.source)
-
-    # 3. MySQL：删除文件行，chunk_records 由 ON DELETE CASCADE 级联清理
+    # 4. MySQL：删除文件行，chunk_records 由 ON DELETE CASCADE 级联清理
     await db.execute(delete(VectorFile).where(VectorFile.id == file_id))
 
-    # 4. 审计
+    # 5. 审计
     db.add(AuditLog(
         user_id=actor.id,
         username=actor.username,

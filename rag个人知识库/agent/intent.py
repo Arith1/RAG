@@ -19,6 +19,7 @@ import logging
 import re
 from typing import List, Literal, Optional
 
+from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import BaseModel, Field
 
 from rag个人知识库.agent.model import get_chat_model
@@ -131,6 +132,32 @@ def classify_by_rules(text: str) -> Optional[str]:
 _intent_model = None
 
 
+class _IntentUsageCallback(BaseCallbackHandler):
+    """捕获意图识别 LLM 调用的 token 用量并打日志（仅度量，不影响流程）。"""
+
+    def on_llm_end(self, response, *, run_id, parent_run_id=None, **kwargs):
+        try:
+            for gen in response.generations or []:
+                msg = gen[0].message if gen else None
+                if msg is None:
+                    continue
+                rm = getattr(msg, "response_metadata", None) or {}
+                um = getattr(msg, "usage_metadata", None) or {}
+                usage = rm.get("usage") or {}
+                details = um.get("input_token_details") or {}
+                prompt = usage.get("prompt_tokens") or um.get("input_tokens") or 0
+                completion = usage.get("completion_tokens") or um.get("output_tokens") or 0
+                hit = usage.get("prompt_cache_hit_tokens") or details.get("cache_read") or 0
+                miss = usage.get("prompt_cache_miss_tokens") or details.get("cache_creation") or 0
+                total = usage.get("total_tokens") or um.get("total_tokens") or (prompt + completion)
+                logger.info(
+                    "[intent_token_usage] input=%s cache_hit=%s cache_miss=%s output=%s total=%s",
+                    prompt, hit, miss, completion, total,
+                )
+        except Exception:
+            pass
+
+
 def _get_intent_model():
     """缓存结构化意图识别模型，避免每次 analyze 重复创建。"""
     global _intent_model
@@ -158,7 +185,8 @@ def analyze(content: str, history: Optional[str] = None) -> Intent:
     history_block = _HISTORY_BLOCK_TEMPLATE.format(history=history) if history else ""
     try:
         result = _get_intent_model().invoke(
-            ANALYZE_PROMPT.format(history_block=history_block, text=content)
+            ANALYZE_PROMPT.format(history_block=history_block, text=content),
+            config={"callbacks": [_IntentUsageCallback()]},
         )
     except Exception as exc:  # LLM 失败/解析失败时兜底，不打断对话
         logger.warning("意图识别失败，兜底 rag_ask：%s", exc)

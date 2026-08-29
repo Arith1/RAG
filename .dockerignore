@@ -3,6 +3,12 @@
 .gitignore
 .env
 .venv/
+.uv-cache/
+
+# 本地工具目录（开发/审计产物，不进镜像）
+.buildtmp/
+.agents/
+.impeccable/
 
 # Python 缓存
 __pycache__/
@@ -12,8 +18,16 @@ __pycache__/
 # 运行时不需要（resources 由 docker-compose 挂载；测试/评测不进镜像）
 tests/
 evaluation/
+benchmark/
+docs/
 rag个人知识库/resources/
 rag个人知识库/demo/
 
+# 前端（API 镜像不需要；排除 node_modules 显著缩小构建上下文）
+rag_frontend/
+
 # 文档
 README.md
+.md
+DESIGN.md
+PRODUCT.md

@@ -2,7 +2,7 @@
 
 方案约定：
 - MySQL chat_sessions 只存「会话列表 + 摘要」：标题、消息数、最后一条用户消息摘要、最后活跃时间，
-  供问答侧边栏快速加载与 TTL 清理扫描。
+  供问答侧边栏快速加载；TTL 清理以 updated_at（会话最后活跃/更新时间）为准。
 - 完整消息 / Agent 记忆由 Postgres（langgraph PostgresSaver checkpoint）持有，
   按 thread_id={user_id}:{session_id} 恢复；本模块不落任何完整消息。
 - 每完成一轮问答（user 提问 + assistant 回答），只更新 chat_sessions 一行元信息：
@@ -87,7 +87,8 @@ async def upsert_chat_session(
     - 标题：仅首次自动生成（首问前 30 字），已有标题（含用户重命名）保持不变
     - message_count +2（user + assistant）
     - last_message_preview = 最后一条 user 消息截断（60 字）
-    - last_message_at = now（侧边栏排序 / TTL 清理依据）
+    - last_message_at = now（侧边栏排序依据）
+    - updated_at 由 ORM 更新行时自动刷新（onupdate / DB ON UPDATE），作为 TTL 清理依据
     - 检索范围：首次创建时写入 3 个布尔字段；「指定用户」范围先删后插
       （幂等，后续轮次重复写入同一范围不影响已锁定的语义）
     """
@@ -268,27 +269,17 @@ async def delete_session(user_id: int, session_id: str) -> bool:
 
 
 async def list_expired_sessions(ttl_days: float) -> List[Tuple[int, str]]:
-    """返回已过 TTL 的会话 (user_id, session_id) 列表（供 TTL 清理先删 MySQL、再删 Postgres）。
+    """返回已过 TTL 的会话 (user_id, session_id) 列表（供 TTL 清理先删 Postgres、再删 MySQL）。
 
-    时间依据：last_message_at；该列为 NULL 时退化为 created_at。
+    时间依据：chat_sessions.updated_at（会话最后活跃/更新时间，ORM 更新行时自动刷新）；
+    updated_at 早于 now - TTL 即视为过期（该列 NOT NULL，无需回退其它列）。
     """
     deadline = datetime.now() - timedelta(days=ttl_days)
-    rows: List[ChatSession] = []
     async with async_session() as db:
         result = await db.execute(
-            select(ChatSession).where(
-                ChatSession.last_message_at.is_not(None),
-                ChatSession.last_message_at < deadline,
-            )
+            select(ChatSession).where(ChatSession.updated_at < deadline)
         )
-        rows.extend(result.scalars().all())
-        result2 = await db.execute(
-            select(ChatSession).where(
-                ChatSession.last_message_at.is_(None),
-                ChatSession.created_at < deadline,
-            )
-        )
-        rows.extend(result2.scalars().all())
+        rows = result.scalars().all()
     return [(s.user_id, s.session_id) for s in rows]
 
 

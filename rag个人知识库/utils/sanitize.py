@@ -7,6 +7,8 @@ import os
 
 from rag个人知识库.service.oss_archive import UPLOAD_DIR
 
+from typing import Optional
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -28,6 +30,29 @@ def sanitize_source(path: str) -> str:
     if abs_path.startswith(base + os.sep):
         return os.path.relpath(abs_path, base).replace(os.sep, "/")
     return os.path.basename(abs_path)
+
+
+def resolve_upload_file_path(user_dir: str, raw_file_name: str) -> Optional[str]:
+    """把上传文件名解析为用户目录内的落盘路径；非法或逃逸出目录时返回 None。
+
+    - 统一转正斜杠后取最后一段，挡住 "../" 与 Windows 反斜杠目录穿越；
+    - 盘符相对路径（如 "C:evil.pdf"）不含斜杠，上面的截断挡不住，而
+      ntpath.join 会把它当作带盘符的路径直接丢弃 user_dir，必须显式拒绝冒号；
+    - 最后用 commonpath 兜底校验仍在 user_dir 内（Windows 跨盘符会抛
+      ValueError，一并按非法处理）。
+    """
+    name = (raw_file_name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not name or ":" in name:
+        return None
+    user_root = os.path.abspath(user_dir)
+    path = os.path.abspath(os.path.join(user_dir, name))
+    if path == user_root:
+        return None
+    try:
+        inside = os.path.commonpath([user_root, path]) == user_root
+    except ValueError:
+        return None
+    return path if inside else None
 
 
 def sanitize_source_paths(items: list) -> None:

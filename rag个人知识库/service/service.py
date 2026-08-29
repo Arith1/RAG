@@ -66,12 +66,20 @@ async def search_documents(
       指定用户的公开文档（retrieve_owner_ids，多选，服务端强制 is_public=1）。
     user_id 为 None（CLI/评测）不做可见性过滤，行为与旧版一致。
     """
-    owner_ids_digest = ",".join(str(x) for x in sorted({t for t in (retrieve_owner_ids or []) if t is not None}))
+    owner_ids_digest = ",".join(
+        sorted({str(x) for x in (retrieve_owner_ids or []) if x is not None})
+    )
+    # None 表示由本函数按权限自动计算；显式 [] 表示调用方明确限定为空。
+    # 两者必须区分，否则不同文件范围会复用错误的检索结果。
+    file_ids_digest = (
+        "<auto>" if file_ids is None else
+        "<explicit>:" + ",".join(sorted({str(x) for x in file_ids}))
+    )
     cache_key_ = cache_key(
         "search", query, k, source or "", expr or "",
         user_id if user_id is not None else "",
         int(bool(retrieve_own_private)), int(bool(retrieve_own_public)),
-        int(bool(retrieve_kb_public)), owner_ids_digest,
+        int(bool(retrieve_kb_public)), owner_ids_digest, file_ids_digest,
     )
     cached = await cache_get(cache_key_)
     if cached is not None:

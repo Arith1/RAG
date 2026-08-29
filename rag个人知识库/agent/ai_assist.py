@@ -44,6 +44,27 @@ _checkpointer_stack = None
 _agent = None
 
 
+# 长驻单连接的 TCP 保活（libpq conninfo 参数）：Postgres/防火墙空闲掐断连接后
+# 单例不会重建，后续问答会持续报错。默认空闲 30s 起发保活探测。
+_KEEPALIVE_DEFAULTS = (
+    ("keepalives", "1"),
+    ("keepalives_idle", "30"),
+    ("keepalives_interval", "10"),
+    ("keepalives_count", "3"),
+)
+
+
+def memory_conninfo_with_keepalives(url: str) -> str:
+    """给 Postgres conninfo 追加缺失的 keepalives* 参数，已显式配置的项保持不动。"""
+    if not url:
+        return url
+    missing = [f"{key}={value}" for key, value in _KEEPALIVE_DEFAULTS if f"{key}=" not in url]
+    if not missing:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{'&'.join(missing)}"
+
+
 def get_checkpointer():
     """创建/复用对话记忆 checkpointer（进程内单例）。"""
     global _checkpointer, _checkpointer_stack
@@ -59,7 +80,9 @@ def get_checkpointer():
             # from_conn_string 是上下文管理器，连接仅在 with 块内有效；
             # 用 ExitStack 保持连接存活到进程结束（单例复用）
             stack = ExitStack()
-            saver = stack.enter_context(PostgresSaver.from_conn_string(url))
+            saver = stack.enter_context(
+                PostgresSaver.from_conn_string(memory_conninfo_with_keepalives(url))
+            )
             saver.setup()  # 建 checkpoint 表（幂等）
             _checkpointer_stack = stack
             _checkpointer = saver
@@ -316,14 +339,3 @@ def load_thread_messages(thread_id: str):
             result.append(item)
             pending_sources = []
     return result
-
-
-
-
-if __name__ == "__main__":
-    from rag个人知识库.agent.intent import analyze
-
-    result = analyze("你好")
-    # 手动测试：python -m rag个人知识库.agent.ai_assist
-    print(result.intent, result.query)
-    print(ask([HumanMessage(content="你好")]))

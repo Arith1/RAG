@@ -24,7 +24,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from rag个人知识库.config.redis import get_redis
 
 from rag个人知识库.config.db_config import async_session, get_db
-from rag个人知识库.service.session_cache import get_cached_user, set_user
 from rag个人知识库.models.user import AuditLog, User
 
 logger = logging.getLogger(__name__)
@@ -84,12 +83,8 @@ async def get_current_user(
     except (TypeError, ValueError):
         raise credentials_error
 
-    # 用户行缓存：同一用户高频请求（每次页面加载/每个接口）免一次 DB 查询；
-    # 状态/角色/密码变更（改密、删号）时显式失效，TTL 60s 兜底。
-    cached_user = await get_cached_user(user_id)
-    if cached_user is not None:
-        return cached_user
-
+    # 每个请求都回源 DB：用户行缓存存在时也先回源，否则状态/角色变更
+    # 在缓存失效失败时可能被陈旧缓存绕过（例如删除中的账号仍被当成 active）。
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None:
@@ -99,7 +94,6 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="账号已删除/删除中/禁用，无法继续访问",
         )
-    await set_user(user)
     return user
 
 
@@ -157,9 +151,9 @@ def _local_prune(key: str) -> None:
         _attempts.pop(key, None)
 
 
-def _local_check_allowed(key: str) -> bool:
+def _local_check_allowed(key: str, max_requests: int = LOGIN_MAX_ATTEMPTS) -> bool:
     _local_prune(key)
-    return len(_attempts.get(key, ())) < LOGIN_MAX_ATTEMPTS
+    return len(_attempts.get(key, ())) < max_requests
 
 
 def _local_record_failure(key: str) -> None:
@@ -189,23 +183,27 @@ return 1
 """
 
 
-async def _redis_check(key: str) -> "bool | None":
+async def _redis_check(
+    key: str,
+    max_requests: int = LOGIN_MAX_ATTEMPTS,
+    window_seconds: int = LOGIN_WINDOW_SECONDS,
+) -> "bool | None":
     """Redis 原子检查（含窗口清理）：True 放行 / False 拦截 / None 表示 Redis 不可用。"""
     try:
         r = get_redis()
-        ok = await r.eval(_CHECK_LUA, 1, key, LOGIN_WINDOW_SECONDS,
-                          LOGIN_MAX_ATTEMPTS, int(time.time() * 1000))
+        ok = await r.eval(_CHECK_LUA, 1, key, window_seconds,
+                          max_requests, int(time.time() * 1000))
         return bool(ok)
     except Exception:
         return None
 
 
-async def _redis_record(key: str) -> bool:
+async def _redis_record(key: str, window_seconds: int = LOGIN_WINDOW_SECONDS) -> bool:
     """Redis 原子记录一次失败，成功返回 True；Redis 不可用返回 False。"""
     try:
         r = get_redis()
         member = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
-        await r.eval(_RECORD_LUA, 1, key, LOGIN_WINDOW_SECONDS, 0,
+        await r.eval(_RECORD_LUA, 1, key, window_seconds, 0,
                      int(time.time() * 1000), member)
         return True
     except Exception:
@@ -233,6 +231,24 @@ async def clear_key(key: str) -> None:
     except Exception:
         pass
     _local_clear_key(key)
+
+
+async def allow_request(key: str, max_requests: int, window_seconds: int = LOGIN_WINDOW_SECONDS) -> bool:
+    """通用成本限流（问答/检索等昂贵接口）：滑动窗口内未超限则占用一个名额并放行。
+
+    与登录限流共用 ZSET + Lua 实现（多 worker 共享、重启不清零），
+    Redis 不可用时回退进程内 dict。名额在进入昂贵流程前先占下，
+    简单且不会低估并发成本；max_requests <= 0 表示不限流。
+    """
+    if max_requests <= 0:
+        return True
+    ok = await _redis_check(key, max_requests, window_seconds)
+    if ok is None:
+        ok = _local_check_allowed(key, max_requests)
+    if not ok:
+        return False
+    await _redis_record(key, window_seconds)
+    return True
 
 
 # ── 种子管理员（首次启动时从环境变量播种）──

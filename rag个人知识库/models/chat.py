@@ -2,7 +2,7 @@
 
 方案约定：
 - MySQL chat_sessions 只存「会话列表 + 摘要」：标题、消息数、最后一条用户消息摘要、最后活跃时间，
-  供问答侧边栏快速加载与 TTL 清理扫描。
+  供问答侧边栏快速加载；TTL 清理以 updated_at（会话最后活跃时间）为准。
 - 完整消息 / Agent 记忆由 Postgres（langgraph PostgresSaver checkpoint）持有，
   按 thread_id={user_id}:{session_id} 恢复。
 """
@@ -64,7 +64,7 @@ class ChatSession(Base):
         comment="最后一条用户消息摘要（侧边栏展示，过长截断）",
     )
     last_message_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True, comment="最后一条消息时间（侧边栏排序 / TTL 清理依据）"
+        DateTime, nullable=True, comment="最后一条消息时间（侧边栏排序依据）"
     )
     retrieve_own_private: Mapped[bool] = mapped_column(
         Boolean,

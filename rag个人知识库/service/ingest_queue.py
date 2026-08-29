@@ -20,10 +20,12 @@
   await run_worker()
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime
 
 from typing import Optional
@@ -31,6 +33,7 @@ from typing import Optional
 from rag个人知识库.config.redis import get_redis, redis_available
 from rag个人知识库.utils.sanitize import sanitize_source
 from rag个人知识库.service.oss_archive import archive_local_file, rel_source_from_local
+from rag个人知识库.service.operation_lock import owner_operation_lock
 from rag个人知识库.service.service import ingest_files
 
 logger = logging.getLogger(__name__)
@@ -39,16 +42,34 @@ STREAM = "ingest_queue"
 DEAD_LETTER = "ingest_queue:dead"
 GROUP = "ingest_workers"
 INFLIGHT_KEY = "ingest:inflight"
+INFLIGHT_LOCK_PREFIX = "ingest:lock:"
+INFLIGHT_LOCK_TTL = int(os.getenv("INGEST_INFLIGHT_TTL", str(6 * 3600)))
 RETRY_HASH = "ingest:retry"
 RETRY_DELAY_KEY = "ingest:retry:delayed"
 MAX_RETRIES = 3
 CONSUMER = f"worker-{os.getpid()}"
+# 崩溃恢复阈值：XAUTOCLAIM 的 min-idle 必须大于单条任务的最长处理耗时
+# （MinerU 解析可达数分钟），否则会把仍在处理中的任务误判为崩溃残留并抢占，
+# 与原 worker 争抢用户锁、误增重试计数。默认 10 分钟，可用环境变量调整。
+RECOVER_IDLE_MS = int(os.getenv("INGEST_RECOVER_IDLE_MS", str(10 * 60 * 1000)))
+
+# 只有持有者能释放锁：值格式为 source|token，释放时 Lua 比较后删除，
+# 避免旧任务或失败任务误删并发上传/重试新建的锁。
+_RELEASE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 async def enqueue_ingest(
     file_path: str,
     owner_id: int,
     is_public: bool = False,
+    *,
+    already_claimed: bool = False,
+    inflight_token: str | None = None,
 ) -> str | None:
     """把文件路径加入入库队列，返回消息 ID；Redis 不可用时返回 None。
 
@@ -58,21 +79,87 @@ async def enqueue_ingest(
     """
     if not await redis_available():
         return None
+    claimed_here = False
+    if not already_claimed:
+        claimed = await claim_inflight(file_path)
+        if not claimed:
+            return None
+        inflight_token = claimed
+        claimed_here = True
     r = get_redis()
-    await r.sadd(INFLIGHT_KEY, rel_source_from_local(file_path))
     msg: dict = {
         "path": file_path,
         "owner_id": str(owner_id),
         "is_public": "1" if is_public else "0",
+        "inflight_token": inflight_token or "",
     }
-    return await r.xadd(STREAM, msg)
+    try:
+        return await r.xadd(STREAM, msg)
+    except Exception as e:
+        if claimed_here:
+            await release_inflight(file_path, inflight_token)
+        logger.warning("[ingest_queue] 入队失败：%s（%s）", file_path, e)
+        return None
+
+
+def _inflight_lock_key(file_path: str) -> str:
+    source = rel_source_from_local(file_path)
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return f"{INFLIGHT_LOCK_PREFIX}{digest}"
+
+
+async def claim_inflight(file_path: str) -> str | bool | None:
+    """原子声明文件入库权，返回本次声明的 token；已占用返回 False；不可用返回 None。"""
+    if not await redis_available():
+        return None
+    source = rel_source_from_local(file_path)
+    try:
+        r = get_redis()
+        token = uuid.uuid4().hex
+        claimed = await r.set(
+            _inflight_lock_key(file_path),
+            f"{source}|{token}",
+            nx=True,
+            ex=INFLIGHT_LOCK_TTL,
+        )
+        if not claimed:
+            return False
+        await r.sadd(INFLIGHT_KEY, source)
+        return token
+    except Exception as e:
+        logger.warning("[ingest_queue] 声明文件入库权失败：%s（%s）", source, e)
+        return None
+
+
+async def release_inflight(file_path: str, token: str | None = None) -> None:
+    """释放文件入库权；token 匹配时才删除锁，同时清理旧版本集合成员。"""
+    try:
+        r = get_redis()
+        source = rel_source_from_local(file_path)
+        key = _inflight_lock_key(file_path)
+        if token:
+            await r.eval(_RELEASE_LUA, 1, key, f"{source}|{token}")
+        else:
+            # 旧版本消息没有 token：无条件清理（升级窗口内的兼容路径）
+            await r.delete(key)
+        if not await r.exists(key):
+            await r.srem(INFLIGHT_KEY, source)
+    except Exception as e:
+        logger.warning("[ingest_queue] 释放文件入库权失败：%s（%s）", file_path, e)
 
 
 async def is_inflight(file_path: str) -> bool:
     """文件是否正在入库（删除接口据此返回 409）。Redis 不可用时返回 False（放行）。"""
     if not await redis_available():
         return False
-    return bool(await get_redis().sismember(INFLIGHT_KEY, rel_source_from_local(file_path)))
+    r = get_redis()
+    source = rel_source_from_local(file_path)
+    if await r.exists(_inflight_lock_key(file_path)):
+        return True
+    # 兼容旧版本遗留集合；发现无对应租约时主动清掉陈旧成员。
+    if await r.sismember(INFLIGHT_KEY, source):
+        await r.srem(INFLIGHT_KEY, source)
+    return False
 
 
 async def _ensure_group() -> None:
@@ -135,7 +222,7 @@ async def _flush_due_retries() -> None:
         logger.warning("[ingest_queue] 扫描延迟重试队列失败：%s", e)
 
 async def _recover_pending() -> None:
-    """回收上次崩溃未 ACK 的任务并**立即重新处理**（PEL 中的残留，空闲 > 10s）。
+    """回收上次崩溃未 ACK 的任务并**立即重新处理**（PEL 中的残留，空闲超过阈值）。
 
     注意：XAUTOCLAIM 只是把 pending 消息的所有权转移给本 consumer，
     消息不会自动重新投递——必须认领后手动执行 process_message + XACK，
@@ -146,7 +233,7 @@ async def _recover_pending() -> None:
         start = "0"
         while True:
             # xautoclaim 返回 (next_start_id, claimed_messages, deleted_ids)
-            result = await r.xautoclaim(STREAM, GROUP, "recovery", 10000, start, count=100)
+            result = await r.xautoclaim(STREAM, GROUP, "recovery", RECOVER_IDLE_MS, start, count=100)
             claimed = result[1] if result else []
             if not claimed:
                 break
@@ -159,7 +246,7 @@ async def _recover_pending() -> None:
                     await r.xdel(STREAM, msg_id)
                 else:
                     await _handle_failure(msg_id, fields)
-                await r.srem(INFLIGHT_KEY, rel_source_from_local(path))
+                await release_inflight(path, fields.get("inflight_token"))
             start = result[0] if result else "0"
     except Exception as e:
         logger.warning("[ingest_queue] 崩溃任务回收失败：%s", e)
@@ -184,16 +271,27 @@ async def process_message(msg_id: str, fields: dict) -> bool:
             return False
         owner_id = int(fields["owner_id"])
         is_public = fields.get("is_public") == "1"
-        result = await ingest_files([path], owner_id=owner_id, is_public=is_public)
-        # 缓存失效（search/ans）已下沉到 service.ingest_files 统一处理
-        if any(r.get("status") == "error" for r in result):
-            # 入库失败：不归档、不删原件，走重试（本地文件仍在）
-            return False
-        # 入库成功（inserted/updated/retried/skipped）：归档原件到 OSS，成功才删本地
-        archived = await archive_local_file(path)
-        if not archived:
-            logger.warning("[ingest_queue] 任务 %s 归档 OSS 失败，保留本地原件重试：%s", msg_id, path)
-        return archived
+        # 账户删除也持有同一把用户级锁，确保删除与入库不会交叉写 Milvus。
+        async with owner_operation_lock(owner_id):
+            result = await ingest_files([path], owner_id=owner_id, is_public=is_public)
+            # 缓存失效（search/ans）已下沉到 service.ingest_files 统一处理
+            if any(r.get("status") == "error" for r in result):
+                # 入库失败：不归档、不删原件，走重试（本地文件仍在）
+                return False
+            if any(r.get("status") == "cancelled" for r in result):
+                # 账号已删除/禁用时安全丢弃队列任务，不再归档或无限重试。
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.exception("[ingest_queue] 取消任务清理本地原件失败：%s", path)
+                return True
+            # 入库成功（inserted/updated/retried/skipped）：归档原件到 OSS，成功才删本地
+            archived = await archive_local_file(path)
+            if not archived:
+                logger.warning("[ingest_queue] 任务 %s 归档 OSS 失败，保留本地原件重试：%s", msg_id, path)
+            return archived
     except Exception as e:
         logger.warning("[ingest_queue] 任务 %s 处理失败：%s", msg_id, e)
         return False
@@ -202,19 +300,17 @@ async def process_message(msg_id: str, fields: dict) -> bool:
 async def _handle_failure(msg_id: str, fields: dict) -> None:
     """失败重试：指数退避重入队，超限进死信。
 
-    延迟重试先写入 Redis ZSET，由 worker 定期扫描到期任务重新入队，
-    避免进程崩溃导致重试任务丢失。
+    关键顺序：先持久化重试计划（ZSET / 死信流），再 ACK + XDEL 原消息。
+    若先 ACK 再写计划，进程在两步之间崩溃会同时失去原消息和重试计划（任务丢失）；
+    先写计划再 ACK，最坏情况是崩溃后恢复重放导致重复计数/重复入队，
+    而入库语义幂等（内容未变则 skip），可安全收敛。
 
     注意：必须从 fields 中保留 owner_id / is_public 并透传给重试消息，
     否则重试写入 vector_files 时因 owner_id NOT NULL 而必然失败。
     """
     r = get_redis()
     path = fields.get("path", "")
-    owner_id = int(fields["owner_id"]) if fields.get("owner_id") else None
-    is_public = fields.get("is_public") == "1"
     retries = await r.hincrby(RETRY_HASH, path, 1)
-    await r.xack(STREAM, GROUP, msg_id)  # 先确认，再由重试机制重新入队
-    await r.xdel(STREAM, msg_id)  # 原消息删除，防止 stream 增长
     if retries >= MAX_RETRIES:
         await r.xadd(DEAD_LETTER, {
             "path": path,
@@ -225,10 +321,12 @@ async def _handle_failure(msg_id: str, fields: dict) -> None:
         })
         await r.hdel(RETRY_HASH, path)
         logger.warning("[ingest_queue] 任务 %s 进入死信队列：%s", msg_id, path)
-        return
-    delay = 2 ** int(retries)  # 指数退避 2s / 4s
-    logger.warning("[ingest_queue] 任务 %s 第 %d 次失败，%ds 后重试：%s", msg_id, retries, delay, path)
-    await _schedule_retry(fields, delay)
+    else:
+        delay = 2 ** int(retries)  # 指数退避 2s / 4s
+        logger.warning("[ingest_queue] 任务 %s 第 %d 次失败，%ds 后重试：%s", msg_id, retries, delay, path)
+        await _schedule_retry(fields, delay)
+    await r.xack(STREAM, GROUP, msg_id)
+    await r.xdel(STREAM, msg_id)  # 原消息删除，防止 stream 增长
 
 
 async def run_worker(stop: "asyncio.Event | None" = None) -> None:
@@ -265,7 +363,7 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
                         await _handle_failure(msg_id, fields)
                     # ACK 后删除消息本体，避免 stream 无限增长（XACK 不会移除条目）
                     await r.xdel(STREAM, msg_id)
-                    await r.srem(INFLIGHT_KEY, rel_source_from_local(fields.get("path", "")))
+                    await release_inflight(fields.get("path", ""), fields.get("inflight_token"))
         except asyncio.CancelledError:
             logger.info("[ingest_queue] worker 停止")
             raise
@@ -285,14 +383,15 @@ async def queue_stats() -> dict:
     r = get_redis()
     try:
         info = await r.xinfo_groups(STREAM)
-        pending, delivered, last_id = 0, 0, "0-0"
+        pending, last_id = 0, "0-0"
         for g in info:
             pending += g.get("pending", 0)
-            delivered += g.get("consumers", 0)  # 占位，实际看 entries
             last_id = g.get("last-delivered-id", last_id)
         n = await r.xlen(STREAM)
         dead = await r.xlen(DEAD_LETTER)
-        inflight = await r.scard(INFLIGHT_KEY)
+        inflight = 0
+        async for _key in r.scan_iter(f"{INFLIGHT_LOCK_PREFIX}*", count=200):
+            inflight += 1
         return {
             "enabled": True,
             "stream_len": n,
@@ -301,8 +400,9 @@ async def queue_stats() -> dict:
             "inflight": inflight,
             "last_delivered_id": last_id,
         }
-    except Exception as e:
-        return {"enabled": True, "error": str(e)}
+    except Exception:
+        logger.exception("[ingest_queue] 队列统计失败")
+        return {"enabled": True, "error": "queue_unavailable"}
 
 
 
@@ -345,12 +445,17 @@ async def list_pending(limit: int = 100) -> list[dict]:
 
 
 async def list_inflight() -> list[dict]:
-    """列出正在入库的文件（inflight 集合）。"""
+    """列出正在入库的文件（基于带 TTL 的锁，避免陈旧集合成员）。"""
     if not await redis_available():
         return []
     r = get_redis()
     try:
-        paths = await r.smembers(INFLIGHT_KEY)
+        paths = []
+        async for key in r.scan_iter(f"{INFLIGHT_LOCK_PREFIX}*", count=200):
+            raw = await r.get(key)
+            if raw:
+                source = raw.split("|", 1)[0]
+                paths.append(source)
     except Exception as e:
         logger.warning("[ingest_queue] 读取入库中集合失败：%s", e)
         return []

@@ -14,6 +14,8 @@ import asyncio
 import logging
 import os
 from decimal import Decimal
+
+from sqlalchemy import delete, select
 from typing import Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
@@ -40,6 +42,7 @@ from rag个人知识库.loader.load_file import (
     validate_file,
 )
 from rag个人知识库.loader.parser.mineru_parser import minerU_files_ordered
+from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.splitter.spliter import split_documents
 from rag个人知识库.service.oss_archive import rel_source_from_local
@@ -59,6 +62,24 @@ logger = logging.getLogger(__name__)
 
 def _next_version(current: Decimal) -> Decimal:
     return (current + VERSION_STEP).quantize(Decimal("0.1"))
+
+
+async def _owner_is_active(owner_id: int) -> bool:
+    """读取用户最新状态；入库只允许 active 用户继续。"""
+    async with session_factory() as db:
+        status = await db.scalar(select(User.status).where(User.id == owner_id))
+    return status == "active"
+
+
+async def _drop_staged_insert(file_id: int) -> None:
+    """删除刚落库但尚未写入 Milvus 的新文件记录，避免账号取消入库后留下 pending 孤儿行。"""
+    try:
+        async with session_factory() as db:
+            await db.execute(delete(VectorFile).where(VectorFile.id == file_id))
+            await db.commit()
+        logger.info("[Ingest] 已清理未同步 Milvus 的新入库记录：file_id=%s", file_id)
+    except Exception:
+        logger.exception("[Ingest] 清理未同步新入库记录失败：file_id=%s", file_id)
 
 
 async def precheck(
@@ -230,6 +251,15 @@ async def process_file(
     mineru_result: 批量 MinerU 解析结果；非 None 时不再单独触发 MinerU 上传解析。
     owner_id / is_public: 文档归属与共享标记（API 上传场景传入，写入 vector_files + chunk metadata）。
     """
+    # 0. 用户状态预检：即使任务已进入队列，删除/禁用期间也不得继续写库。
+    try:
+        if not await _owner_is_active(owner_id):
+            logger.info("[Ingest] 用户 %s 已非 active，取消入库：%s", owner_id, file_path)
+            return {"file_path": file_path, "status": "cancelled", "message": "账号当前不可入库"}
+    except Exception:
+        logger.exception("[Ingest] 读取用户状态失败：owner_id=%s, file=%s", owner_id, file_path)
+        raise
+
     # 1. 基础校验
     error = validate_file(file_path)
     if error is not None:
@@ -261,7 +291,7 @@ async def process_file(
             return {
                 "file_path": file_path,
                 "status": "error",
-                "message": f"MinerU 解析失败：{mineru_result.get('error') or '未返回解析结果'}",
+                "message": "文档解析失败，请稍后重试",
             }
         if mineru_result is not None:
             docs = await asyncio.to_thread(
@@ -272,9 +302,13 @@ async def process_file(
             )
         else:
             docs = await asyncio.to_thread(load_single, file_path)
-    except Exception as e:
-        logger.warning("[Ingest] %s 加载失败：%s", file_path, e)
-        return {"file_path": file_path, "status": "error", "message": f"加载失败：{e}"}
+    except Exception:
+        logger.exception("[Ingest] 文件加载失败：%s", file_path)
+        return {
+            "file_path": file_path,
+            "status": "error",
+            "message": "文件加载失败，请稍后重试",
+        }
     if not docs:
         return {"file_path": file_path, "status": "error", "message": "加载结果为空"}
 
@@ -316,10 +350,14 @@ async def process_file(
                 )
                 owner_id = owner_id or record.owner_id  # 更新沿用已有 owner
             await db.commit()
-        except Exception as e:
+        except Exception:
             await db.rollback()
-            logger.warning("[Ingest] %s 元数据落库失败，已回滚（Milvus 未改动）：%s", file_path, e)
-            return {"file_path": file_path, "status": "error", "message": f"元数据落库失败：{e}"}
+            logger.exception("[Ingest] 元数据落库失败，已回滚（Milvus 未改动）：%s", file_path)
+            return {
+                "file_path": file_path,
+                "status": "error",
+                "message": "元数据保存失败，请稍后重试",
+            }
 
     # 5.5 阶段二前：把 file_id / owner_id 写入即将入 Milvus 的 chunk metadata
     #   （检索可见性过滤载体：file_id in (...) / owner_id 溯源；source 已在切分前写入）
@@ -329,7 +367,13 @@ async def process_file(
             doc.metadata["owner_id"] = owner_id
 
     # 6. 阶段二：同步 Milvus（独立会话标记状态，与阶段一事务隔离）
+    # 在真正写向量前再次回源，避免账号在解析/落库期间进入 deleting 后仍写回 Milvus。
     try:
+        if not await _owner_is_active(owner_id):
+            logger.info("[Ingest] 用户 %s 在 Milvus 同步前已非 active，取消入库：%s", owner_id, file_path)
+            if action == "insert":
+                await _drop_staged_insert(file_id)
+            return {"file_path": file_path, "status": "cancelled", "message": "账号当前不可入库"}
         await _sync_milvus(file_id, added_chunks, removed_ids, rebuild_source)
         logger.info("[Ingest] %s 处理完成：%s", file_path, summary)
         return {
@@ -342,8 +386,14 @@ async def process_file(
             "version": str(version),
             **summary,
         }
-    except RuntimeError as e:
-        return {"file_path": file_path, "status": "error", "message": str(e), "retryable": True}
+    except RuntimeError:
+        logger.exception("[Ingest] Milvus 同步失败：%s", file_path)
+        return {
+            "file_path": file_path,
+            "status": "error",
+            "message": "向量同步失败，请稍后重试",
+            "retryable": True,
+        }
 
 
 async def ingest_files_batched(
@@ -386,12 +436,13 @@ async def ingest_files_batched(
                 ordered_results[idx] = await process_file(
                     db, file_path, owner_id=owner_id, is_public=is_public,
                 )
-        except Exception as e:
+        except Exception:
             await db.rollback()
+            logger.exception("[Ingest] 批量处理文件失败：%s", file_path)
             ordered_results[idx] = {
                 "file_path": file_path,
                 "status": "error",
-                "message": f"处理失败：{e}",
+                "message": "文件处理失败，请稍后重试",
             }
 
     # 预检阶段的 SELECT 会隐式开启事务，长时间批量解析前先释放数据库连接/事务
@@ -401,9 +452,9 @@ async def ingest_files_batched(
         complex_paths = [path for _, path in complex_batch]
         try:
             mineru_results = await asyncio.to_thread(minerU_files_ordered, complex_paths)
-        except Exception as e:
+        except Exception:
+            logger.exception("[Ingest] MinerU 批量解析失败")
             mineru_results = None
-            batch_error = str(e)
 
         for position, (idx, file_path) in enumerate(complex_batch):
             try:
@@ -411,7 +462,7 @@ async def ingest_files_batched(
                     ordered_results[idx] = {
                         "file_path": file_path,
                         "status": "error",
-                        "message": f"MinerU 批量解析失败：{batch_error}",
+                        "message": "文档解析失败，请稍后重试",
                     }
                 else:
                     ordered_results[idx] = await process_file(
@@ -421,12 +472,13 @@ async def ingest_files_batched(
                         owner_id=owner_id,
                         is_public=is_public,
                     )
-            except Exception as e:
+            except Exception:
                 await db.rollback()
+                logger.exception("[Ingest] 批量处理 MinerU 文件失败：%s", file_path)
                 ordered_results[idx] = {
                     "file_path": file_path,
                     "status": "error",
-                    "message": f"处理失败：{e}",
+                    "message": "文件处理失败，请稍后重试",
                 }
 
     return [result for result in ordered_results if result is not None]

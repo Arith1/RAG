@@ -19,3 +19,16 @@ __pycache__/
 /.agents/
 /DESIGN.md
 /PRODUCT.md
+/.uv-cache/
+
+# 本地开发手记（根目录 .md 为提交备忘，不入库）
+/.md
+
+# 日志与系统文件
+*.log
+Thumbs.db
+desktop.ini
+/tests/
+/evaluation/
+/docs/
+/benchmark/

@@ -1,5 +1,22 @@
 import { useAuthStore } from '../stores/auth'
 
+/** FastAPI 错误体的 detail 通常是字符串；少数接口（如 readiness 503）返回对象，
+ *  统一转成可读文案，避免 UI 弹出 [object Object]。 */
+function detailMessage(data: unknown, status: number): string {
+  const detail = (data as { detail?: unknown } | null)?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (detail && typeof detail === 'object') {
+    const d = detail as Record<string, unknown>
+    if (d.status === 'not_ready' && d.checks && typeof d.checks === 'object') {
+      const failed = Object.entries(d.checks as Record<string, unknown>)
+        .filter(([, ok]) => ok !== true)
+        .map(([name]) => name)
+      if (failed.length > 0) return `服务尚未就绪：${failed.join('、')} 检查未通过`
+    }
+  }
+  return `HTTP ${status}`
+}
+
 export interface SourceItem {
   index: number
   source: string | null
@@ -98,8 +115,8 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
     throw new Error('登录已过期')
   }
   if (!res.ok) {
-    const data = (await res.json().catch(() => ({}))) as { detail?: string }
-    throw new Error(data.detail ?? `HTTP ${res.status}`)
+    const data = (await res.json().catch(() => null)) as unknown
+    throw new Error(detailMessage(data, res.status))
   }
   return (await res.json()) as T
 }
@@ -136,8 +153,8 @@ export async function streamChat(
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    const data = (await res.json().catch(() => ({}))) as { detail?: string }
-    throw new Error(data.detail ?? `HTTP ${res.status}`)
+    const data = (await res.json().catch(() => null)) as unknown
+    throw new Error(detailMessage(data, res.status))
   }
 
   const reader = res.body!.getReader()

@@ -21,16 +21,17 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.api.auth import (
+    allow_request,
     audit, check_allowed, clear_key, create_access_token, get_current_user,
     hash_password, record_failure, require_admin, seed_admin, verify_password,
     write_audit,
 )
-from rag个人知识库.config.db_config import engine, get_db
+from rag个人知识库.config.db_config import async_session, engine, get_db
 from rag个人知识库.config.redis import cache_clear_prefix, cache_clear_source, redis_available
 from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import VectorFile
@@ -52,7 +53,6 @@ from rag个人知识库.service.session_cache import (
     invalidate_docs,
     invalidate_session_detail,
     invalidate_session_list,
-    invalidate_user,
     invalidate_user_search,
     invalidate_user_sessions,
     set_cached_docs,
@@ -61,16 +61,20 @@ from rag个人知识库.service.session_cache import (
     set_session_list,
     warmup_user_sessions,
 )
-from rag个人知识库.utils.sanitize import sanitize_source, sanitize_source_paths
+from rag个人知识库.utils.sanitize import (
+    resolve_upload_file_path,
+    sanitize_source,
+    sanitize_source_paths,
+)
 from rag个人知识库.service.delete_queue import (
     enqueue_delete,
     run_worker as run_delete_worker,
 )
 from rag个人知识库.service.document_admin import delete_document, revoke_document_public, share_document_public
 from rag个人知识库.service.ingest_queue import (
-    clear_dead, enqueue_ingest, is_inflight, list_dead, list_inflight,
+    claim_inflight, clear_dead, enqueue_ingest, is_inflight, list_dead, list_inflight,
     list_pending, queue_stats, retry_all_dead, retry_dead,
-    run_worker as run_ingest_worker,
+    release_inflight, run_worker as run_ingest_worker,
 )
 from rag个人知识库.service.memory_maintenance import (
     CLEANUP_INTERVAL_SECONDS, MEMORY_TTL_DAYS, cleanup_expired_memory,
@@ -79,6 +83,7 @@ from rag个人知识库.service.oss_archive import (
     UPLOAD_DIR, build_download_url, local_source_exists,
 )
 from rag个人知识库.service.service import ingest_files, list_documents, search_documents
+from rag个人知识库.vector_store.milvus_store import get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +92,30 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_FILE_SIZE", 10*1024*1024))
 MAX_BATCH_UPLOAD = int(os.getenv("MAX_BATCH_UPLOAD", 10))  # 单次批量上传文件数上限
 ALLOWED_EXT = {".pdf", ".docx", ".txt", ".md"}
+# 成本限流（滑动窗口 60s/用户）：问答会触发 analyze + 检索 + rerank + 生成，
+# 一次最多 5 个子问题，属于最贵的接口；检索次之。0 或负数表示不限流。
+CHAT_MAX_REQUESTS_PER_MINUTE = int(os.getenv("CHAT_MAX_REQUESTS_PER_MINUTE", "10"))
+SEARCH_MAX_REQUESTS_PER_MINUTE = int(os.getenv("SEARCH_MAX_REQUESTS_PER_MINUTE", "30"))
 
 
 # ── 请求/响应模型 ──
+def _check_password_utf8_limit(v: str) -> str:
+    """bcrypt 硬上限 72 字节：超长输入必须在此拦下，否则 hashpw 抛 ValueError 变 500。"""
+    if len(v.encode("utf-8")) > 72:
+        raise ValueError("密码过长（UTF-8 编码后最多 72 字节）")
+    return v
+
+
 class RegisterIn(BaseModel):
-    username: str
-    password: str
+    """注册入参。长度上限对齐 users.username 列宽与 bcrypt 72 字节硬限制。"""
+
+    username: str = Field(..., min_length=2, max_length=64, description="用户名（2~64 字符）")
+    password: str = Field(..., min_length=6, max_length=64, description="密码（6~64 字符）")
+
+    @field_validator("password")
+    @classmethod
+    def _password_utf8_limit(cls, v: str) -> str:
+        return _check_password_utf8_limit(v)
 
 
 class UserOut(BaseModel):
@@ -112,8 +135,13 @@ class ProfileOut(BaseModel):
 
 
 class ChangePasswordIn(BaseModel):
-    old_password: str
-    new_password: str
+    old_password: str = Field(..., max_length=128)
+    new_password: str = Field(..., min_length=6, max_length=64, description="新密码（6~64 字符）")
+
+    @field_validator("new_password")
+    @classmethod
+    def _new_password_utf8_limit(cls, v: str) -> str:
+        return _check_password_utf8_limit(v)
 
 class TokenOut(BaseModel):
     access_token: str
@@ -273,13 +301,11 @@ app.add_middleware(
 )
 
 
-async def _sse_events(gen):
-    """把 chat_stream 的 JSON 事件封装为 SSE 帧：data: {json}\n\n"""
-    async for event in gen:
-        # 流式事件同样需要脱敏 source，避免暴露服务器本地绝对路径
-        if event.get("sources"):
-            sanitize_source_paths(event["sources"])
-        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+async def _upload_user_active(user_id: int) -> bool:
+    """上传前用独立会话回源用户状态，避免同一请求事务里读到陈旧快照。"""
+    async with async_session() as db:
+        status = await db.scalar(select(User.status).where(User.id == user_id))
+    return status == "active"
 
 
 @app.get("/")
@@ -297,12 +323,68 @@ async def chat_page():
 
 @app.get("/api/health")
 async def health():
+    """轻量 liveness 探针：进程存活即可返回，不依赖外部服务。"""
     return {"status": "ok"}
 
 
+def _probe_milvus() -> None:
+    """在工作线程中触发 Milvus 客户端初始化，避免阻塞事件循环。"""
+    get_vector_store()
+
+
+@app.get("/api/ready")
+async def ready():
+    """readiness 探针：检查 MySQL、Redis 和 Milvus 是否可用。"""
+    checks = {"mysql": False, "redis": False, "milvus": False}
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        checks["mysql"] = True
+    except Exception:
+        logger.exception("[ready] MySQL 检查失败")
+    try:
+        checks["redis"] = bool(await redis_available())
+        if not checks["redis"]:
+            logger.warning("[ready] Redis 检查失败")
+    except Exception:
+        logger.exception("[ready] Redis 检查失败")
+    try:
+        await asyncio.to_thread(_probe_milvus)
+        checks["milvus"] = True
+    except Exception:
+        logger.exception("[ready] Milvus 检查失败")
+    if not all(checks.values()):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "not_ready", "checks": checks},
+        )
+    return {"status": "ready", "checks": checks}
+
+
 # ══ 认证 ══
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
 def _client_ip(request: Request) -> str:
+    """客户端 IP：默认取 socket 对端地址。
+
+    反向代理（Nginx/Caddy）后请设置 TRUST_PROXY_HEADERS=true，取
+    X-Forwarded-For 的最右一段（由最后一个可信代理追加的真实客户端地址；
+    最左段可被客户端伪造，不能直接信任）。不开启时全站共享代理 IP，
+    登录/注册/问答限流会互相误伤。
+    """
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[-1].strip() or "unknown"
     return request.client.host if request.client else "unknown"
+
+
+def _escape_like(keyword: str) -> str:
+    """转义 MySQL LIKE 通配符（反斜杠为 MySQL 默认转义符），让用户输入按字面匹配。"""
+    return keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @app.post("/api/auth/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -362,7 +444,7 @@ async def user_search(
     """用户搜索（供问答页「指定用户的公开文档」多选器）。
 
     只返回 active 用户，且排除当前用户（自己的文档由「自己的私有/公开文档」覆盖）。
-    按 username 前缀优先、再按创建时间倒序，最多 limit 条。
+    按用户名模糊匹配（通配符已转义、按字面命中），按 username 字典序返回前 limit 条。
     """
     keyword = (q or "").strip()
     cached = await get_cached_user_search(user.id, limit, keyword)
@@ -375,8 +457,7 @@ async def user_search(
         .limit(limit)
     )
     if keyword:
-        like = f"%{keyword}%"
-        stmt = stmt.where(User.username.like(like))
+        stmt = stmt.where(User.username.like(f"%{_escape_like(keyword)}%"))
     result = await db.execute(stmt)
     rows = result.scalars().all()
     items = [UserOut(id=r.id, username=r.username, role=r.role) for r in rows]
@@ -402,7 +483,6 @@ async def change_password(
     new_hash = hash_password(body.new_password)
     await db.execute(update(User).where(User.id == user.id).values(password_hash=new_hash))
     await db.commit()
-    await invalidate_user(user.id)  # 密码哈希已变，清鉴权用户缓存
     audit(db, user, "change_password", target=user.username)
     return {"message": "密码修改成功，请重新登录"}
 
@@ -439,11 +519,10 @@ async def me(user: User = Depends(get_current_user)):
 
 @app.post("/api/auth/logout")
 async def logout(user: User = Depends(get_current_user)):
-    """退出登录：清除该用户的鉴权用户行缓存（JWT 本身无状态，客户端丢弃 token 即可）。
+    """退出登录：JWT 无状态、服务端无会话可吊销，客户端丢弃 token 即完成登出。
 
-    多端同时在线时，任一端登出都会让其他端下一次请求回源 DB 重建缓存（无害的缓存未命中）。
+    保留此接口以承载前端调用，并顺带完成一次 token 有效性校验。
     """
-    await invalidate_user(user.id)
     return {"status": "logged_out", "user_id": user.id}
 
 
@@ -468,12 +547,21 @@ async def delete_account(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "管理员账号不能删除自己，请联系系统管理员处理")
 
     source_result = await db.execute(
-        select(VectorFile.source).where(VectorFile.owner_id == user.id)
+        select(VectorFile.id, VectorFile.source, VectorFile.is_public)
+        .where(VectorFile.owner_id == user.id)
     )
-    user_sources = list(source_result.scalars().all())
+    user_documents = list(source_result.all())
+    user_sources = [source for _file_id, source, _is_public in user_documents]
 
     # 显式 UPDATE 落库：user 可能来自 Redis 缓存（游离对象），直接改属性 + commit 不会生效
-    await db.execute(update(User).where(User.id == user.id).values(status="deleting"))
+    update_result = await db.execute(
+        update(User)
+        .where(User.id == user.id, User.status == "active")
+        .values(status="deleting")
+    )
+    if update_result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "账号删除状态已发生变化，请稍后重试")
     await db.execute(
         update(VectorFile)
         .where(VectorFile.owner_id == user.id)
@@ -487,18 +575,23 @@ async def delete_account(
 
     msg_id = await enqueue_delete(user.id)
     if msg_id is None:
-        # Redis 不可用：补偿回滚 status=active，避免账号卡死在 deleting 且无任务可消费
+        # 入队失败：补偿恢复账号状态和原有公开性，避免账号卡死或文档被误设为私有。
         async with async_session() as db2:
             await db2.execute(update(User).where(User.id == user.id).values(status="active"))
+            for file_id, _source, was_public in user_documents:
+                await db2.execute(
+                    update(VectorFile)
+                    .where(VectorFile.id == file_id, VectorFile.owner_id == user.id)
+                    .values(is_public=bool(was_public))
+                )
             await db2.commit()
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Redis 不可用，暂时无法提交账户删除请求")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "暂时无法提交账户删除请求，请稍后重试")
 
     # 文档私有化后立即清理相关缓存，避免其他用户在删除队列执行前仍命中旧共享结果
     for source in user_sources:
         await cache_clear_source(source)
 
-    # 账号进入删除流程：清鉴权/会话缓存；文档与用户搜索缓存全量失效
-    await invalidate_user(user.id)
+    # 账号进入删除流程：清会话缓存；文档与用户搜索缓存全量失效
     await invalidate_user_sessions(user.id)
     await invalidate_docs()
     await invalidate_user_search()
@@ -532,6 +625,10 @@ async def upload_documents(
             status.HTTP_400_BAD_REQUEST,
             f"一次最多上传 {MAX_BATCH_UPLOAD} 个文件，当前选择了 {len(files)} 个",
         )
+    # user 可能来自缓存；上传前回源校验一次，避免删除/禁用期间继续接受任务。
+    user_state = await db.scalar(select(User.status).where(User.id == user.id))
+    if user_state != "active":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "账号当前不可上传文件")
     # 按用户分目录隔离：uploads/{user_id}/{file_name}
     user_dir = os.path.join(UPLOAD_DIR, str(user.id))
     os.makedirs(user_dir, exist_ok=True)
@@ -557,29 +654,74 @@ async def upload_documents(
                 "message": "暂不支持旧版 .doc，请用 WPS/Word 另存为 .docx 后上传",
             })
             continue
-        content = await file.read()
-        if not content:
-            results.append({"file_name": file_name, "status": "error", "message": "文件为空"})
+        # 解析为用户目录内的绝对路径；盘符相对路径（如 "C:evil.pdf"）等逃逸
+        # 文件名一律拒绝，避免写盘越过 uploads/{user_id} 边界。
+        path = resolve_upload_file_path(user_dir, file_name)
+        if path is None:
+            results.append({
+                "file_name": file_name, "status": "error",
+                "message": "文件名不合法（不能包含盘符/冒号），无法保存",
+            })
             continue
-        if len(content) > MAX_UPLOAD_SIZE:
-            results.append({"file_name": file_name, "status": "error", "message": "文件超过 10MB 上限"})
+        # SET NX 原子声明同一路径的入库权，避免并发请求互相覆盖文件并重复入队。
+        claimed = await claim_inflight(path)
+        if claimed is None:
+            results.append({"file_name": file_name, "status": "error", "message": "Redis 不可用，暂时无法提交入库任务"})
             continue
-        path = os.path.join(user_dir, file_name)
-        # 写盘/入队前先检查是否已有同一文件正在入库，避免并发重复任务
-        if await is_inflight(path):
+        if not claimed:
             results.append({"file_name": file_name, "status": "error", "message": "文档正在入库中，请勿重复上传"})
             continue
-        with open(path, "wb") as f:
-            f.write(content)
+        # 写盘前再次回源：删除请求可能在批量上传过程中提交，避免为已删除账号继续写文件/入队。
+        if not await _upload_user_active(user.id):
+            await release_inflight(path, claimed)
+            results.append({"file_name": file_name, "status": "error", "message": "账号已删除/禁用，无法上传文件"})
+            continue
+        temp_path = f"{path}.uploading-{uuid.uuid4().hex}"
+        try:
+            size = 0
+            with open(temp_path, "wb") as f:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_SIZE:
+                        raise ValueError(f"文件超过 {MAX_UPLOAD_SIZE // (1024 * 1024)}MB 上限")
+                    f.write(chunk)
+            if size == 0:
+                raise ValueError("文件为空")
+            # 同目录 rename 是原子的，worker 不会看到半写入文件。
+            os.replace(temp_path, path)
+        except ValueError as e:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            await release_inflight(path, claimed)
+            results.append({"file_name": file_name, "status": "error", "message": str(e)})
+            continue
+        except OSError as e:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            await release_inflight(path, claimed)
+            logger.warning("[upload] 写入文件失败：%s（%s）", path, e)
+            results.append({"file_name": file_name, "status": "error", "message": "文件写入失败，请稍后重试"})
+            continue
         audit(db, user, "upload", target=file_name, detail=sanitize_source(path))
         # 入库任务必须进入 Redis Streams 持久队列，避免进程内存任务在崩溃时丢失
-        msg_id = await enqueue_ingest(path, owner_id=user.id, is_public=is_public)
+        msg_id = await enqueue_ingest(
+            path, owner_id=user.id, is_public=is_public,
+            already_claimed=True, inflight_token=claimed,
+        )
         if msg_id is None:
             # 任务未入队时不能保留半成品文件，清理后按失败返回
             try:
                 os.remove(path)
             except OSError:
                 pass
+            await release_inflight(path, claimed)
             results.append({"file_name": file_name, "status": "error", "message": "Redis 不可用，暂时无法提交入库任务"})
             continue
         accepted += 1
@@ -594,6 +736,7 @@ async def upload_documents(
     failed = len(results) - accepted
     summary = f"{accepted} 个文件已提交入库，{failed} 个文件失败" if failed else f"{accepted} 个文件已提交入库"
     if accepted:
+        await db.commit()  # 提交本次上传的审计记录
         await invalidate_docs()  # 新文件进入队列，文档列表立即刷新（状态 processing）
     return {
         "status": "processing",
@@ -768,7 +911,7 @@ async def download_document(
 
 
 @app.get("/api/ingest/stats")
-async def ingest_stats(user: User = Depends(get_current_user)):
+async def ingest_stats(admin: User = Depends(require_admin)):
     """入库任务队列状态（Redis Streams：待处理 / 死信 / 正在入库）。"""
     return await queue_stats()
 
@@ -776,14 +919,14 @@ async def ingest_stats(user: User = Depends(get_current_user)):
 @app.get("/api/ingest/queue")
 async def ingest_queue_list(
     limit: int = Query(100, ge=1, le=500),
-    user: User = Depends(get_current_user),
+    admin: User = Depends(require_admin),
 ):
     """入库队列：列出待处理任务（最新 limit 条，含重试次数与入队时间）。"""
     return await list_pending(limit)
 
 
 @app.get("/api/ingest/inflight")
-async def ingest_inflight_list(user: User = Depends(get_current_user)):
+async def ingest_inflight_list(admin: User = Depends(require_admin)):
     """入库队列：列出正在入库的文件。"""
     return await list_inflight()
 
@@ -791,7 +934,7 @@ async def ingest_inflight_list(user: User = Depends(get_current_user)):
 @app.get("/api/ingest/dead")
 async def ingest_dead_list(
     limit: int = Query(100, ge=1, le=500),
-    user: User = Depends(get_current_user),
+    admin: User = Depends(require_admin),
 ):
     """入库队列：列出失败（死信）任务（含失败原因）。"""
     return await list_dead(limit)
@@ -818,7 +961,6 @@ async def ingest_dead_clear(admin: User = Depends(require_admin)):
     return await clear_dead()
 
 
-# ══ 问答 / 检索（所有登录用户）══
 # ══ 问答 / 检索（所有登录用户）══
 @app.get("/api/chat/sessions", response_model=List[ChatSessionOut])
 async def chat_sessions(user: User = Depends(get_current_user)):
@@ -914,12 +1056,37 @@ async def _resolve_chat_scope(body: ChatIn, user: User) -> dict:
     return scope
 
 
+async def _persist_chat_round(
+    user_id: int,
+    session_id: str,
+    content: str,
+    answer: str,
+    intent: Optional[str],
+    scope: dict,
+) -> None:
+    """一轮成功对话后写会话历史并失效相关缓存（失败不影响已返回的回答）。"""
+    try:
+        await upsert_chat_session(
+            user_id, session_id, content, answer, intent, **scope,
+        )
+    except Exception as e:
+        logger.warning("[chat] 会话历史落库失败（不影响回答）：%s", e)
+    # 会话内容/摘要变化：失效该会话的列表与详情缓存
+    await invalidate_session_list(user_id)
+    await invalidate_session_detail(user_id, session_id)
+
+
 @app.post("/api/chat", response_model=ChatOut)
 async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
     """知识库问答。thread_id 按用户隔离：{user_id}:{session_id}，同一 session 保持多轮记忆。
 
     检索范围：首问（新会话）用请求参数并落库锁定；后续轮次以库中为准。
     """
+    if not await allow_request(f"chat:{user.id}", CHAT_MAX_REQUESTS_PER_MINUTE):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "提问太频繁，请稍后再试",
+        )
     scope = await _resolve_chat_scope(body, user)
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
@@ -931,22 +1098,21 @@ async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
             load_history=body.session_id is not None,
             **scope,
         )
-    except Exception as e:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"问答服务异常：{e}")
+    except Exception:
+        logger.exception("[chat] 问答服务异常")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "问答服务暂时不可用，请稍后重试",
+        )
     sources = result.get("sources", [])
     sanitize_source_paths(sources)
-    # 完成一轮对话后写入会话历史（失败不影响回答本身）
-    try:
-        await upsert_chat_session(
-            user.id, session_id, body.content,
-            result["answer"], result.get("intent"),
-            **scope,
+    # 模型不可用等失败轮次不落库：错误文案不进会话历史，
+    # 也与 Agent 记忆一致（该轮 checkpoint 未写入）
+    if not result.get("error"):
+        await _persist_chat_round(
+            user.id, session_id, body.content, result["answer"],
+            result.get("intent"), scope,
         )
-    except Exception as e:
-        logger.warning("[chat] 会话历史落库失败（不影响回答）：%s", e)
-    # 会话内容/摘要变化：失效该会话的列表与详情缓存
-    await invalidate_session_list(user.id)
-    await invalidate_session_detail(user.id, session_id)
     return ChatOut(
         answer=result["answer"],
         intent=result.get("intent", ""),
@@ -964,6 +1130,11 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
     前端用 fetch ReadableStream 消费（SSE POST 不支持 EventSource），
     禁用缓冲保证逐段即时到达。流结束后把整轮对话落库（会话历史）。
     """
+    if not await allow_request(f"chat:{user.id}", CHAT_MAX_REQUESTS_PER_MINUTE):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "提问太频繁，请稍后再试",
+        )
     scope = await _resolve_chat_scope(body, user)
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
@@ -975,36 +1146,26 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
 
     async def _stream_with_persist():
         final_answer = None
-        final_sources = []
         final_intent = None
+        stream_failed = False
         async for event in gen:
             if event.get("sources"):
                 sanitize_source_paths(event["sources"])
             etype = event.get("type")
             if etype == "meta":
-                final_sources = event.get("sources") or []
                 final_intent = event.get("intent")
             elif etype in ("answer", "done") and event.get("answer"):
                 final_answer = event["answer"]
-                final_sources = event.get("sources") or final_sources
-                final_intent = event.get("intent") or final_intent
             elif etype == "error":
-                final_answer = event.get("message") or "回答失败，请重试。"
-                final_sources = []
+                # 失败轮次不落库：错误文案不进会话历史，也与未写入的 Agent 记忆一致
+                stream_failed = True
+                final_answer = None
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-        # 流结束：有产出即落库（失败不影响已推送的回答）
-        if final_answer is not None:
-            try:
-                await upsert_chat_session(
-                    user.id, session_id, body.content,
-                    final_answer, final_intent,
-                    **scope,
-                )
-            except Exception as e:
-                logger.warning("[chat] 会话历史落库失败（不影响回答）：%s", e)
-            # 会话内容/摘要变化：失效该会话的列表与详情缓存
-            await invalidate_session_list(user.id)
-            await invalidate_session_detail(user.id, session_id)
+        # 流结束：仅成功轮次落库（error 事件已在上方标记）
+        if final_answer is not None and not stream_failed:
+            await _persist_chat_round(
+                user.id, session_id, body.content, final_answer, final_intent, scope,
+            )
 
     return StreamingResponse(
         _stream_with_persist(),
@@ -1019,9 +1180,18 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
 @app.post("/api/search")
 async def search_api(body: SearchIn, user: User = Depends(get_current_user)):
     """语义检索（双路召回 + rerank 精排），仅返回当前用户可见的文档（自己的 + 共享的）。"""
+    if not await allow_request(f"search:{user.id}", SEARCH_MAX_REQUESTS_PER_MINUTE):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "检索太频繁，请稍后再试",
+        )
     try:
         hits = await search_documents(body.query, k=body.k, source=body.source, user_id=user.id)
-    except Exception as e:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"检索服务异常：{e}")
+    except Exception:
+        logger.exception("[search] 检索服务异常")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "检索服务暂时不可用，请稍后重试",
+        )
     sanitize_source_paths(hits)
     return {"query": body.query, "hits": hits}

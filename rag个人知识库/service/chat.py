@@ -197,13 +197,14 @@ async def chat(
                 thread_id,
             )
         except Exception as exc:
+            logger.exception("[chat] 闲聊模型调用失败")
             return {
                 "answer": _friendly_model_error(exc),
                 "intent": analysis.intent,
                 "query": None,
                 "sources": [],
                 "hits": [],
-                "error": str(exc),
+                "error": "model_unavailable",
             }
         return {
             "answer": answer,
@@ -333,13 +334,14 @@ async def chat(
             )
             await cache_index_sources(ans_key, [hit.get("source") for hit in all_hits])
         except Exception as exc:
+            logger.exception("[chat] 问答模型调用失败")
             return {
                 "answer": _friendly_model_error(exc),
                 "intent": analysis.intent,
                 "query": query,
                 "sources": sources,
                 "hits": all_hits,
-                "error": str(exc),
+                "error": "model_unavailable",
             }
 
     return {
@@ -472,9 +474,14 @@ async def chat_stream(
                         "content": hit.get("content"),
                     })
                     index += 1
-    except Exception as exc:
-        # 检索失败（如 Milvus 不可用）：发 error 事件而非直接断流，前端可提示重试
-        yield {"type": "error", "session_id": session_id, "message": f"检索服务异常：{exc}"}
+    except Exception:
+        # 检索失败（如 Milvus 不可用）：发固定提示，详细异常只写服务端日志。
+        logger.exception("[chat] 流式检索失败")
+        yield {
+            "type": "error",
+            "session_id": session_id,
+            "message": "检索服务暂时不可用，请稍后重试",
+        }
         return
 
     # meta 事件回传 session_id：前端据此维持多轮会话（服务端生成的 id 必须返回）
@@ -507,6 +514,7 @@ async def chat_stream(
             parts.append(token)
             yield {"type": "token", "text": token}
     except Exception as exc:
+        logger.exception("[chat] 流式模型调用失败")
         yield {"type": "error", "message": _friendly_model_error(exc)}
         return
     answer = "".join(parts)

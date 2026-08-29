@@ -103,16 +103,17 @@ CREATE TABLE `chat_sessions` (
     `title` VARCHAR(128) NOT NULL DEFAULT '新会话' COMMENT '会话标题（首问自动生成，可重命名）',
     `message_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '消息条数（user+assistant 都算）',
     `last_message_preview` VARCHAR(256) NOT NULL DEFAULT '' COMMENT '最后一条用户消息摘要（侧边栏展示，过长截断）',
-    `last_message_at` DATETIME NULL COMMENT '最后一条消息时间（侧边栏按此倒序 / TTL 清理依据）',
+    `last_message_at` DATETIME NULL COMMENT '最后一条消息时间（侧边栏按此倒序）',
     `retrieve_own_private` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索自己的私有文档',
     `retrieve_own_public` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索自己的公开文档',
     `retrieve_kb_public` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否检索知识库里的公开文档(所有他人)',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '会话最后活跃/更新时间（TTL 清理依据）',
 
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_chat_sessions_user_session` (`user_id`, `session_id`) COMMENT '用户内会话唯一',
     KEY `idx_chat_sessions_last_message` (`user_id`, `last_message_at`) COMMENT '按用户+最近消息排序',
+    KEY `idx_chat_sessions_updated_at` (`updated_at`) COMMENT 'TTL 清理按最后活跃时间扫描',
     CONSTRAINT `fk_chat_sessions_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='问答历史会话（会话元信息，完整消息在 Postgres）';
 
@@ -162,4 +163,5 @@ CREATE TABLE `chat_session_scope_users` (
 --                 REFERENCES `users` (`id`) ON DELETE CASCADE
 --         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 --      3) DROP TABLE IF EXISTS `chat_messages`;  -- 旧方案遗留的消息表已废弃（完整消息改由 Postgres 持有）
+--      4) （可选，清理扫描提速）ALTER TABLE `chat_sessions` ADD KEY `idx_chat_sessions_updated_at` (`updated_at`);
 -- ============================================

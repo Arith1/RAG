@@ -11,9 +11,9 @@
 --   （或 pgAdmin / Docker exec 中执行下面的语句）
 --
 -- 用途：
---   为 checkpoints 表补充 created_at 列（默认 now()）。langgraph 每次写入
---   checkpoint 都会新建一行并自动带上时间，因此 max(created_at) 即该会话线程的
---   "最后一次活跃时间"，TTL 清理以它为基准倒计时（默认 24 小时）。
+--   TTL 清理已改为以 MySQL chat_sessions.updated_at 为基准（见 service/memory_maintenance.py），
+--   checkpoints 不再需要 created_at 列。下面的 ALTER 仅保留用于兼容/排查历史数据：
+--   新环境可跳过；已加列的环境也可安全保留（langgraph 不写该列，仅占一列）。
 
 -- 1. checkpoints 补充 created_at（TTL 清理的时间依据）
 ALTER TABLE checkpoints
