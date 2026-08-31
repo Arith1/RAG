@@ -74,7 +74,7 @@ services:
       retries: 20
 
   milvus:
-    image: milvusdb/milvus:v2.5.4
+    image: milvusdb/milvus:v2.6.20
     container_name: rag-milvus
     command: ["milvus", "run", "standalone"]
     environment:
@@ -98,7 +98,7 @@ services:
       start_period: 30s
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     container_name: rag-redis
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD（强口令）}
@@ -112,7 +112,7 @@ services:
       retries: 20
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: rag-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-rag}
