@@ -11,21 +11,22 @@
 - **文件指纹增量入库**：`identity_hash` 判定同名同源，`file_content_hash` 判定内容变化——skip / insert / update / retry 四态分流，只增量更新差集。
 - **跨库一致性**：MySQL 先落期望状态（`pending`）→ Milvus 幂等同步 → `in_sync`/`failed` 状态机；失败重试按 source 重建，可清理孤儿向量。
 - **结构感知切分**：Markdown 标题分节、**表格/公式/问答对原子保护**（占位符 + 还原长度分组）、超长表格自动拆子表并重复表头、图片路径入 metadata。
-- **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤；**检索结果 / embedding / 回答三层 Redis 缓存**（相同问题秒回、省 API 调用）。
+- **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤（二者互斥，可叠加 `file_ids` 可见性过滤，并可独立调 `fetch_k` 放大召回宽度）；**检索结果 / embedding / 回答三层 Redis 缓存**（相同问题秒回、省 API 调用）。
 - **Agent 问答**：意图识别（规则层 + LLM 查询重构，多轮指代补全）→ 检索 → DeepSeek Agent 生成带来源引用回答；对话记忆按用户隔离。
 - **会话记忆**：Postgres 持久化（跨重启/多 worker），TTL 按"最后活跃时间"自动清理，~20 轮对话自动摘要压缩。
 - **可靠入库队列**：Redis Streams（Consumer Group + PEL 崩溃恢复、持久化延迟重试、死信队列、inflight 竞态防护 409）。
 - **可靠删除队列**：账户删除同样走 Redis Streams，按 Milvus → OSS → 本地文件 → MySQL → 缓存清理顺序执行，失败持久化重试，不卡账号。
 - **权限模型**：普通用户可上传/删除自己的文档；管理员可把共享文档取消为私有；下载仅 owner 或共享文档可访问。
 - **多问题问答**：意图识别支持拆分多个子问题，逐个检索后汇总分点回答，并限制最大子问题数。
-- **精准缓存失效**：维护 `src_idx:{source}` 缓存索引，文档取消共享/删除/账户删除时 O(1) 定位清理相关缓存。
+- **精准缓存失效**：维护 `src_idx:{source}` 缓存索引，文档取消共享/删除/账户删除/重新入库时按 source O(1) 定位清理相关检索与回答缓存（入库改为按 source 精准失效，不再全库清空）。
+- **Milvus 连接自愈**：向量库实例连接/执行异常时自动重建单例，检索与写入不会因一次断线而永久失败；写操作不盲目自动重试，避免重复插入。
 - **多人共享知识库**：文档可设为私有/公开，普通用户与管理员都能管理自己的文档；管理员可把他人公开文档设为私有（审核）；知识库页支持搜索、按最近更新/最近上传/下载量/chunk 数排序与下载。
 - **会话检索范围**：新建会话时可选 4 个检索范围（自己的私有 / 自己的公开 / 知识库公开 / 指定用户公开），首问后锁定不可更改。
 - **历史会话 + Redis 缓存**：MySQL 存会话列表/摘要、Postgres 存完整消息；登录后后台预热「会话列表 + 最近 10 个会话记录」到 Redis（Cache-Aside + 1h TTL），会话变更精准失效。
 - **高频访问缓存**：鉴权用户行（登出/改密/删号失效）、文档列表、用户搜索均缓存到 Redis，显著减少高频接口 DB 查询。
 - **前端定时轮询**：文档管理页每 5s 自动刷新文档列表与入库队列状态（入库中/失败实时可见）。
 - **Web 服务**：FastAPI + JWT 认证 + RBAC + 操作审计 + 登录/注册失败限流 + 路径脱敏。
-- **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索对比实验、52 个 pytest 用例。
+- **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索对比实验、DeepEval 端到端评测（Faithfulness / AnswerRelevancy / 上下文精度召回）、52 个 pytest 用例。
 
 ## 系统架构
 
@@ -103,10 +104,7 @@ cp .env.example .env
 #    Milvus 已开启认证（docker/milvus.yaml，root/Milvus，启动后建议立即改密）
 docker compose up -d --build
 
-# 3. 首次问答后，为 Postgres 对话记忆补充 created_at 列（幂等，TTL 清理的时间依据）
-docker compose exec postgres psql -U rag -d rag-demo -f /init-sql/postgres_memory.sql
-
-# 4. 访问
+# 3. 访问
 #    问答页  http://localhost:8010/chat      Swagger: http://localhost:8010/docs
 ```
 
@@ -160,9 +158,7 @@ cp .env.example .env   # 填写各密钥（见下表）
 mysql -uroot -p -e "CREATE DATABASE rag_demo CHARACTER SET utf8mb4;"
 mysql -uroot -p rag_demo < rag个人知识库/models/vector.sql
 
-# 2. Postgres 对话记忆：langgraph 首次使用自动建 checkpoint 表；
-#    再执行一次补充 created_at 列（TTL 清理的时间依据，幂等）
-psql -U root -d rag-demo -f rag个人知识库/models/postgres_memory.sql
+# 2. Postgres 对话记忆：langgraph 首次使用时自动创建 checkpoint 表，无需手动建表
 ```
 
 > 表结构采用**手动 SQL 管理**（`models/*.sql`），代码不做任何 DDL，改表后需同步 SQL 文件并手动执行。
@@ -241,6 +237,13 @@ curl -X POST http://localhost:8010/api/documents/upload \
 1. **阶段一（MySQL）**：把期望状态落库并提交（`sync_status=pending`）。失败即回滚，Milvus 完全未动，不产生孤儿向量。
 2. **阶段二（Milvus）**：按确定性 ID 幂等同步（先删后插）。成功置 `in_sync`；失败置 `failed + last_error`，重跑自动恢复。
 
+### 检索过滤、召回与容错
+
+- **过滤条件**：`source`（按来源，便捷）与 `expr`（原生 Milvus 表达式）**互斥**，同时传入直接抛 `ValueError` 避免歧义；二者均可与 `file_ids`（可见性文件 id 集合）叠加，`file_ids` 作为最外层用 `and` 组合。
+- **召回宽度**：`search()` 支持独立 `fetch_k` 参数（默认等于 `k`），放大后让 RRF 在更宽的候选中融合再交给 reranker 精排；精排入口 `_search_with_rerank_metrics` 默认以 `recall_k=20` 召回（可用 `RAG_RECALL_K` 调整）。
+- **精排保底填充（fill-to-k）**：rerank 后先取达标（≥ `RERANK_SCORE_THRESHOLD`）候选；若不足 `k`，用未达标中分数最高者补齐到 `k`（标记 `rerank_low_score`），避免小知识库 + 阈值一刀切把真正的答案 chunk 误杀导致返回数远小于 `k`（实测由 2~5 条补满）。
+- **断线自愈**：所有 Milvus 操作统一经 `_milvus_op` 包装，异常时自动丢弃单例缓存、下次调用重建连接；写操作不自动重试，避免重复写入。
+
 ### 入库任务队列（Redis Streams）
 
 ```
@@ -279,6 +282,15 @@ curl -X POST http://localhost:8010/api/documents/upload \
 # 检索评测（golden 集 25 题 → hit@k + 精排分）
 python -m evaluation.run_evaluation
 
+# DeepEval 端到端评测（检索 + Agent 生成 + LLM 评判）
+#   依赖 deepeval（uv sync --dev 已含）+ 可联网访问 embedding/Agent/judge
+#   Judge 默认复用 DashScope 配置（也可用 JUDGE_BASE_URL/JUDGE_API_KEY/JUDGE_MODEL 覆盖）
+python -m evaluation.evaluate_rag_deepeval                      # 端到端：Faithfulness / AnswerRelevancy 等
+python -m evaluation.evaluate_rag_deepeval --mode retrieval     # 仅检索：top-1 片段代理，只跑 AnswerRelevancy
+python -m evaluation.evaluate_rag_deepeval --limit 3            # 冒烟：只跑前 3 题
+# 可调项：--concurrency（judge 并发，默认 2，防限流）/ --throttle（请求间隔）/ --threshold
+# 网络慢导致 judge 超时时：DEEPEVAL_JUDGE_TIMEOUT=120 python -m ...
+
 # 分层检索对比实验（普通块 vs 子→父）
 python -m evaluation.experiment_parent_child
 
@@ -286,7 +298,9 @@ python -m evaluation.experiment_parent_child
 python -m pytest tests/
 ```
 
-当前基线：**hit@1 = 80% / hit@3 = 100% / hit@5 = 100%**，平均精排分 0.89（`evaluation/report.json`）。
+- 检索基线：**hit@1 = 80% / hit@3 = 100% / hit@5 = 100%**，平均精排分 0.89（`evaluation/report.json`）。
+- DeepEval 报告：`evaluation/deepeval_report.json`（生成侧质量，与检索 hit@k 互补）。
+- 说明：已适配 deepeval 4.x（judge 经 metric 的 `model=` 传入 OpenAIModel 指向 OpenAI 兼容端点）；仅检索模式下 `Faithfulness` 因 top-1 即上下文而恒为 1.0（代理值），`AnswerRelevancy` 是有效信号；golden 每题补 `expected_answer` 后还会启用 ContextualPrecision / ContextualRecall。
 
 ## API 一览
 
@@ -311,7 +325,7 @@ python -m pytest tests/
 | GET | `/api/chat/sessions/{id}` | 登录 | 单会话完整记录（Postgres 消息 + Redis 缓存） |
 | PATCH | `/api/chat/sessions/{id}` | 登录 | 重命名会话 |
 | DELETE | `/api/chat/sessions/{id}` | 登录 | 删除会话（同步清 Postgres 记忆） |
-| POST | `/api/search` | 登录 | 语义检索 |
+| POST | `/api/search` | 登录 | 语义检索（双路召回 + 精排，支持 `source` 过滤） |
 | GET | `/api/ingest/stats` | 登录 | 入库队列状态 |
 | GET | `/api/ingest/queue` | 登录 | 入库队列：待处理任务 |
 | GET | `/api/ingest/inflight` | 登录 | 入库队列：正在入库 |
@@ -334,13 +348,13 @@ rag_project/
 │  │                        # delete_queue(账户删除队列) / memory_maintenance(TTL清理)
 │  ├─ loader/               # 文档加载（docx/pdf/md/txt，复杂度评估 + MinerU 分流）
 │  ├─ spliter/              # 结构感知切分（标题分节 + 原子块保护）
-│  ├─ vector_store/         # Milvus 存取 + 双路召回 + rerank
+│  ├─ vector_store/         # Milvus 存取 + 双路召回 + rerank（断线自愈）
 │  ├─ crud/                 # MySQL 数据访问
-│  ├─ models/               # SQLAlchemy 模型 + 建表 SQL（vector.sql / postgres_memory.sql）
+│  ├─ models/               # SQLAlchemy 模型 + 建表 SQL（vector.sql）
 │  ├─ config/               # db_config(MySQL) / redis(Redis)
 │  └─ utils/                # 指纹哈希 / sanitize(路径脱敏)
 ├─ rag_frontend/            # Vue 3 前端（问答/知识库/文档管理/个人详情/登录注册）
-├─ evaluation/              # golden 评测集 + 评测/实验脚本 + 报告
+├─ evaluation/              # golden 评测集 + 检索评测 + DeepEval 端到端评测 + 报告
 ├─ tests/                   # pytest 单元测试（52 用例）
 └─ .env.example             # 环境变量模板
 ```

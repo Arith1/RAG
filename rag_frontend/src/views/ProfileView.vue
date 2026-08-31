@@ -233,7 +233,7 @@ async function changePwd() {
 async function requestDeleteAccount() {
   const ok = await feedback.confirm({
     message: '确认删除账号？',
-    detail: '删除后你的全部文档与向量将被清理，账号将无法登录，且此操作不可撤销。',
+    detail: '账号将被标记为已删除，无法再登录；文档与计费记录均保留，此操作不可撤销。',
     confirmText: '确认删除',
     danger: true,
   })
@@ -790,4 +790,3 @@ onMounted(loadProfile)
   .kb-source { max-width: 100%; }
 }
 </style>
-

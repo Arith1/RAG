@@ -13,6 +13,7 @@
 """
 import asyncio
 import logging
+import time
 from typing import List, Optional
 
 import openai
@@ -28,6 +29,13 @@ from rag个人知识库.agent.intent import analyze
 from rag个人知识库.config.db_config import async_session
 from rag个人知识库.config.redis import cache_get, cache_index_sources, cache_key, cache_set
 from rag个人知识库.crud.vector import select_visible_file_ids
+from rag个人知识库.service.billing import billing_stage
+from rag个人知识库.service.obs import (
+    trace_fail,
+    trace_set_generation,
+    trace_set_intent,
+    trace_set_retrieval,
+)
 from rag个人知识库.service.service import search_documents
 from rag个人知识库.vector_store.milvus_store import ANSWER_CACHE_TTL
 
@@ -186,18 +194,25 @@ async def chat(
     # 第一步：意图识别 + 查询提炼（结合最近对话补全指代；读取失败则退化为无历史）
     # 新会话（load_history=False）没有 checkpoint，跳过历史读取省一次 Postgres 往返
     history = await asyncio.to_thread(load_recent_history, thread_id) if load_history else None
+    intent_t0 = time.monotonic()
     analysis = await asyncio.to_thread(analyze, content, history)
+    intent_ms = int((time.monotonic() - intent_t0) * 1000)
+    trace_set_intent(analysis.intent, analysis.query or content, intent_ms)
 
     # 闲聊：只进入 LLM 对话，不做检索
     if analysis.intent == "chat":
         try:
-            answer = await asyncio.to_thread(
-                ask,
-                [HumanMessage(content=content)],
-                thread_id,
-            )
+            gen_t0 = time.monotonic()
+            with billing_stage("chat"):
+                answer = await asyncio.to_thread(
+                    ask,
+                    [HumanMessage(content=content)],
+                    thread_id,
+                )
+            trace_set_generation(len(answer), int((time.monotonic() - gen_t0) * 1000))
         except Exception as exc:
             logger.exception("[chat] 闲聊模型调用失败")
+            trace_fail("model_unavailable", _friendly_model_error(exc))
             return {
                 "answer": _friendly_model_error(exc),
                 "intent": analysis.intent,
@@ -218,6 +233,7 @@ async def chat(
     if analysis.intent == "other":
         answer = "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。"
         await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        trace_set_generation(len(answer), 0)
         return {
             "answer": answer,
             "intent": analysis.intent,
@@ -237,6 +253,7 @@ async def chat(
                 retrieve_kb_public=retrieve_kb_public,
                 retrieve_owner_ids=retrieve_owner_ids,
             )
+    has_scope = bool(file_ids) if user_id is not None else True
 
     # 问答环节：先把用户输入规范成可检索子问题列表
     questions = [q.strip() for q in (analysis.questions or []) if q.strip()]
@@ -249,13 +266,17 @@ async def chat(
 
     if len(questions) == 1:
         single_q = questions[0]
-        hits = await search_documents(
+        retr_t0 = time.monotonic()
+        hits, retr_metrics = await search_documents(
             single_q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
             retrieve_own_private=retrieve_own_private,
             retrieve_own_public=retrieve_own_public,
             retrieve_kb_public=retrieve_kb_public,
             retrieve_owner_ids=retrieve_owner_ids,
+            return_metrics=True,
         )
+        retrieval_ms = int((time.monotonic() - retr_t0) * 1000)
+        retr_metrics_list = [retr_metrics]
         all_hits = hits
         hits_by_question = [hits]
         user_prompt = _build_user_prompt(single_q, hits)
@@ -270,7 +291,8 @@ async def chat(
         ]
     else:
         # 多问题并行检索，减少整体响应时间
-        hits_by_question = list(await asyncio.gather(
+        retr_t0 = time.monotonic()
+        gathered = list(await asyncio.gather(
             *(
                 search_documents(
                     q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
@@ -278,10 +300,14 @@ async def chat(
                     retrieve_own_public=retrieve_own_public,
                     retrieve_kb_public=retrieve_kb_public,
                     retrieve_owner_ids=retrieve_owner_ids,
+                    return_metrics=True,
                 )
                 for q in questions
             )
         ))
+        retrieval_ms = int((time.monotonic() - retr_t0) * 1000)
+        hits_by_question = [g[0] for g in gathered]
+        retr_metrics_list = [g[1] for g in gathered]
         all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
         user_prompt = _build_multi_user_prompt(questions, hits_by_question)
         sources = []
@@ -297,9 +323,36 @@ async def chat(
                 })
                 index += 1
 
+    # 检索阶段埋点：聚合各子问题指标 + 记录精简来源列表（不落 content）
+    recall_count = sum(m["recall_count"] for m in retr_metrics_list)
+    rerank_count = sum(m["rerank_count"] for m in retr_metrics_list)
+    rerank_degraded = any(m["rerank_degraded"] for m in retr_metrics_list)
+    cache_hit = any(m["cache_hit"] for m in retr_metrics_list)
+    hit_scores = [h.get("score") for h in all_hits if h.get("score") is not None]
+    rerank_avg_score = round(sum(hit_scores) / len(hit_scores), 4) if hit_scores else None
+    rerank_max_score = round(max(hit_scores), 4) if hit_scores else None
+    compact_sources = [
+        {"source": s.get("source"), "score": s.get("score"), "question": s.get("question")}
+        for s in sources
+        if s.get("source")
+    ]
+    trace_set_intent(analysis.intent, query, intent_ms)
+    trace_set_retrieval(
+        retrieval_ms,
+        cache_hit=cache_hit,
+        has_scope=has_scope,
+        recall_count=recall_count,
+        rerank_count=rerank_count,
+        rerank_avg_score=rerank_avg_score,
+        rerank_max_score=rerank_max_score,
+        rerank_degraded=rerank_degraded,
+        sources=compact_sources,
+    )
+
     if not all_hits:
         answer = "知识库中未找到相关资料，请换个问法，或确认文档已入库。"
         await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        trace_set_generation(len(answer), 0)
         return {
             "answer": answer,
             "intent": analysis.intent,
@@ -316,14 +369,18 @@ async def chat(
     if cached_answer is not None:
         answer = cached_answer.get("answer") if isinstance(cached_answer, dict) else cached_answer
         # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
+        trace_set_generation(len(answer), 0)
         await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
     else:
         try:
-            answer = await asyncio.to_thread(
-                ask,
-                [HumanMessage(content=user_prompt)],
-                thread_id,
-            )
+            gen_t0 = time.monotonic()
+            with billing_stage("answer"):
+                answer = await asyncio.to_thread(
+                    ask,
+                    [HumanMessage(content=user_prompt)],
+                    thread_id,
+                )
+            trace_set_generation(len(answer), int((time.monotonic() - gen_t0) * 1000))
             await cache_set(
                 ans_key,
                 {
@@ -335,6 +392,7 @@ async def chat(
             await cache_index_sources(ans_key, [hit.get("source") for hit in all_hits])
         except Exception as exc:
             logger.exception("[chat] 问答模型调用失败")
+            trace_fail("model_unavailable", _friendly_model_error(exc))
             return {
                 "answer": _friendly_model_error(exc),
                 "intent": analysis.intent,
@@ -382,17 +440,24 @@ async def chat_stream(
     """
     # 新会话（load_history=False）没有 checkpoint，跳过历史读取省一次 Postgres 往返
     history = await asyncio.to_thread(load_recent_history, thread_id) if load_history else None
+    intent_t0 = time.monotonic()
     analysis = await asyncio.to_thread(analyze, content, history)
+    intent_ms = int((time.monotonic() - intent_t0) * 1000)
+    trace_set_intent(analysis.intent, analysis.query or content, intent_ms)
 
     # 闲聊：不走检索，直接完整回答
     if analysis.intent == "chat":
         try:
-            answer = await asyncio.to_thread(
-                ask, [HumanMessage(content=content)], thread_id
-            )
+            gen_t0 = time.monotonic()
+            with billing_stage("chat"):
+                answer = await asyncio.to_thread(
+                    ask, [HumanMessage(content=content)], thread_id
+                )
+            trace_set_generation(len(answer), int((time.monotonic() - gen_t0) * 1000))
         except Exception as exc:
             # 与 chat() 的闲聊分支保持一致：模型调用异常转成 error 事件，
             # 前端可展示友好提示，而不是收到裸 500
+            trace_fail("model_unavailable", _friendly_model_error(exc))
             yield {"type": "error", "session_id": session_id,
                    "message": _friendly_model_error(exc)}
             return
@@ -403,6 +468,7 @@ async def chat_stream(
     if analysis.intent == "other":
         answer = "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。"
         await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        trace_set_generation(len(answer), 0)
         yield {"type": "answer", "session_id": session_id, "intent": "other", "query": None,
                "answer": answer,
                "sources": []}
@@ -419,6 +485,7 @@ async def chat_stream(
                 retrieve_kb_public=retrieve_kb_public,
                 retrieve_owner_ids=retrieve_owner_ids,
             )
+    has_scope = bool(file_ids) if user_id is not None else True
 
     questions = [q.strip() for q in (analysis.questions or []) if q.strip()]
     if not questions:
@@ -431,13 +498,17 @@ async def chat_stream(
     try:
         if len(questions) == 1:
             single_q = questions[0]
-            hits = await search_documents(
+            retr_t0 = time.monotonic()
+            hits, retr_metrics = await search_documents(
                 single_q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
                 retrieve_own_private=retrieve_own_private,
                 retrieve_own_public=retrieve_own_public,
                 retrieve_kb_public=retrieve_kb_public,
                 retrieve_owner_ids=retrieve_owner_ids,
+                return_metrics=True,
             )
+            retrieval_ms = int((time.monotonic() - retr_t0) * 1000)
+            retr_metrics_list = [retr_metrics]
             all_hits = hits
             hits_by_question = [hits]
             user_prompt = _build_user_prompt(single_q, hits)
@@ -445,10 +516,11 @@ async def chat_stream(
                 {"index": index, "source": hit.get("source"),
                  "score": hit.get("score"), "content": hit.get("content")}
                 for index, hit in enumerate(all_hits, start=1)
-            ]
+                ]
         else:
             # 多问题并行检索，减少整体响应时间
-            hits_by_question = list(await asyncio.gather(
+            retr_t0 = time.monotonic()
+            gathered = list(await asyncio.gather(
                 *(
                     search_documents(
                         q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
@@ -456,10 +528,14 @@ async def chat_stream(
                         retrieve_own_public=retrieve_own_public,
                         retrieve_kb_public=retrieve_kb_public,
                         retrieve_owner_ids=retrieve_owner_ids,
+                        return_metrics=True,
                     )
                     for q in questions
                 )
             ))
+            retrieval_ms = int((time.monotonic() - retr_t0) * 1000)
+            hits_by_question = [g[0] for g in gathered]
+            retr_metrics_list = [g[1] for g in gathered]
             all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
             user_prompt = _build_multi_user_prompt(questions, hits_by_question)
             sources = []
@@ -477,12 +553,39 @@ async def chat_stream(
     except Exception:
         # 检索失败（如 Milvus 不可用）：发固定提示，详细异常只写服务端日志。
         logger.exception("[chat] 流式检索失败")
+        trace_fail("retrieval_error", "检索服务暂时不可用")
         yield {
             "type": "error",
             "session_id": session_id,
             "message": "检索服务暂时不可用，请稍后重试",
         }
         return
+
+    # 检索阶段埋点：聚合各子问题指标 + 记录精简来源列表（不落 content）
+    recall_count = sum(m["recall_count"] for m in retr_metrics_list)
+    rerank_count = sum(m["rerank_count"] for m in retr_metrics_list)
+    rerank_degraded = any(m["rerank_degraded"] for m in retr_metrics_list)
+    cache_hit = any(m["cache_hit"] for m in retr_metrics_list)
+    hit_scores = [h.get("score") for h in all_hits if h.get("score") is not None]
+    rerank_avg_score = round(sum(hit_scores) / len(hit_scores), 4) if hit_scores else None
+    rerank_max_score = round(max(hit_scores), 4) if hit_scores else None
+    compact_sources = [
+        {"source": s.get("source"), "score": s.get("score"), "question": s.get("question")}
+        for s in sources
+        if s.get("source")
+    ]
+    trace_set_intent(analysis.intent, query, intent_ms)
+    trace_set_retrieval(
+        retrieval_ms,
+        cache_hit=cache_hit,
+        has_scope=has_scope,
+        recall_count=recall_count,
+        rerank_count=rerank_count,
+        rerank_avg_score=rerank_avg_score,
+        rerank_max_score=rerank_max_score,
+        rerank_degraded=rerank_degraded,
+        sources=compact_sources,
+    )
 
     # meta 事件回传 session_id：前端据此维持多轮会话（服务端生成的 id 必须返回）
     yield {"type": "meta", "session_id": session_id, "intent": analysis.intent,
@@ -491,6 +594,7 @@ async def chat_stream(
     if not all_hits:
         answer = "知识库中未找到相关资料，请换个问法，或确认文档已入库。"
         await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        trace_set_generation(len(answer), 0)
         yield {"type": "answer", "intent": analysis.intent, "query": query,
                "answer": answer,
                "sources": []}
@@ -504,20 +608,25 @@ async def chat_stream(
         cached_answer = cached.get("answer") if isinstance(cached, dict) else cached
         # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
         await asyncio.to_thread(append_thread_exchange, thread_id, content, cached_answer)
+        trace_set_generation(len(cached_answer), 0)
         yield {"type": "token", "text": cached_answer}
         yield {"type": "done", "answer": cached_answer}
         return
 
     parts: List[str] = []
     try:
-        async for token in astream([HumanMessage(content=user_prompt)], thread_id):
-            parts.append(token)
-            yield {"type": "token", "text": token}
+        gen_t0 = time.monotonic()
+        with billing_stage("answer"):
+            async for token in astream([HumanMessage(content=user_prompt)], thread_id):
+                parts.append(token)
+                yield {"type": "token", "text": token}
     except Exception as exc:
         logger.exception("[chat] 流式模型调用失败")
+        trace_fail("model_unavailable", _friendly_model_error(exc))
         yield {"type": "error", "message": _friendly_model_error(exc)}
         return
     answer = "".join(parts)
+    trace_set_generation(len(answer), int((time.monotonic() - gen_t0) * 1000))
     await cache_set(
         ans_key,
         {

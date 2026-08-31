@@ -48,10 +48,29 @@ def _require_env(name: str) -> str:
     return value
 
 
+_env_cache: dict = {}
+
+
+def _require_env_cached(name: str) -> str:
+    """读取必需环境变量并缓存结果（rerank 热路径免重复 os.getenv）"""
+    if name not in _env_cache:
+        _env_cache[name] = _require_env(name)
+    return _env_cache[name]
+
+
 # 缓存 TTL（秒）：embedding 7 天 / 检索结果 10 分钟 / 回答 1 小时（可用环境变量覆盖）
 EMBEDDING_CACHE_TTL = int(os.getenv("EMBEDDING_CACHE_TTL", str(7 * 24 * 3600)))
 SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "600"))
 ANSWER_CACHE_TTL = int(os.getenv("ANSWER_CACHE_TTL", "3600"))
+
+
+# 精排前召回候选数（默认 20，可用环境变量 RAG_RECALL_K 调整）：越大 reranker 候选池越宽，
+# 但 rerank 延迟/token 随候选数线性增长。低分根因是阈值过滤误杀，见 _search_with_rerank_metrics 保底填充。
+DEFAULT_RECALL_K = int(os.getenv("RAG_RECALL_K", "20"))
+
+# fill-to-k 补进来的候补分数下限：低于此分即使达标数不足也不补（避免纯噪声混入）。
+# 可用环境变量 RAG_FILL_FLOOR 调整（0=不设下限）。
+FILL_SCORE_FLOOR = float(os.getenv("RAG_FILL_FLOOR", "0.1"))
 
 
 class CachedEmbeddings(OpenAIEmbeddings):
@@ -95,7 +114,7 @@ def get_embeddings() -> OpenAIEmbeddings:
 
 
 @lru_cache(maxsize=1)
-def get_vector_store() -> Milvus:
+def _build_vector_store() -> Milvus:
     """构造 Milvus 向量库实例（双路：dense 语义 + BM25 稀疏，集合首次写入时自动创建）
 
     进程内单例复用：Milvus 实例初始化时会建立 gRPC 连接并拉取集合 schema，
@@ -124,6 +143,33 @@ def get_vector_store() -> Milvus:
             {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25"},
         ],
     )
+
+
+def get_vector_store() -> Milvus:
+    """获取 Milvus 实例（进程内单例）。
+
+    连接/执行异常由 _invalidate_vector_store() 触发缓存重建，实现断线自愈：
+    不会因为一次连接中断就让整个进程的后续检索/写入永久失败。
+    """
+    return _build_vector_store()
+
+
+def _invalidate_vector_store() -> None:
+    """Milvus 连接/执行异常后丢弃缓存单例，下次调用自动重建。"""
+    _build_vector_store.cache_clear()
+
+
+def _milvus_op(fn, *args, **kwargs):
+    """执行 Milvus 操作；异常时丢弃单例以便下次重建连接，然后向上抛出。
+
+    只做"下次自愈"、不自动重试当前操作：写入类操作（insert/delete）重试可能
+    产生重复数据，保守起见让调用方决定是否重试。
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        _invalidate_vector_store()
+        raise
 
 
 def _normalize_metadata(metadata: dict) -> dict:
@@ -170,15 +216,18 @@ def add_chunks(chunks: List[Document], batch_size: int = 64) -> List[str]:
 
     unique_chunks, ids = _dedup_chunks(chunks)
     vector_store = get_vector_store()
-    # 集合已存在时先删除同 ID 旧数据（首次运行集合尚未创建，col 为 None，直接插入）
+    # 集合已存在时先删除同 ID 旧数据（首次运行集合尚未创建，col 为 None，直接插入）。
+    # 与 delete_chunks_by_ids 一致按 batch_size 分片删除，避免超大文件拼出超长
+    # pk in [...] 表达式被 Milvus 拒绝（同 _FILE_ID_EXPR_CHUNK 的考量）。
     if vector_store.col is not None:
-        vector_store.delete(ids=ids)
+        for start in range(0, len(ids), batch_size):
+            _milvus_op(vector_store.delete, ids=ids[start:start + batch_size])
 
     inserted: List[str] = []
     for start in range(0, len(unique_chunks), batch_size):
         batch = unique_chunks[start:start + batch_size]
         batch_ids = ids[start:start + batch_size]
-        inserted.extend(vector_store.add_documents(batch, ids=batch_ids))
+        inserted.extend(_milvus_op(vector_store.add_documents, batch, ids=batch_ids))
     logger.info("[VectorStore] 成功写入 %d 个 chunk（原始 %d 个，批内去重 %d 个）",
                 len(inserted), len(chunks), len(chunks) - len(unique_chunks))
     return inserted
@@ -194,7 +243,7 @@ def delete_chunks_by_ids(ids: List[str], batch_size: int = 64) -> None:
         logger.info("[VectorStore] 集合尚未创建，无需删除")
         return
     for start in range(0, len(ids), batch_size):
-        vector_store.delete(ids=ids[start:start + batch_size])
+        _milvus_op(vector_store.delete, ids=ids[start:start + batch_size])
     logger.info("[VectorStore] 已删除 %d 个旧 chunk", len(ids))
 
 
@@ -210,10 +259,12 @@ def delete_chunks_by_source(source: str) -> None:
     if vector_store.col is None:
         logger.info("[VectorStore] 集合尚未创建，无需删除")
         return
-    ok = vector_store.delete(expr=_source_expr(source))
+    ok = _milvus_op(vector_store.delete, expr=_source_expr(source))
     if not ok:
         raise RuntimeError(f"按 source 删除 Milvus 向量失败：{source}")
     logger.info("[VectorStore] 已按 source 删除该文件全部向量：%s", source)
+
+
 def _owner_expr(owner_id: int) -> str:
     """构造按用户 id 过滤的 Milvus 表达式：owner_id == 15（账户删除清向量用）"""
     return f"owner_id == {int(owner_id)}"
@@ -225,7 +276,7 @@ def delete_chunks_by_owner(owner_id: int) -> None:
     if vector_store.col is None:
         logger.info("[VectorStore] 集合尚未创建，无需删除")
         return
-    ok = vector_store.delete(expr=_owner_expr(owner_id))
+    ok = _milvus_op(vector_store.delete, expr=_owner_expr(owner_id))
     if not ok:
         raise RuntimeError(f"按 owner_id 删除 Milvus 向量失败：{owner_id}")
     logger.info("[VectorStore] 已按 owner_id 删除该用户全部向量：%s", owner_id)
@@ -267,30 +318,35 @@ def search(
     expr: Optional[str] = None,
     source: Optional[str] = None,
     file_ids: Optional[List[int]] = None,
+    fetch_k: Optional[int] = None,
 ) -> List[Document]:
     """双路召回：dense 语义 + BM25 关键词两路各取候选，RRF 融合后返回 Top k。
 
     expr: 原生 Milvus 过滤表达式（如 'file_name == "a.docx"'）；
     source: 便捷的按来源过滤；file_ids: 按文件 id 集合过滤（可见性控制）。
-    三者同时提供时以 file_ids 为最外层、source/expr 用 and 组合。
+    expr 与 source 互斥：二者都用于限定 Milvus 检索范围，同时传入会引发歧义，
+    直接抛 ValueError（请二选一）；file_ids 可与二者任一叠加，作为最外层用 and 组合。
     """
+    if source is not None and expr:
+        raise ValueError("source 与 expr 互斥，不能同时指定（请二选一）")
     vector_store = get_vector_store()
     parts = []
     if file_ids:
         parts.append(_file_ids_expr(file_ids))
     if source is not None:
         parts.append(_source_expr(source))
-    elif expr:
+    if expr:
         parts.append(expr)
     filter_expr = " and ".join(parts) if parts else None
     kwargs: dict = {
-        # 每路各自预取 k 条再融合（库内默认只预取 4 条，必须显式放大）
-        "fetch_k": k,
+        # 每路各自预取 fetch_k 条再融合（库内默认只预取 4 条，必须显式放大）。
+        # 默认与 k 相同；调用方可单独放大召回宽度（如 rerank 前先召回更多候选）。
+        "fetch_k": fetch_k if fetch_k is not None else k,
         "reranker": _RRF_RANKER,
     }
     if filter_expr:
         kwargs["expr"] = filter_expr
-    return vector_store.similarity_search(query, k=k, **kwargs)
+    return _milvus_op(vector_store.similarity_search, query, k=k, **kwargs)
 
 
 def _rerank(query: str, documents: List[str], top_n: int) -> List[dict]:
@@ -299,8 +355,8 @@ def _rerank(query: str, documents: List[str], top_n: int) -> List[dict]:
         return []
 
     resp = _session.post(
-        f"{_require_env('SILICONFLOW_BASE_URL').rstrip('/')}/rerank",
-        headers={"Authorization": f"Bearer {_require_env('SILICONFLOW_API_KEY')}"},
+        f"{_require_env_cached('SILICONFLOW_BASE_URL').rstrip('/')}/rerank",
+        headers={"Authorization": f"Bearer {_require_env_cached('SILICONFLOW_API_KEY')}"},
         json={
             "model": RERANK_MODEL,
             "query": query,
@@ -316,26 +372,38 @@ def _rerank(query: str, documents: List[str], top_n: int) -> List[dict]:
     return results
 
 
-def search_with_rerank(
+def _empty_retrieval_metrics() -> dict:
+    """检索指标默认值（无召回 / 无法统计时）。"""
+    return {
+        "recall_count": 0,
+        "rerank_count": 0,
+        "rerank_avg_score": None,
+        "rerank_max_score": None,
+        "rerank_degraded": False,
+    }
+
+
+def _search_with_rerank_metrics(
     query: str,
     k: int = 5,
-    recall_k: int = 20,
+    recall_k: int = DEFAULT_RECALL_K,
     score_threshold: float = RERANK_SCORE_THRESHOLD,
     expr: Optional[str] = None,
     source: Optional[str] = None,
     file_ids: Optional[List[int]] = None,
-) -> List[Document]:
-    """
-    双路召回 + 精排：dense/BM25 双路召回 Top recall_k → reranker 精排 → 阈值过滤后取 Top k。
+) -> Tuple[List[Document], dict]:
+    """双路召回 + 精排（含检索指标）：返回 (文档列表, 指标)。
 
     recall_k 需明显大于 k（默认 20 vs 5），给精排留足挑选空间；
     精排分写入 metadata 的 rerank_score，便于下游观察区分度；
     rerank 接口故障时降级返回召回 Top k，不让精排环节成为单点故障。
+    指标供可观测性使用：recall_count / rerank_count / 平均与最高分 / 降级标记。
+    expr 与 source 互斥（同 search）：同时传参会抛 ValueError。
     file_ids: 按文件 id 集合过滤（可见性控制），透传给 search。
     """
     candidates = search(query, k=recall_k, expr=expr, source=source, file_ids=file_ids)
     if not candidates:
-        return []
+        return [], _empty_retrieval_metrics()
 
     try:
         # 对全部召回候选做精排，避免阈值过滤后无法用后续候选补位
@@ -352,9 +420,16 @@ def search_with_rerank(
         for doc in degraded:
             doc.metadata["rerank_score"] = None
             doc.metadata["rerank_degraded"] = True
-        return degraded
+        return degraded, {
+            "recall_count": len(candidates),
+            "rerank_count": len(degraded),
+            "rerank_avg_score": None,
+            "rerank_max_score": None,
+            "rerank_degraded": True,
+        }
 
-    reranked = []
+    # results 已按 relevance_score 降序返回（rerank 接口保证）
+    scored: List[Tuple[float, Document]] = []
     for item in results:
         index = item.get("index")
         score = item.get("relevance_score")
@@ -367,16 +442,79 @@ def search_with_rerank(
             continue
         if not (0 <= index < len(candidates)):
             continue
-        # 低于阈值的候选直接丢弃，避免不相关内容污染下游 prompt
-        if score < score_threshold:
-            continue
         doc = candidates[index]
         doc.metadata["rerank_score"] = round(score, 4)
-        reranked.append(doc)
-    reranked = reranked[:k]
+        scored.append((score, doc))
+
+    # 第一优先：达标项（>= threshold）按分数降序直接入选
+    reranked: List[Document] = []
+    scores: List[float] = []
+    for score, doc in scored:
+        if len(reranked) >= k:
+            break
+        if score >= score_threshold:
+            reranked.append(doc)
+            scores.append(score)
+
+    # 保底填充：达标项不足 k 时，用"未达标但分数最高"的候补补齐到 k。
+    # 背景：小知识库 + 0.3 阈值一刀切会把真正的答案 chunk 误杀，导致最终返回数
+    # 远小于 k（实测常只剩 2~5 条）。补齐后保证答案能进 Top-k，由下游生成侧兜底。
+    if len(reranked) < k:
+        used = {id(d) for d in reranked}
+        for score, doc in scored:
+            if score < FILL_SCORE_FLOOR:
+                # 候选按分数降序：一旦低于下限，后续只会更低，直接结束
+                break
+            if len(reranked) >= k:
+                break
+            if id(doc) in used:
+                continue
+            used.add(id(doc))
+            doc.metadata["rerank_low_score"] = True  # 低于阈值的候补标记
+            reranked.append(doc)
+            scores.append(score)
+
     logger.info("[Rerank] 召回 %d 条，精排后保留 %d 条（阈值 %s）",
                 len(candidates), len(reranked), score_threshold)
-    return reranked
+    return reranked, {
+        "recall_count": len(candidates),
+        "rerank_count": len(reranked),
+        "rerank_avg_score": round(sum(scores) / len(scores), 4) if scores else None,
+        "rerank_max_score": round(max(scores), 4) if scores else None,
+        "rerank_degraded": False,
+    }
+
+
+def search_with_rerank(
+    query: str,
+    k: int = 5,
+    recall_k: int = DEFAULT_RECALL_K,
+    score_threshold: float = RERANK_SCORE_THRESHOLD,
+    expr: Optional[str] = None,
+    source: Optional[str] = None,
+    file_ids: Optional[List[int]] = None,
+) -> List[Document]:
+    """双路召回 + 精排：dense/BM25 双路召回 Top recall_k → reranker 精排 → 阈值过滤后取 Top k。
+    expr 与 source 互斥（同 search）：同时传参会抛 ValueError。
+    """
+    docs, _ = _search_with_rerank_metrics(
+        query, k, recall_k, score_threshold, expr, source, file_ids
+    )
+    return docs
+
+
+def get_collection_row_count() -> Optional[int]:
+    """查询 Milvus 集合当前行数（存储概览用）；连接/集合异常返回 None。"""
+    try:
+        store = get_vector_store()
+        if _milvus_op(store.client.has_collection, store.collection_name):
+            stats = _milvus_op(store.client.get_collection_stats, store.collection_name)
+            row_count = stats.get("row_count")
+            if row_count is not None:
+                return int(row_count)
+    except Exception as e:
+        logger.warning("[milvus] 读取集合行数失败：%s", e)
+    return None
 
 
 # ── 异步包装：把阻塞型同步调用放进线程池执行，避免卡住事件循环（便于将来接入 FastAPI 等服务）──
@@ -393,6 +531,8 @@ async def adelete_chunks_by_ids(ids: List[str], batch_size: int = 64) -> None:
 async def adelete_chunks_by_source(source: str) -> None:
     """delete_chunks_by_source 的异步版本：线程池中执行按 source 删除"""
     await asyncio.to_thread(delete_chunks_by_source, source)
+
+
 async def adelete_chunks_by_owner(owner_id: int) -> None:
     """delete_chunks_by_owner 的异步版本：线程池中执行按 owner_id 删除"""
     await asyncio.to_thread(delete_chunks_by_owner, owner_id)
@@ -401,13 +541,15 @@ async def adelete_chunks_by_owner(owner_id: int) -> None:
 async def asearch_with_rerank(
     query: str,
     k: int = 5,
-    recall_k: int = 20,
+    recall_k: int = DEFAULT_RECALL_K,
     score_threshold: float = RERANK_SCORE_THRESHOLD,
     expr: Optional[str] = None,
     source: Optional[str] = None,
     file_ids: Optional[List[int]] = None,
-) -> List[Document]:
-    """search_with_rerank 的异步版本：线程池中执行召回 + 精排"""
+) -> Tuple[List[Document], dict]:
+    """search_with_rerank 的异步版本（含检索指标）：线程池中执行召回 + 精排。
+    expr 与 source 互斥（同 search）：同时传参会抛 ValueError。
+    """
     return await asyncio.to_thread(
-        search_with_rerank, query, k, recall_k, score_threshold, expr, source, file_ids
+        _search_with_rerank_metrics, query, k, recall_k, score_threshold, expr, source, file_ids
     )

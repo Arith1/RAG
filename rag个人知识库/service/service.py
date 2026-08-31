@@ -7,10 +7,12 @@
 from typing import List, Optional
 
 from rag个人知识库.config.db_config import async_session
-from rag个人知识库.config.redis import cache_clear_prefix, cache_get, cache_index_sources, cache_key, cache_set
+from rag个人知识库.config.redis import cache_clear_prefix, cache_clear_source, cache_get, cache_index_sources, cache_key, cache_set
 from rag个人知识库.crud.vector import count_file_names, select_file_names, select_visible_file_ids
 from rag个人知识库.service.ingest import ingest_files_batched
-from rag个人知识库.vector_store.milvus_store import SEARCH_CACHE_TTL, asearch_with_rerank
+from rag个人知识库.service.oss_archive import rel_source_from_local
+from rag个人知识库.service.obs import record_retrieval_cache
+from rag个人知识库.vector_store.milvus_store import DEFAULT_RECALL_K, SEARCH_CACHE_TTL, asearch_with_rerank
 
 # 数据发生变更（新增/更新/重放）的状态集合：命中任一即需清检索/回答缓存，
 # 避免旧数据在 TTL 内继续被返回；skipped/error 不涉及数据变更，无需清缓存。
@@ -34,9 +36,16 @@ async def ingest_files(
     # 就清一次检索/回答缓存（全批只清一次）。与改造前"每个文件清两次"相比，
     # 批量入库（如队列连续消费 10 个文件）只需失效一次，避免缓存踩踏。
     if any(r.get("status") in _CHANGED_STATUSES for r in results):
-        await cache_clear_prefix("search:")
-        await cache_clear_prefix("ans:")
-        # 文档列表缓存：chunk_count / sync_status 变化影响所有可见者的文档列表
+        # 检索/回答缓存按 source 精细化失效：利用 src_idx:{source} 索引精确定位，
+        # 只清受影响文档相关的缓存，避免全库清空（比 cache_clear_prefix("search:"/"ans:") 高效）。
+        changed_sources = {
+            rel_source_from_local(r["file_path"])
+            for r in results
+            if r.get("status") in _CHANGED_STATUSES and r.get("file_path")
+        }
+        for source in changed_sources:
+            await cache_clear_source(source)
+        # 文档列表缓存按用户维度缓存、未建立 source 索引，仍需整体失效
         await cache_clear_prefix("docs:")
     return results
 
@@ -44,6 +53,7 @@ async def ingest_files(
 async def search_documents(
     query: str,
     k: int = 3,
+    recall_k: Optional[int] = None,  # None=用 DEFAULT_RECALL_K（默认 40）
     source: Optional[str] = None,
     expr: Optional[str] = None,
     user_id: Optional[int] = None,
@@ -52,6 +62,7 @@ async def search_documents(
     retrieve_kb_public: bool = True,
     retrieve_owner_ids: Optional[List[int]] = None,
     file_ids: Optional[List[int]] = None,
+    return_metrics: bool = False,
 ) -> List[dict]:
     """检索：双路召回 Top recall_k → bge-reranker 精排 → 阈值过滤取 Top k。
 
@@ -65,7 +76,23 @@ async def search_documents(
       检索范围四项：自己的私有文档 / 自己的公开文档 / 知识库公开文档（所有他人）/
       指定用户的公开文档（retrieve_owner_ids，多选，服务端强制 is_public=1）。
     user_id 为 None（CLI/评测）不做可见性过滤，行为与旧版一致。
+    return_metrics=True 时返回 (result, metrics)，metrics 供可观测性埋点使用；
+    默认 False 保持返回 List[dict]（/api/search 等调用方不受影响）。
     """
+
+    # source 与 expr 互斥（与 Milvus search 同规则）：提前 fail-fast，
+    # 避免非法组合继续走缓存/MySQL/检索链路，也避免写入错误的缓存 key。
+    if source is not None and expr:
+        raise ValueError("source 与 expr 互斥，不能同时指定（请二选一）")
+    metrics = {
+        "cache_hit": False,
+        "has_scope": True,
+        "recall_count": 0,
+        "rerank_count": 0,
+        "rerank_avg_score": None,
+        "rerank_max_score": None,
+        "rerank_degraded": False,
+    }
     owner_ids_digest = ",".join(
         sorted({str(x) for x in (retrieve_owner_ids or []) if x is not None})
     )
@@ -83,7 +110,11 @@ async def search_documents(
     )
     cached = await cache_get(cache_key_)
     if cached is not None:
-        return cached
+        record_retrieval_cache(True)
+        metrics["cache_hit"] = True
+        # 缓存命中时无法拿到召回数，仅记录最终命中条数
+        metrics["rerank_count"] = len(cached)
+        return (cached, metrics) if return_metrics else cached
 
     # file_ids 可由调用方（chat 编排层）预先计算并复用；未传入时再查 MySQL
     if file_ids is None and user_id is not None:
@@ -98,9 +129,13 @@ async def search_documents(
             )
     if user_id is not None and not file_ids:
         # 当前用户在当前检索范围内无任何可见文档，直接返回空，不发起 Milvus 检索
-        return []
+        record_retrieval_cache(False)
+        metrics["has_scope"] = False
+        return ([], metrics) if return_metrics else []
 
-    hits = await asearch_with_rerank(query, k=k, expr=expr, source=source, file_ids=file_ids)
+    hits, hit_metrics = await asearch_with_rerank(query, k=k, recall_k=recall_k or DEFAULT_RECALL_K, expr=expr, source=source, file_ids=file_ids)
+    record_retrieval_cache(False)
+    metrics.update(hit_metrics)
     result = [
         {
             "content": hit.page_content,
@@ -112,7 +147,7 @@ async def search_documents(
     ]
     await cache_set(cache_key_, result, SEARCH_CACHE_TTL)
     await cache_index_sources(cache_key_, [h.get("source") for h in result])
-    return result
+    return (result, metrics) if return_metrics else result
 
 
 async def list_documents(

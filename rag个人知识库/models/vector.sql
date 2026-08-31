@@ -13,7 +13,7 @@ CREATE TABLE `users` (
     `username` VARCHAR(64) NOT NULL COMMENT '用户名',
     `password_hash` VARCHAR(128) NOT NULL COMMENT 'bcrypt 密码哈希',
     `role` VARCHAR(16) NOT NULL DEFAULT 'user' COMMENT '角色: admin(管理员)/user(普通用户)/guest(访客,暂未开放注册)',
-    `status` VARCHAR(16) NOT NULL DEFAULT 'active' COMMENT '账号状态: active(正常)/deleting(删除处理中)/disabled(禁用)',
+    `status` VARCHAR(16) NOT NULL DEFAULT 'active' COMMENT '账号状态: active(正常)/deleting(删除处理中)/deleted(已删除-软删除，数据保留)/disabled(禁用)',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
@@ -165,3 +165,92 @@ CREATE TABLE `chat_session_scope_users` (
 --      3) DROP TABLE IF EXISTS `chat_messages`;  -- 旧方案遗留的消息表已废弃（完整消息改由 Postgres 持有）
 --      4) （可选，清理扫描提速）ALTER TABLE `chat_sessions` ADD KEY `idx_chat_sessions_updated_at` (`updated_at`);
 -- ============================================
+
+
+-- ============================================
+-- 5. LLM 计费表 (llm_usage) —— 每次 LLM 调用一行
+--    记录意图识别 / 回答 / 摘要等所有 LLM 调用的 token 用量与预估费用。
+--    同一 HTTP 请求的多次调用（intent + answer 等）通过 request_id 归组。
+--    说明：user_id 不设外键，账号软删除（status=deleted）后计费记录仍保留。
+-- ============================================
+CREATE TABLE `llm_usage` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+
+    `user_id` BIGINT UNSIGNED NOT NULL COMMENT '用户id（不设外键，账号软删除后计费记录保留）',
+    `session_id` VARCHAR(64) NULL COMMENT '会话id（非聊天场景可空）',
+
+    `request_id` VARCHAR(64) NOT NULL COMMENT '本次请求id（同一请求的多次 LLM 调用共用）',
+
+    `provider` VARCHAR(32) NOT NULL COMMENT '模型厂商（deepseek/qwen 等）',
+    `model` VARCHAR(128) NOT NULL COMMENT '模型名称',
+
+    `type` VARCHAR(32) NOT NULL COMMENT '调用阶段: intent(意图识别)/answer(RAG回答)/chat(闲聊回答)/summarize(上下文摘要)',
+
+    `input_tokens` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '输入令牌数（API 上报的 prompt_tokens）',
+    `cached_tokens` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '命中缓存输入令牌数（低价计费）',
+    `uncached_tokens` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '未命中缓存输入令牌数（原价计费）',
+    `output_tokens` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '输出令牌数',
+    `total_tokens` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '总令牌数',
+
+    `credits` DECIMAL(18,6) NOT NULL DEFAULT 0 COMMENT '积分（独立体系，暂未启用，默认 0）',
+    `estimated_cost` DECIMAL(18,6) NOT NULL DEFAULT 0 COMMENT '预估费用（元，按 .env 单价估算）',
+
+    `latency_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'LLM 调用耗时（毫秒）',
+
+    `status` VARCHAR(20) NOT NULL DEFAULT 'success' COMMENT '状态: success(成功)/failed(调用失败，费用为0)',
+
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+
+    PRIMARY KEY (`id`),
+    KEY `idx_user_time` (`user_id`, `created_at`),
+    KEY `idx_request_id` (`request_id`),
+    KEY `idx_provider_model` (`provider`, `model`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='LLM 调用计费记录';
+
+-- ============================================
+-- 5.1 迁移说明（已有数据库执行）
+--    新环境执行上面的 CREATE TABLE 已建好 llm_usage；
+--    老库把上方 CREATE TABLE 语句整体执行一次即可（表当前尚未创建）。
+-- ============================================
+
+-- ============================================
+-- 6. RAG 请求链路追踪表 (rag_traces) —— 每次问答请求一行
+--    记录 意图识别 → 检索 → 精排 → 生成 各阶段指标与耗时；
+--    与 llm_usage 共用 request_id，便于关联费用与链路。
+-- ============================================
+CREATE TABLE `rag_traces` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+
+    `request_id` VARCHAR(64) NOT NULL COMMENT '本次请求id（与 llm_usage.request_id 一致）',
+    `user_id` BIGINT UNSIGNED NOT NULL COMMENT '用户id',
+    `session_id` VARCHAR(64) NULL COMMENT '会话id',
+
+    `intent` VARCHAR(32) NULL COMMENT '意图识别结果: rag_ask/chat/other 等',
+    `query` VARCHAR(1024) NULL COMMENT '用户提问/检索文本（便于排查）',
+    `status` VARCHAR(20) NOT NULL DEFAULT 'success' COMMENT '状态: success/failed',
+    `error_type` VARCHAR(64) NULL COMMENT '错误类型',
+    `error_message` VARCHAR(512) NULL COMMENT '错误信息',
+
+    `total_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '端到端耗时(毫秒)',
+    `intent_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '意图识别耗时',
+    `retrieval_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '检索耗时',
+    `retrieval_cache_hit` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '检索缓存是否命中',
+    `retrieval_has_scope` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否有可见文档',
+    `recall_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '双路召回候选数',
+    `rerank_count` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '精排后命中数',
+    `rerank_avg_score` DECIMAL(6,4) NULL COMMENT '精排平均分',
+    `rerank_max_score` DECIMAL(6,4) NULL COMMENT '精排最高分',
+    `rerank_degraded` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '精排是否降级(接口失败)',
+    `generation_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'LLM 生成耗时',
+    `answer_len` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '回答字符数',
+
+    `sources` JSON NULL COMMENT '来源列表 [{source, score}]',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+
+    PRIMARY KEY (`id`),
+    KEY `idx_trace_request` (`request_id`),
+    KEY `idx_trace_user_time` (`user_id`, `created_at`),
+    KEY `idx_trace_status_time` (`status`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='RAG 请求链路追踪';
+
+-- 6.1 迁移说明（已有数据库执行）：把上方 CREATE TABLE 语句整体执行一次即可。

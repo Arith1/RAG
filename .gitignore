@@ -1,25 +1,38 @@
+# ===== 本地密钥与配置（绝不上传）=====
 /.env
+/.env.*
+!/.env.example
+
+# ===== 运行数据（文档上传/解析产物，不上传）=====
 /rag个人知识库/loader/parsed_files/
 /rag个人知识库/resources/
-/.venv/
-/uv.lock
 /rag个人知识库/demo/
 
-# Python 缓存与 IDE
+# ===== Python 环境与缓存 =====
+/.venv/
+/uv.lock
+/.uv-cache/
 __pycache__/
 *.pyc
+.pytest_cache/
+/_test_*_tmp/
 .idea/
 .DS_Store
 
-# 测试产物/缓存（保留 tests/*.py 源码）
-.pytest_cache/
-/_test_*_tmp/
+# ===== 本地开发/构建/审计产物 =====
 /.buildtmp/
 /.impeccable/
 /.agents/
+/.deepeval/
 /DESIGN.md
 /PRODUCT.md
-/.uv-cache/
+node_modules/
+dist/
+
+# ===== 评测/基准/测试报告（保留 tests/*.py 源码）=====
+/evaluation/
+/benchmark/
+/docs/
 
 # 本地开发手记（根目录 .md 为提交备忘，不入库）
 /.md
@@ -29,6 +42,3 @@ __pycache__/
 Thumbs.db
 desktop.ini
 /tests/
-/evaluation/
-/docs/
-/benchmark/

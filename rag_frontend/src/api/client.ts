@@ -264,9 +264,9 @@ export async function changePassword(oldPassword: string, newPassword: string): 
   })
 }
 
-/** 提交账号删除请求（进入删除队列，删除完成后无法登录） */
-export async function deleteAccount(): Promise<{ status: string; queued: boolean; message: string }> {
-  return api<{ status: string; queued: boolean; message: string }>('/api/auth/delete-account', {
+/** 软删除账号：仅标记为已删除，数据与计费记录保留，账号无法登录 */
+export async function deleteAccount(): Promise<{ status: string; message: string }> {
+  return api<{ status: string; message: string }>('/api/auth/delete-account', {
     method: 'POST',
   })
 }
@@ -281,4 +281,219 @@ export interface UserSearchItem {
 /** 按用户名关键字搜索 active 用户（排除自己），最多 limit 条 */
 export async function searchUsers(q: string, limit = 20): Promise<UserSearchItem[]> {
   return api<UserSearchItem[]>(`/api/users/search?q=${encodeURIComponent(q)}&limit=${limit}`)
+}
+
+/** 用量周期：今天 / 近7天 / 近30天 / 全部 */
+export type BillingRange = 'today' | '7d' | '30d' | 'all'
+
+/** 按类型 / 按模型的用量分布桶 */
+export interface BillingBucket {
+  key: string
+  requests: number
+  tokens: number
+  cost: number
+}
+
+export interface BillingDaily {
+  date: string
+  requests: number
+  tokens: number
+  cost: number
+}
+
+/** 当前用户用量汇总（GET /api/billing/summary） */
+export interface BillingSummary {
+  range: BillingRange
+  request_count: number
+  total_requests: number
+  total_cost: number
+  avg_cost: number
+  total_tokens: number
+  input_tokens: number
+  cached_tokens: number
+  uncached_tokens: number
+  output_tokens: number
+  by_type: BillingBucket[]
+  by_model: BillingBucket[]
+  daily: BillingDaily[]
+}
+
+/** 单条 LLM 调用计费记录 */
+export interface UsageRecord {
+  id: number
+  session_id: string | null
+  request_id: string
+  provider: string
+  model: string
+  type: string
+  input_tokens: number
+  cached_tokens: number
+  uncached_tokens: number
+  output_tokens: number
+  total_tokens: number
+  estimated_cost: number
+  latency_ms: number
+  status: string
+  created_at: string | null
+}
+
+export interface UsageList {
+  total: number
+  items: UsageRecord[]
+}
+
+/** 管理员：全站用量汇总（GET /api/admin/billing/overview） */
+export interface AdminBillingOverview {
+  range: BillingRange
+  request_count: number
+  total_requests: number
+  total_cost: number
+  total_tokens: number
+  active_users: number
+  by_type: BillingBucket[]
+  by_model: BillingBucket[]
+  top_users: Array<{ user_id: number; username: string | null; requests: number; tokens: number; cost: number }>
+}
+
+export interface AdminUserUsage {
+  user_id: number
+  username: string | null
+  total_requests: number
+  request_count: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  total_cost: number
+  last_used_at: string | null
+}
+
+export interface AdminUserUsageList {
+  total: number
+  items: AdminUserUsage[]
+}
+
+/** 当前用户用量汇总（周期：today/7d/30d/all） */
+export async function getBillingSummary(range: BillingRange): Promise<BillingSummary> {
+  return api<BillingSummary>(`/api/billing/summary?range=${range}`)
+}
+
+/** 当前用户最近调用明细（分页，可按 type 过滤） */
+export async function getBillingUsage(params: {
+  page: number
+  page_size: number
+  type?: string
+}): Promise<UsageList> {
+  const qs = new URLSearchParams({ page: String(params.page), page_size: String(params.page_size) })
+  if (params.type) qs.set('type', params.type)
+  return api<UsageList>(`/api/billing/usage?${qs}`)
+}
+
+/** 管理员：全站用量汇总 + 费用排行 */
+export async function getAdminBillingOverview(range: BillingRange): Promise<AdminBillingOverview> {
+  return api<AdminBillingOverview>(`/api/admin/billing/overview?range=${range}`)
+}
+
+/** 管理员：按用户聚合用量列表（可按用户名搜索，分页） */
+export async function getAdminBillingUsers(params: {
+  page: number
+  page_size: number
+  q?: string
+}): Promise<AdminUserUsageList> {
+  const qs = new URLSearchParams({ page: String(params.page), page_size: String(params.page_size) })
+  if (params.q) qs.set('q', params.q)
+  return api<AdminUserUsageList>(`/api/admin/billing/users?${qs}`)
+}
+
+/** 监控周期：近1小时 / 近24小时 / 近7天 / 全部 */
+export type ObsRange = '1h' | '24h' | '7d' | 'all'
+
+/** 意图分布桶 */
+export interface ObsIntentBucket {
+  intent: string | null
+  count: number
+}
+
+/** RAG 链路聚合（GET /api/obs/summary） */
+export interface ObsSummary {
+  range: ObsRange
+  requests: number
+  success_rate: number
+  avg_total_ms: number
+  avg_intent_ms: number
+  avg_retrieval_ms: number
+  avg_generation_ms: number
+  zero_hit_rate: number
+  rerank_degraded_rate: number
+  retrieval_cache_hit_rate: number
+  active_users: number
+  intent_distribution: ObsIntentBucket[]
+}
+
+/** 单条 RAG 链路（GET /api/obs/traces） */
+export interface ObsTraceItem {
+  id: number
+  request_id: string
+  user_id: number
+  session_id: string | null
+  intent: string | null
+  query: string | null
+  status: string
+  error_type: string | null
+  error_message: string | null
+  total_ms: number
+  intent_ms: number
+  retrieval_ms: number
+  retrieval_cache_hit: boolean
+  retrieval_has_scope: boolean
+  recall_count: number
+  rerank_count: number
+  rerank_avg_score: number | null
+  rerank_max_score: number | null
+  rerank_degraded: boolean
+  generation_ms: number
+  answer_len: number
+  sources: Array<{ source: string | null; score: number | null; question?: string | null }> | null
+  created_at: string | null
+}
+
+export interface ObsTraceList {
+  total: number
+  items: ObsTraceItem[]
+}
+
+/** 文档同步状态桶 */
+export interface ObsSyncBucket {
+  status: string
+  count: number
+}
+
+/** 存储概览（GET /api/obs/storage，管理员） */
+export interface ObsStorage {
+  documents: { total: number; by_sync_status: ObsSyncBucket[] }
+  milvus: { row_count: number | null; collection: string }
+  cache: { hits: number; total: number; rate: number }
+}
+
+export async function getObsSummary(range: ObsRange): Promise<ObsSummary> {
+  return api<ObsSummary>(`/api/obs/summary?range=${range}`)
+}
+
+export async function listObsTraces(params: {
+  page: number
+  page_size: number
+  status?: string
+  user_id?: number
+}): Promise<ObsTraceList> {
+  const qs = new URLSearchParams({ page: String(params.page), page_size: String(params.page_size) })
+  if (params.status) qs.set('status', params.status)
+  if (params.user_id) qs.set('user_id', String(params.user_id))
+  return api<ObsTraceList>(`/api/obs/traces?${qs}`)
+}
+
+export async function getObsTraceDetail(requestId: string): Promise<ObsTraceItem> {
+  return api<ObsTraceItem>(`/api/obs/traces/${encodeURIComponent(requestId)}`)
+}
+
+export async function getObsStorage(): Promise<ObsStorage> {
+  return api<ObsStorage>('/api/obs/storage')
 }

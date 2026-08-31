@@ -67,8 +67,26 @@ from rag个人知识库.utils.sanitize import (
     sanitize_source_paths,
 )
 from rag个人知识库.service.delete_queue import (
-    enqueue_delete,
     run_worker as run_delete_worker,
+)
+from rag个人知识库.service.billing import (
+    BillingContext,
+    billing_request,
+    flush_usage,
+    get_admin_billing_overview,
+    get_user_billing_summary,
+    list_admin_user_usage,
+    list_user_billing_usage,
+)
+from rag个人知识库.service.obs import (
+    TraceContext,
+    flush_trace,
+    get_storage_overview,
+    get_trace_detail,
+    get_trace_summary,
+    list_traces,
+    trace_fail,
+    trace_request,
 )
 from rag个人知识库.service.document_admin import delete_document, revoke_document_public, share_document_public
 from rag个人知识库.service.ingest_queue import (
@@ -229,6 +247,104 @@ class DocumentListOut(BaseModel):
 
     total: int
     items: List[DocumentOut]
+
+
+class BillingBucketOut(BaseModel):
+    """按类型 / 按模型的用量分布桶。"""
+
+    key: str
+    requests: int
+    tokens: int
+    cost: float
+
+
+class BillingDailyOut(BaseModel):
+    date: str
+    requests: int
+    tokens: int
+    cost: float
+
+
+class BillingSummaryOut(BaseModel):
+    """当前用户用量汇总（请求/调用数、费用、tokens、分布与按天趋势）。"""
+
+    range: str
+    request_count: int
+    total_requests: int
+    total_cost: float
+    avg_cost: float
+    total_tokens: int
+    input_tokens: int
+    cached_tokens: int
+    uncached_tokens: int
+    output_tokens: int
+    by_type: List[BillingBucketOut]
+    by_model: List[BillingBucketOut]
+    daily: List[BillingDailyOut]
+
+
+class UsageRecordOut(BaseModel):
+    """单条 LLM 调用计费记录。"""
+
+    id: int
+    session_id: Optional[str] = None
+    request_id: str
+    provider: str
+    model: str
+    type: str
+    input_tokens: int
+    cached_tokens: int
+    uncached_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated_cost: float
+    latency_ms: int
+    status: str
+    created_at: Optional[datetime] = None
+
+
+class UsageListOut(BaseModel):
+    total: int
+    items: List[UsageRecordOut]
+
+
+class AdminTopUserOut(BaseModel):
+    user_id: int
+    username: Optional[str] = None
+    requests: int
+    tokens: int
+    cost: float
+
+
+class AdminBillingOverviewOut(BaseModel):
+    """管理员：全站用量汇总 + 费用排行。"""
+
+    range: str
+    request_count: int
+    total_requests: int
+    total_cost: float
+    total_tokens: int
+    active_users: int
+    by_type: List[BillingBucketOut]
+    by_model: List[BillingBucketOut]
+    top_users: List[AdminTopUserOut]
+
+
+class AdminUserUsageOut(BaseModel):
+    user_id: int
+    username: Optional[str] = None
+    total_requests: int
+    request_count: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    total_cost: float
+    last_used_at: Optional[datetime] = None
+
+
+class AdminUserUsageListOut(BaseModel):
+    total: int
+    items: List[AdminUserUsageOut]
 
 
 # ── 生命周期：建表（幂等）+ 种子管理员 + 对话记忆清理后台任务 ──
@@ -526,19 +642,16 @@ async def logout(user: User = Depends(get_current_user)):
     return {"status": "logged_out", "user_id": user.id}
 
 
-@app.post("/api/auth/delete-account", status_code=status.HTTP_202_ACCEPTED)
+@app.post("/api/auth/delete-account", status_code=status.HTTP_200_OK)
 async def delete_account(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """提交账户删除请求。
+    """软删除账号：仅把 status 置为 deleted，不真正删除任何数据。
 
-    处理顺序：
-      1. 当前用户 status 置为 deleting
-      2. 该用户所有文档 is_public 置为 0（防止删除队列执行期间共享文档仍被他人检索）
-      3. 进入 delete_queue（Redis Streams），队列内先删 Milvus，再删 OSS，最后删 MySQL 用户
-
-    删除请求必须先成功进入 Redis Streams 再提交 DB，避免 status=deleting 但没有可靠任务导致账号卡死。
+    用户行、文档、向量、计费记录（llm_usage）全部保留；
+    账号从用户搜索 / 资料可见性中消失，现有 token 立即失效
+    （get_current_user 每个请求回源 DB 校验 status）。
     """
     if user.status != "active":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "当前账号状态不可删除")
@@ -546,60 +659,26 @@ async def delete_account(
     if user.role == "admin":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "管理员账号不能删除自己，请联系系统管理员处理")
 
-    source_result = await db.execute(
-        select(VectorFile.id, VectorFile.source, VectorFile.is_public)
-        .where(VectorFile.owner_id == user.id)
-    )
-    user_documents = list(source_result.all())
-    user_sources = [source for _file_id, source, _is_public in user_documents]
-
     # 显式 UPDATE 落库：user 可能来自 Redis 缓存（游离对象），直接改属性 + commit 不会生效
     update_result = await db.execute(
         update(User)
         .where(User.id == user.id, User.status == "active")
-        .values(status="deleting")
+        .values(status="deleted")
     )
     if update_result.rowcount != 1:
         await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "账号删除状态已发生变化，请稍后重试")
-    await db.execute(
-        update(VectorFile)
-        .where(VectorFile.owner_id == user.id)
-        .values(is_public=False)
-    )
-    audit(db, user, "delete_account_request", target=user.username, detail="status=deleting, docs is_public=0")
-
-    # 先提交事务，再入队删除任务：确保 worker 读取时 status=deleting 已可见，
-    # 避免「入队先于提交」导致 worker 读到旧状态而误判丢弃（账号卡死在 deleting）
+    audit(db, user, "delete_account", target=user.username, detail="status=deleted (soft delete, 数据保留)")
     await db.commit()
 
-    msg_id = await enqueue_delete(user.id)
-    if msg_id is None:
-        # 入队失败：补偿恢复账号状态和原有公开性，避免账号卡死或文档被误设为私有。
-        async with async_session() as db2:
-            await db2.execute(update(User).where(User.id == user.id).values(status="active"))
-            for file_id, _source, was_public in user_documents:
-                await db2.execute(
-                    update(VectorFile)
-                    .where(VectorFile.id == file_id, VectorFile.owner_id == user.id)
-                    .values(is_public=bool(was_public))
-                )
-            await db2.commit()
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "暂时无法提交账户删除请求，请稍后重试")
-
-    # 文档私有化后立即清理相关缓存，避免其他用户在删除队列执行前仍命中旧共享结果
-    for source in user_sources:
-        await cache_clear_source(source)
-
-    # 账号进入删除流程：清会话缓存；文档与用户搜索缓存全量失效
+    # 软删除后立即清缓存：会话列表/详情、文档列表、用户搜索均失效
     await invalidate_user_sessions(user.id)
     await invalidate_docs()
     await invalidate_user_search()
 
     return {
-        "status": "deleting",
-        "queued": True,
-        "message": "已提交账户删除队列，删除完成后账号将无法登录",
+        "status": "deleted",
+        "message": "账号已删除（软删除），数据与计费记录保留",
     }
 
 
@@ -1090,20 +1169,37 @@ async def chat_api(body: ChatIn, user: User = Depends(get_current_user)):
     scope = await _resolve_chat_scope(body, user)
     session_id = body.session_id or uuid.uuid4().hex
     thread_id = f"{user.id}:{session_id}"
-    try:
-        result = await chat(
-            body.content,
-            thread_id=thread_id,
-            user_id=user.id,
-            load_history=body.session_id is not None,
-            **scope,
-        )
-    except Exception:
-        logger.exception("[chat] 问答服务异常")
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            "问答服务暂时不可用，请稍后重试",
-        )
+    request_id = uuid.uuid4().hex
+    billing_ctx = BillingContext(
+        request_id=request_id,
+        user_id=user.id,
+        session_id=session_id,
+    )
+    trace_ctx = TraceContext(
+        request_id=request_id,
+        user_id=user.id,
+        session_id=session_id,
+    )
+    with billing_request(billing_ctx), trace_request(trace_ctx):
+        try:
+            result = await chat(
+                body.content,
+                thread_id=thread_id,
+                user_id=user.id,
+                load_history=body.session_id is not None,
+                **scope,
+            )
+        except Exception:
+            trace_fail("server_error", "问答服务内部异常")
+            logger.exception("[chat] 问答服务异常")
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "问答服务暂时不可用，请稍后重试",
+            )
+        finally:
+            # 无论成功/失败都把已收集的 LLM 用量落库（失败只记日志，不影响返回）
+            await flush_usage(billing_ctx)
+            await flush_trace(trace_ctx)
     sources = result.get("sources", [])
     sanitize_source_paths(sources)
     # 模型不可用等失败轮次不落库：错误文案不进会话历史，
@@ -1145,22 +1241,39 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
     )
 
     async def _stream_with_persist():
+        request_id = uuid.uuid4().hex
+        billing_ctx = BillingContext(
+            request_id=request_id,
+            user_id=user.id,
+            session_id=session_id,
+        )
+        trace_ctx = TraceContext(
+            request_id=request_id,
+            user_id=user.id,
+            session_id=session_id,
+        )
         final_answer = None
         final_intent = None
         stream_failed = False
-        async for event in gen:
-            if event.get("sources"):
-                sanitize_source_paths(event["sources"])
-            etype = event.get("type")
-            if etype == "meta":
-                final_intent = event.get("intent")
-            elif etype in ("answer", "done") and event.get("answer"):
-                final_answer = event["answer"]
-            elif etype == "error":
-                # 失败轮次不落库：错误文案不进会话历史，也与未写入的 Agent 记忆一致
-                stream_failed = True
-                final_answer = None
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        with billing_request(billing_ctx), trace_request(trace_ctx):
+            try:
+                async for event in gen:
+                    if event.get("sources"):
+                        sanitize_source_paths(event["sources"])
+                    etype = event.get("type")
+                    if etype == "meta":
+                        final_intent = event.get("intent")
+                    elif etype in ("answer", "done") and event.get("answer"):
+                        final_answer = event["answer"]
+                    elif etype == "error":
+                        # 失败轮次不落库：错误文案不进会话历史，也与未写入的 Agent 记忆一致
+                        stream_failed = True
+                        final_answer = None
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            finally:
+                # 流结束/中断都要把已收集的 LLM 用量落库（失败只记日志，不影响返回）
+                await flush_usage(billing_ctx)
+                await flush_trace(trace_ctx)
         # 流结束：仅成功轮次落库（error 事件已在上方标记）
         if final_answer is not None and not stream_failed:
             await _persist_chat_round(
@@ -1195,3 +1308,99 @@ async def search_api(body: SearchIn, user: User = Depends(get_current_user)):
         )
     sanitize_source_paths(hits)
     return {"query": body.query, "hits": hits}
+
+
+# ══ 计费 / 用量（登录用户 + 管理员）══
+@app.get("/api/billing/summary", response_model=BillingSummaryOut)
+async def billing_summary(
+    period: str = Query(default="7d", alias="range", pattern="^(today|7d|30d|all)$"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """当前用户用量汇总：请求/调用数、费用、tokens + 按类型/模型/按天趋势。"""
+    return await get_user_billing_summary(db, user.id, period)
+
+
+@app.get("/api/billing/usage", response_model=UsageListOut)
+async def billing_usage(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    type: Optional[str] = Query(default=None, max_length=32),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """当前用户最近调用明细（分页，可按 type 过滤）。"""
+    return await list_user_billing_usage(db, user.id, page, page_size, type)
+
+
+@app.get("/api/admin/billing/overview", response_model=AdminBillingOverviewOut)
+async def admin_billing_overview(
+    period: str = Query(default="7d", alias="range", pattern="^(today|7d|30d|all)$"),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员：全站用量汇总 + 按费用排行前 10 的用户。"""
+    return await get_admin_billing_overview(db, period)
+
+
+@app.get("/api/admin/billing/users", response_model=AdminUserUsageListOut)
+async def admin_billing_users(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    q: str = Query(default="", max_length=64),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """管理员：按用户聚合用量列表（可按用户名搜索，分页）。"""
+    return await list_admin_user_usage(db, page, page_size, q)
+
+
+# ══ 可观测性 / 监控（登录用户 + 管理员）══
+@app.get("/api/obs/summary")
+async def obs_summary(
+    range: str = Query(default="1h", pattern="^(1h|24h|7d|all)$"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """链路聚合：请求量、成功率、各阶段平均耗时、零命中/降级/缓存命中率、意图分布。"""
+    return await get_trace_summary(db, range)
+
+
+@app.get("/api/obs/traces")
+async def obs_traces(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    status: Optional[str] = Query(default=None, pattern="^(success|failed)$"),
+    user_id: Optional[int] = Query(default=None, ge=1),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """链路列表（分页，可按 status / user_id 过滤）；普通用户只能看自己。"""
+    is_admin = user.role == "admin"
+    if user_id is not None and not is_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "仅管理员可按用户过滤")
+    target_user_id = user_id if is_admin else user.id
+    return await list_traces(db, page, page_size, status, user_id=target_user_id, is_admin=is_admin)
+
+
+@app.get("/api/obs/traces/{request_id}")
+async def obs_trace_detail(
+    request_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """单条链路详情；普通用户只能看自己的。"""
+    is_admin = user.role == "admin"
+    detail = await get_trace_detail(db, request_id, user_id=user.id, is_admin=is_admin)
+    if detail is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "未找到该链路")
+    return detail
+
+
+@app.get("/api/obs/storage")
+async def obs_storage(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """存储概览（管理员）：文档同步分布 + Milvus 行数 + 检索缓存命中计数。"""
+    return await get_storage_overview(db)

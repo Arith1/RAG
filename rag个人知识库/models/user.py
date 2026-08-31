@@ -28,10 +28,10 @@ class User(Base):
         String(16), nullable=False, default="user", server_default="user",
         comment="角色: admin(管理员) / user(普通用户) / guest(访客,暂未开放注册)"
     )
-    # 账号状态：active(正常) / deleting(删除处理中) / disabled(禁用)
+    # 账号状态：active(正常) / deleting(删除处理中) / deleted(已删除-软删除) / disabled(禁用)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active",
-        comment="账号状态: active(正常)/deleting(删除处理中)/disabled(禁用)"
+        comment="账号状态: active(正常)/deleting(删除处理中)/deleted(已删除-软删除，数据保留)/disabled(禁用)"
     )
 
     created_at: Mapped[Optional[datetime]] = mapped_column(

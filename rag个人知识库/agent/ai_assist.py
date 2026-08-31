@@ -11,6 +11,7 @@
     answer = ask([HumanMessage(content="你好")], thread_id="user-123")
 """
 import asyncio
+import contextvars
 import logging
 import re
 from typing import List
@@ -23,6 +24,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from rag个人知识库.agent.model import get_chat_model
+from rag个人知识库.service.billing import token_usage_callback
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +139,10 @@ def ask(messages: List[BaseMessage], thread_id: str = "default") -> str:
         raise ValueError("messages 不能为空")
     response = get_agent().invoke(
         {"messages": messages},
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "callbacks": [token_usage_callback],
+            "configurable": {"thread_id": thread_id},
+        },
     )
     return str(response["messages"][-1].content)
 
@@ -158,7 +163,10 @@ async def astream(messages: List[BaseMessage], thread_id: str = "default"):
         try:
             for chunk, _metadata in get_agent().stream(
                 {"messages": messages},
-                config={"configurable": {"thread_id": thread_id}},
+                config={
+                    "callbacks": [token_usage_callback],
+                    "configurable": {"thread_id": thread_id},
+                },
                 stream_mode="messages",  # token 级增量
             ):
                 content = getattr(chunk, "content", "")
@@ -178,7 +186,8 @@ async def astream(messages: List[BaseMessage], thread_id: str = "default"):
             queue.put_nowait(exc)
 
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, _run)  # 后台线程执行，不阻塞消费
+    # 后台线程执行，不阻塞消费；显式复制上下文，让计费 contextvar（request 上下文/阶段）在流线程可见
+    loop.run_in_executor(None, contextvars.copy_context().run, _run)
     while True:
         item = await queue.get()
         if item is None:

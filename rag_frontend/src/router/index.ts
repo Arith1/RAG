@@ -9,17 +9,22 @@ const router = createRouter({
     { path: '/', name: 'chat', component: () => import('../views/ChatView.vue') },
     { path: '/documents', name: 'documents', component: () => import('../views/DocumentsView.vue') },
     { path: '/knowledge', name: 'knowledge', component: () => import('../views/KnowledgeBaseView.vue') },
+    { path: '/billing', name: 'billing', component: () => import('../views/BillingView.vue') },
+    { path: '/obs', name: 'obs', component: () => import('../views/ObsView.vue') },
     { path: '/profile', name: 'profile', component: () => import('../views/ProfileView.vue') },
     { path: '/profile/:userId', name: 'profile-user', component: () => import('../views/ProfileView.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })
 
-// 已登录用户访问登录页时直接回到问答首页；个人详情需登录
+// 已登录用户访问登录页时直接回到问答首页；个人详情/用量需登录
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   if ((to.name === 'login' || to.name === 'register') && auth.isLoggedIn) {
     return { name: 'chat' }
+  }
+  if ((to.name === 'billing' || to.name === 'obs') && !auth.isLoggedIn) {
+    return { name: 'login', query: { redirect: to.fullPath } }
   }
   if (to.name === 'profile' || to.name === 'profile-user') {
     if (!auth.isLoggedIn) {
@@ -44,5 +49,3 @@ router.beforeEach(async (to) => {
 })
 
 export default router
-
-

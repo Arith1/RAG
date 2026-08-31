@@ -43,6 +43,8 @@ function logout() {
         <nav class="nav" aria-label="主导航">
           <RouterLink to="/knowledge" class="nav-link" active-class="active">知识库</RouterLink>
           <RouterLink to="/" class="nav-link" active-class="active">问答</RouterLink>
+          <RouterLink to="/billing" class="nav-link" active-class="active">用量</RouterLink>
+          <RouterLink v-if="auth.isAdmin" to="/obs" class="nav-link" active-class="active">监控</RouterLink>
         </nav>
 
         <div class="user-area">
@@ -193,4 +195,3 @@ function logout() {
   .logout-btn { padding: 8px 10px; }
 }
 </style>
-
