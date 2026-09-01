@@ -1,0 +1,57 @@
+{
+  "tool": "deepeval",
+  "deepeval_version": "4.2.0",
+  "judge_model": "qwen3.7-plus",
+  "mode": "retrieval",
+  "k": 5,
+  "recall_k": 20,
+  "threshold": 0.7,
+  "total": 1,
+  "hit@1": 1.0,
+  "hit@k": 1.0,
+  "metric_summary": {
+    "Faithfulness": 1.0,
+    "Answer Relevancy": 0.5,
+    "Contextual Precision": 1.0,
+    "Contextual Recall": 1.0
+  },
+  "details": [
+    {
+      "input": "什么是 JWT 算法混淆攻击？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions! The actual output perfectly aligns with the retrieval context. Keep up the great work!"
+      },
+      "Answer Relevancy": {
+        "score": 0.5,
+        "success": false,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.50 because while the output provides some context on JWT authentication, it fails to directly explain the algorithm confusion attack. Instead, it includes irrelevant details about Python exception handling, HTTP 401 status codes, and basic verification flows, which dilute the focus and prevent a higher score."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the first node in the retrieval contexts is perfectly relevant! This node in the retrieval contexts explicitly addresses the defense against algorithm confusion attacks by stating '④ 验算法：确认 alg 是白名单里的 HS256（防算法混淆攻击）' and provides the exact code logic 'if header[\"alg\"] not in algorithms: raise InvalidAlgorithmError', which perfectly aligns with the expected output's explanation of PyJWT's internal verification process. Since there are no irrelevant nodes in the retrieval contexts to rank lower, the precision is absolutely flawless!"
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the 1st node in retrieval context fully supports both the 1st sentence regarding the defense method and the 2nd sentence detailing PyJWT's validation steps. Excellent work!"
+      },
+      "id": "jwt-3",
+      "question": "什么是 JWT 算法混淆攻击？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "recall_count": 1,
+      "expected_answer": "算法混淆攻击的防御方式是验证时必须确认 header 里的 alg 在白名单中。PyJWT 内部执行流程第④步就是验算法：确认 alg 是白名单里的 HS256，如果 header 的 alg 不在 jwt.decode(..., algorithms=[\"HS256\"]) 指定的白名单内，则抛出 InvalidAlgorithmError。"
+    }
+  ]
+}

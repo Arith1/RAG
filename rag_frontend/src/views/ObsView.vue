@@ -42,7 +42,7 @@ const traces = ref<ObsTraceItem[]>([])
 const tracesTotal = ref(0)
 const tracesLoading = ref(false)
 const page = ref(1)
-const pageSize = 20
+const pageSize = 10
 const statusFilter = ref('')
 const storage = ref<ObsStorage | null>(null)
 const selected = ref<ObsTraceItem | null>(null)
@@ -91,6 +91,12 @@ function syncShare(bucket: { status: string; count: number }): number {
   const total = storage.value?.documents.total ?? 0
   if (total <= 0) return 0
   return Math.round((bucket.count / total) * 100)
+}
+
+function wfPct(ms: number | null | undefined): number {
+  const total = selected.value?.total_ms ?? 0
+  if (total <= 0) return 0
+  return Math.min(100, Math.max(3, Math.round((Number(ms ?? 0) / total) * 100)))
 }
 
 async function loadSummary() {
@@ -247,6 +253,42 @@ onMounted(() => {
           </ul>
           <p v-else class="empty-inline">该周期内暂无链路</p>
         </section>
+
+        <section class="card intent-card">
+          <div class="section-head">
+            <div>
+              <h3 class="section-title">Top 慢请求</h3>
+              <p class="section-sub">当前周期内端到端耗时最长的 5 条</p>
+            </div>
+          </div>
+          <ul v-if="summary.slowest && summary.slowest.length" class="dist-list">
+            <li v-for="(s, i) in summary.slowest" :key="s.request_id" class="dist-item">
+              <div class="dist-top">
+                <span class="dist-name">{{ fmtNum(i + 1) }}. {{ s.query || '—' }} <span class="dist-meta">{{ intentLabel(s.intent) }}</span></span>
+                <span class="dist-meta">{{ fmtMs(s.total_ms) }}</span>
+              </div>
+            </li>
+          </ul>
+          <p v-else class="empty-inline">该周期内暂无慢请求</p>
+        </section>
+
+        <section class="card intent-card">
+          <div class="section-head">
+            <div>
+              <h3 class="section-title">失败分布</h3>
+              <p class="section-sub">当前周期内失败请求按错误类型聚合</p>
+            </div>
+          </div>
+          <ul v-if="summary.failure_distribution && summary.failure_distribution.length" class="dist-list">
+            <li v-for="f in summary.failure_distribution" :key="f.error_type ?? 'unknown'" class="dist-item">
+              <div class="dist-top">
+                <span class="dist-name">{{ f.error_type || 'unknown' }}</span>
+                <span class="dist-meta">{{ f.count }} 次</span>
+              </div>
+            </li>
+          </ul>
+          <p v-else class="empty-inline">当前周期无失败</p>
+        </section>
       </template>
 
       <section class="card trace-card">
@@ -339,6 +381,10 @@ onMounted(() => {
               <span class="detail-value mono">#{{ selected.user_id }}</span>
             </div>
             <div class="detail-cell">
+              <span class="detail-label">类型</span>
+              <span class="detail-value">{{ selected.trace_type || selected.intent || '—' }}</span>
+            </div>
+            <div class="detail-cell">
               <span class="detail-label">端到端</span>
               <span class="detail-value">{{ fmtMs(selected.total_ms) }}</span>
             </div>
@@ -349,6 +395,10 @@ onMounted(() => {
             <div class="detail-cell">
               <span class="detail-label">检索</span>
               <span class="detail-value">{{ fmtMs(selected.retrieval_ms) }}</span>
+            </div>
+            <div class="detail-cell">
+              <span class="detail-label">检索分跳</span>
+              <span class="detail-value mono">emb {{ fmtMs(selected.embedding_ms) }} · mv {{ fmtMs(selected.milvus_ms) }} · rr {{ fmtMs(selected.rerank_ms) }} · cache {{ fmtMs(selected.cache_ms) }}</span>
             </div>
             <div class="detail-cell">
               <span class="detail-label">生成</span>
@@ -370,6 +420,41 @@ onMounted(() => {
               <span class="detail-label">检索缓存</span>
               <span class="detail-value">{{ selected.retrieval_cache_hit ? '命中' : '未命中' }} · {{ selected.retrieval_has_scope ? '有范围' : '无可见文档' }}</span>
             </div>
+          </div>
+
+          <div class="query-block">
+            <div class="detail-cell">
+              <span class="detail-label">原始输入</span>
+              <span class="detail-value">{{ selected.query_raw || '—' }}</span>
+            </div>
+            <div class="detail-cell">
+              <span class="detail-label">提炼后查询</span>
+              <span class="detail-value">{{ selected.query || '—' }}</span>
+            </div>
+          </div>
+
+          <div v-if="selected.total_ms > 0" class="waterfall">
+            <div class="wf-row">
+              <span class="wf-label">意图</span>
+              <div class="wf-track"><div class="wf-seg intent" :style="{ width: wfPct(selected.intent_ms) + '%' }"></div></div>
+              <span class="wf-val">{{ fmtMs(selected.intent_ms) }}</span>
+            </div>
+            <div class="wf-row">
+              <span class="wf-label">检索</span>
+              <div class="wf-track"><div class="wf-seg retrieval" :style="{ width: wfPct(selected.retrieval_ms) + '%' }"></div></div>
+              <span class="wf-val">{{ fmtMs(selected.retrieval_ms) }}</span>
+            </div>
+            <div class="wf-row">
+              <span class="wf-label">精排</span>
+              <div class="wf-track"><div class="wf-seg rerank" :style="{ width: wfPct(selected.rerank_ms) + '%' }"></div></div>
+              <span class="wf-val">{{ fmtMs(selected.rerank_ms) }}</span>
+            </div>
+            <div class="wf-row">
+              <span class="wf-label">生成</span>
+              <div class="wf-track"><div class="wf-seg generation" :style="{ width: wfPct(selected.generation_ms) + '%' }"></div></div>
+              <span class="wf-val">{{ fmtMs(selected.generation_ms) }}</span>
+            </div>
+            <p class="wf-note">总耗时 {{ fmtMs(selected.total_ms) }} · 检索内：embedding {{ fmtMs(selected.embedding_ms) }} / Milvus {{ fmtMs(selected.milvus_ms) }} / rerank {{ fmtMs(selected.rerank_ms) }} / cache {{ fmtMs(selected.cache_ms) }}</p>
           </div>
 
           <p v-if="selected.error_type" class="detail-error">
@@ -415,7 +500,7 @@ onMounted(() => {
             <p v-else class="empty-inline">暂无文档</p>
           </div>
           <div class="storage-cell">
-            <h4 class="sources-title">检索缓存命中</h4>
+            <h4 class="sources-title">检索缓存命中（本进程实时）</h4>
             <div class="cache-stat">
               <span class="cache-num">{{ fmtPct(storage.cache.rate) }}</span>
               <span class="cache-meta">{{ fmtNum(storage.cache.hits) }} 次命中 / {{ fmtNum(storage.cache.total) }} 次判定</span>
@@ -620,6 +705,27 @@ onMounted(() => {
 }
 
 .sources-block { margin-top: 16px; }
+.query-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.waterfall { margin-top: 14px; }
+.wf-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
+.wf-label { flex: none; width: 34px; font-size: 12px; color: var(--text-3); }
+.wf-track { flex: 1; height: 12px; background: var(--surface-2); border-radius: 6px; overflow: hidden; }
+.wf-seg { height: 100%; border-radius: 6px; }
+.wf-seg.intent { background: var(--accent); }
+.wf-seg.retrieval { background: #4caf50; }
+.wf-seg.rerank { background: #ff9800; }
+.wf-seg.generation { background: #9c27b0; }
+.wf-val { flex: none; width: 70px; text-align: right; font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.wf-note { margin: 8px 0 0; font-size: 12px; color: var(--text-3); }
 .sources-title { margin: 0 0 10px; font-size: 13.5px; font-weight: 650; }
 .sources-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .source-item {

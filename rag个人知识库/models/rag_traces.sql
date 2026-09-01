@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS `rag_traces` (
     `generation_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'LLM 生成耗时',
     `answer_len` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '回答字符数',
     `sources` JSON NULL COMMENT '来源列表 [{source, score}]',
+    `trace_type` VARCHAR(16) NULL COMMENT '来源类型: chat/search'
+    `query_raw` VARCHAR(1024) NULL COMMENT '原始输入（未提炼）'
+    `embedding_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'embedding 耗时(毫秒)'
+    `milvus_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Milvus 召回耗时(毫秒)'
+    `rerank_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'rerank 耗时(毫秒)'
+    `cache_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '缓存读写耗时(毫秒)'
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     PRIMARY KEY (`id`),
     KEY `idx_trace_request` (`request_id`),

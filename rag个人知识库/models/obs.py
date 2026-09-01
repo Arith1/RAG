@@ -104,6 +104,24 @@ class RagTrace(_ObsBase):
     sources: Mapped[Optional[List[dict]]] = mapped_column(
         JSON, nullable=True, comment="来源列表 [{source, score}]"
     )
+    trace_type: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True, comment="来源类型: chat/search"
+    )
+    query_raw: Mapped[Optional[str]] = mapped_column(
+        String(1024), nullable=True, comment="原始输入（未提炼）"
+    )
+    embedding_ms: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default="0", comment="embedding 耗时(毫秒)"
+    )
+    milvus_ms: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default="0", comment="Milvus 召回耗时(毫秒)"
+    )
+    rerank_ms: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default="0", comment="rerank 耗时(毫秒)"
+    )
+    cache_ms: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default="0", comment="缓存读写耗时(毫秒)"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,

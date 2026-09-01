@@ -29,7 +29,7 @@ from rag个人知识库.agent.intent import analyze
 from rag个人知识库.config.db_config import async_session
 from rag个人知识库.config.redis import cache_get, cache_index_sources, cache_key, cache_set
 from rag个人知识库.crud.vector import select_visible_file_ids
-from rag个人知识库.service.billing import billing_stage
+from rag个人知识库.service.billing import billing_stage, record_cached_answer
 from rag个人知识库.service.obs import (
     trace_fail,
     trace_set_generation,
@@ -40,6 +40,13 @@ from rag个人知识库.service.service import search_documents
 from rag个人知识库.vector_store.milvus_store import ANSWER_CACHE_TTL
 
 logger = logging.getLogger(__name__)
+
+def _write_memory_async(thread_id: str, content: str, answer: str) -> None:
+    """后台写对话记忆：不阻塞主链路，失败只记日志（火忘即忘，不影响回答返回）。"""
+    try:
+        asyncio.create_task(asyncio.to_thread(append_thread_exchange, thread_id, content, answer))
+    except Exception:
+        logger.warning("[chat] 记忆写入调度失败（不影响回答）", exc_info=True)
 
 # analyze 用到的历史：最多取最近 N 轮（每轮 user+assistant 两条），单条截断长度
 HISTORY_MAX_TURNS = 3
@@ -197,7 +204,7 @@ async def chat(
     intent_t0 = time.monotonic()
     analysis = await asyncio.to_thread(analyze, content, history)
     intent_ms = int((time.monotonic() - intent_t0) * 1000)
-    trace_set_intent(analysis.intent, analysis.query or content, intent_ms)
+    trace_set_intent(analysis.intent, analysis.query or content, intent_ms, query_raw=content)
 
     # 闲聊：只进入 LLM 对话，不做检索
     if analysis.intent == "chat":
@@ -232,7 +239,7 @@ async def chat(
     # 当前没有文档上传/修改/删除等管理功能，遇到 other 直接明确提示，不触发检索
     if analysis.intent == "other":
         answer = "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。"
-        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        _write_memory_async(thread_id, content, answer)
         trace_set_generation(len(answer), 0)
         return {
             "answer": answer,
@@ -328,6 +335,10 @@ async def chat(
     rerank_count = sum(m["rerank_count"] for m in retr_metrics_list)
     rerank_degraded = any(m["rerank_degraded"] for m in retr_metrics_list)
     cache_hit = any(m["cache_hit"] for m in retr_metrics_list)
+    embedding_ms = sum(m.get("embedding_ms") or 0 for m in retr_metrics_list)
+    milvus_ms = sum(m.get("milvus_ms") or 0 for m in retr_metrics_list)
+    rerank_ms = sum(m.get("rerank_ms") or 0 for m in retr_metrics_list)
+    cache_ms = sum(m.get("cache_ms") or 0 for m in retr_metrics_list)
     hit_scores = [h.get("score") for h in all_hits if h.get("score") is not None]
     rerank_avg_score = round(sum(hit_scores) / len(hit_scores), 4) if hit_scores else None
     rerank_max_score = round(max(hit_scores), 4) if hit_scores else None
@@ -336,7 +347,7 @@ async def chat(
         for s in sources
         if s.get("source")
     ]
-    trace_set_intent(analysis.intent, query, intent_ms)
+    trace_set_intent(analysis.intent, query, intent_ms, query_raw=content)
     trace_set_retrieval(
         retrieval_ms,
         cache_hit=cache_hit,
@@ -347,11 +358,15 @@ async def chat(
         rerank_max_score=rerank_max_score,
         rerank_degraded=rerank_degraded,
         sources=compact_sources,
+        embedding_ms=embedding_ms,
+        milvus_ms=milvus_ms,
+        rerank_ms=rerank_ms,
+        cache_ms=cache_ms,
     )
 
     if not all_hits:
         answer = "知识库中未找到相关资料，请换个问法，或确认文档已入库。"
-        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        _write_memory_async(thread_id, content, answer)
         trace_set_generation(len(answer), 0)
         return {
             "answer": answer,
@@ -370,7 +385,8 @@ async def chat(
         answer = cached_answer.get("answer") if isinstance(cached_answer, dict) else cached_answer
         # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
         trace_set_generation(len(answer), 0)
-        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        record_cached_answer()
+        _write_memory_async(thread_id, content, answer)
     else:
         try:
             gen_t0 = time.monotonic()
@@ -443,7 +459,7 @@ async def chat_stream(
     intent_t0 = time.monotonic()
     analysis = await asyncio.to_thread(analyze, content, history)
     intent_ms = int((time.monotonic() - intent_t0) * 1000)
-    trace_set_intent(analysis.intent, analysis.query or content, intent_ms)
+    trace_set_intent(analysis.intent, analysis.query or content, intent_ms, query_raw=content)
 
     # 闲聊：不走检索，直接完整回答
     if analysis.intent == "chat":
@@ -467,7 +483,7 @@ async def chat_stream(
 
     if analysis.intent == "other":
         answer = "当前仅支持知识库问答和闲聊，暂不支持文档上传、修改、删除等操作。"
-        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        _write_memory_async(thread_id, content, answer)
         trace_set_generation(len(answer), 0)
         yield {"type": "answer", "session_id": session_id, "intent": "other", "query": None,
                "answer": answer,
@@ -566,6 +582,10 @@ async def chat_stream(
     rerank_count = sum(m["rerank_count"] for m in retr_metrics_list)
     rerank_degraded = any(m["rerank_degraded"] for m in retr_metrics_list)
     cache_hit = any(m["cache_hit"] for m in retr_metrics_list)
+    embedding_ms = sum(m.get("embedding_ms") or 0 for m in retr_metrics_list)
+    milvus_ms = sum(m.get("milvus_ms") or 0 for m in retr_metrics_list)
+    rerank_ms = sum(m.get("rerank_ms") or 0 for m in retr_metrics_list)
+    cache_ms = sum(m.get("cache_ms") or 0 for m in retr_metrics_list)
     hit_scores = [h.get("score") for h in all_hits if h.get("score") is not None]
     rerank_avg_score = round(sum(hit_scores) / len(hit_scores), 4) if hit_scores else None
     rerank_max_score = round(max(hit_scores), 4) if hit_scores else None
@@ -574,7 +594,7 @@ async def chat_stream(
         for s in sources
         if s.get("source")
     ]
-    trace_set_intent(analysis.intent, query, intent_ms)
+    trace_set_intent(analysis.intent, query, intent_ms, query_raw=content)
     trace_set_retrieval(
         retrieval_ms,
         cache_hit=cache_hit,
@@ -585,6 +605,10 @@ async def chat_stream(
         rerank_max_score=rerank_max_score,
         rerank_degraded=rerank_degraded,
         sources=compact_sources,
+        embedding_ms=embedding_ms,
+        milvus_ms=milvus_ms,
+        rerank_ms=rerank_ms,
+        cache_ms=cache_ms,
     )
 
     # meta 事件回传 session_id：前端据此维持多轮会话（服务端生成的 id 必须返回）
@@ -593,7 +617,7 @@ async def chat_stream(
 
     if not all_hits:
         answer = "知识库中未找到相关资料，请换个问法，或确认文档已入库。"
-        await asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        _write_memory_async(thread_id, content, answer)
         trace_set_generation(len(answer), 0)
         yield {"type": "answer", "intent": analysis.intent, "query": query,
                "answer": answer,
@@ -607,8 +631,9 @@ async def chat_stream(
     if cached is not None:
         cached_answer = cached.get("answer") if isinstance(cached, dict) else cached
         # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
-        await asyncio.to_thread(append_thread_exchange, thread_id, content, cached_answer)
+        _write_memory_async(thread_id, content, cached_answer)
         trace_set_generation(len(cached_answer), 0)
+        record_cached_answer()
         yield {"type": "token", "text": cached_answer}
         yield {"type": "done", "answer": cached_answer}
         return

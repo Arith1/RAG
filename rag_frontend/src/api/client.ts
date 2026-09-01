@@ -427,6 +427,14 @@ export interface ObsSummary {
   retrieval_cache_hit_rate: number
   active_users: number
   intent_distribution: ObsIntentBucket[]
+  slowest: Array<{
+    request_id: string
+    query: string | null
+    intent: string | null
+    total_ms: number
+    status: string
+  }>
+  failure_distribution: Array<{ error_type: string | null; count: number }>
 }
 
 /** 单条 RAG 链路（GET /api/obs/traces） */
@@ -437,6 +445,8 @@ export interface ObsTraceItem {
   session_id: string | null
   intent: string | null
   query: string | null
+  query_raw: string | null
+  trace_type: string | null
   status: string
   error_type: string | null
   error_message: string | null
@@ -452,6 +462,10 @@ export interface ObsTraceItem {
   rerank_degraded: boolean
   generation_ms: number
   answer_len: number
+  embedding_ms: number
+  milvus_ms: number
+  rerank_ms: number
+  cache_ms: number
   sources: Array<{ source: string | null; score: number | null; question?: string | null }> | null
   created_at: string | null
 }

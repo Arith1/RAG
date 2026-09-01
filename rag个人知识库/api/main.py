@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -19,7 +20,7 @@ from typing import List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, text, update
@@ -87,6 +88,8 @@ from rag个人知识库.service.obs import (
     list_traces,
     trace_fail,
     trace_request,
+    trace_set_intent,
+    trace_set_retrieval,
 )
 from rag个人知识库.service.document_admin import delete_document, revoke_document_public, share_document_public
 from rag个人知识库.service.ingest_queue import (
@@ -426,15 +429,8 @@ async def _upload_user_active(user_id: int) -> bool:
 
 @app.get("/")
 async def root():
-    return {"app": "RAG 个人知识库", "chat": "/chat", "docs": "/docs", "health": "/api/health"}
+    return {"app": "RAG 个人知识库", "docs": "/docs", "health": "/api/health"}
 
-
-@app.get("/chat", response_class=HTMLResponse)
-async def chat_page():
-    """浏览器问答入口（手动测试用）。"""
-    page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "chat.html")
-    with open(page, encoding="utf-8") as f:
-        return f.read()
 
 
 @app.get("/api/health")
@@ -1292,20 +1288,57 @@ async def chat_stream_api(body: ChatIn, user: User = Depends(get_current_user)):
 
 @app.post("/api/search")
 async def search_api(body: SearchIn, user: User = Depends(get_current_user)):
-    """语义检索（双路召回 + rerank 精排），仅返回当前用户可见的文档（自己的 + 共享的）。"""
+    """语义检索（双路召回 + rerank 精排），仅返回当前用户可见的文档（自己的 + 共享的）。
+
+    与 chat 一样写 rag_traces（trace_type=search），让搜索流量进入全链路监控。
+    """
     if not await allow_request(f"search:{user.id}", SEARCH_MAX_REQUESTS_PER_MINUTE):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "检索太频繁，请稍后再试",
         )
-    try:
-        hits = await search_documents(body.query, k=body.k, source=body.source, user_id=user.id)
-    except Exception:
-        logger.exception("[search] 检索服务异常")
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            "检索服务暂时不可用，请稍后重试",
-        )
+    request_id = uuid.uuid4().hex
+    trace_ctx = TraceContext(
+        request_id=request_id,
+        user_id=user.id,
+        session_id=None,
+        trace_type="search",
+    )
+    with trace_request(trace_ctx):
+        try:
+            t0 = time.monotonic()
+            hits, metrics = await search_documents(
+                body.query, k=body.k, source=body.source, user_id=user.id, return_metrics=True,
+            )
+            retrieval_ms = int((time.monotonic() - t0) * 1000)
+            trace_set_intent("search", body.query, 0, query_raw=body.query)
+            trace_set_retrieval(
+                retrieval_ms=retrieval_ms,
+                cache_hit=bool(metrics.get("cache_hit")),
+                has_scope=bool(metrics.get("has_scope", True)),
+                recall_count=metrics.get("recall_count", 0) or 0,
+                rerank_count=metrics.get("rerank_count", 0) or 0,
+                rerank_avg_score=metrics.get("rerank_avg_score"),
+                rerank_max_score=metrics.get("rerank_max_score"),
+                rerank_degraded=bool(metrics.get("rerank_degraded")),
+                sources=[
+                    {"source": h.get("source"), "score": h.get("score")}
+                    for h in hits if h.get("source")
+                ],
+                embedding_ms=metrics.get("embedding_ms", 0) or 0,
+                milvus_ms=metrics.get("milvus_ms", 0) or 0,
+                rerank_ms=metrics.get("rerank_ms", 0) or 0,
+                cache_ms=metrics.get("cache_ms", 0) or 0,
+            )
+        except Exception:
+            trace_fail("server_error", "检索服务异常")
+            logger.exception("[search] 检索服务异常")
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "检索服务暂时不可用，请稍后重试",
+            )
+        finally:
+            await flush_trace(trace_ctx)
     sanitize_source_paths(hits)
     return {"query": body.query, "hits": hits}
 

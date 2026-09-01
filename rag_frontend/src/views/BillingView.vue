@@ -29,6 +29,7 @@ const RANGES: Array<{ key: BillingRange; label: string }> = [
 const TYPE_LABELS: Record<string, string> = {
   intent: '意图识别',
   answer: '知识问答',
+  answer_cached: '回答缓存命中',
   chat: '闲聊',
   summarize: '摘要',
 }

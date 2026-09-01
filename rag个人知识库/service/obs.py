@@ -71,6 +71,12 @@ class TraceContext:
     rerank_degraded: bool = False
     answer_len: int = 0
     sources: Optional[List[dict]] = None
+    trace_type: Optional[str] = None
+    query_raw: Optional[str] = None
+    embedding_ms: int = 0
+    milvus_ms: int = 0
+    rerank_ms: int = 0
+    cache_ms: int = 0
     # 内部：请求开始时刻，flush 时换算 total_ms
     _started_at: float = field(default_factory=time.monotonic, repr=False)
 
@@ -93,14 +99,21 @@ def get_trace_ctx() -> Optional[TraceContext]:
     return _trace_ctx.get()
 
 
-def trace_set_intent(intent: Optional[str], query: Optional[str], intent_ms: int = 0) -> None:
-    """记录意图识别阶段：意图、提炼后查询与耗时。"""
+def trace_set_intent(
+    intent: Optional[str],
+    query: Optional[str],
+    intent_ms: int = 0,
+    query_raw: Optional[str] = None,
+) -> None:
+    """记录意图识别阶段：意图、提炼后查询与耗时；query_raw 为原始输入。"""
     ctx = _trace_ctx.get()
     if ctx is None:
         return
     ctx.intent = intent
     ctx.query = query
     ctx.intent_ms = int(intent_ms)
+    if query_raw is not None:
+        ctx.query_raw = query_raw
 
 
 def trace_set_retrieval(
@@ -113,8 +126,12 @@ def trace_set_retrieval(
     rerank_max_score: Optional[float] = None,
     rerank_degraded: bool = False,
     sources: Optional[List[dict]] = None,
+    embedding_ms: int = 0,
+    milvus_ms: int = 0,
+    rerank_ms: int = 0,
+    cache_ms: int = 0,
 ) -> None:
-    """记录检索/精排阶段：耗时、缓存命中、召回/精排数与分数、降级、来源。"""
+    """记录检索/精排阶段：耗时、缓存命中、召回/精排数/分数、降级、来源、分跳耗时。"""
     ctx = _trace_ctx.get()
     if ctx is None:
         return
@@ -127,6 +144,10 @@ def trace_set_retrieval(
     ctx.rerank_max_score = round(float(rerank_max_score), 4) if rerank_max_score is not None else None
     ctx.rerank_degraded = bool(rerank_degraded)
     ctx.sources = sources
+    ctx.embedding_ms = int(embedding_ms or 0)
+    ctx.milvus_ms = int(milvus_ms or 0)
+    ctx.rerank_ms = int(rerank_ms or 0)
+    ctx.cache_ms = int(cache_ms or 0)
 
 
 def trace_set_generation(answer_len: int, generation_ms: int = 0) -> None:
@@ -176,6 +197,12 @@ async def flush_trace(ctx: TraceContext) -> None:
                     generation_ms=ctx.generation_ms,
                     answer_len=ctx.answer_len,
                     sources=ctx.sources,
+                    trace_type=ctx.trace_type,
+                    query_raw=ctx.query_raw,
+                    embedding_ms=ctx.embedding_ms,
+                    milvus_ms=ctx.milvus_ms,
+                    rerank_ms=ctx.rerank_ms,
+                    cache_ms=ctx.cache_ms,
                 )
             )
             await db.commit()
@@ -224,6 +251,12 @@ def _trace_to_dict(t: RagTrace) -> dict:
         "generation_ms": t.generation_ms,
         "answer_len": t.answer_len,
         "sources": t.sources,
+        "trace_type": t.trace_type,
+        "query_raw": t.query_raw,
+        "embedding_ms": t.embedding_ms,
+        "milvus_ms": t.milvus_ms,
+        "rerank_ms": t.rerank_ms,
+        "cache_ms": t.cache_ms,
         "created_at": t.created_at,
     }
 
@@ -292,7 +325,8 @@ async def get_trace_summary(db: AsyncSession, range_key: str = "1h") -> dict:
     ).one()
     total = int(totals[0])
 
-    rag_ask_cond = [*cond, RagTrace.intent == "rag_ask"]
+    # 检索类指标聚合 rag_ask（chat 问答）与 search（检索接口）两类请求
+    rag_ask_cond = [*cond, RagTrace.intent.in_(("rag_ask", "search"))]
     rag_ask_total = int(
         (await db.scalar(select(func.count(RagTrace.id)).where(*rag_ask_cond))) or 0
     )
@@ -353,6 +387,37 @@ async def get_trace_summary(db: AsyncSession, range_key: str = "1h") -> dict:
     ).all()
     intent_distribution = [{"intent": r[0], "count": int(r[1])} for r in intent_rows]
 
+    # Top 慢请求：当前范围内 total_ms 最大的 5 条
+    slow_rows = (
+        await db.execute(
+            select(
+                RagTrace.request_id, RagTrace.query, RagTrace.intent,
+                RagTrace.total_ms, RagTrace.status,
+            )
+            .where(*cond)
+            .order_by(RagTrace.total_ms.desc())
+            .limit(5)
+        )
+    ).all()
+    slowest = [
+        {
+            "request_id": r[0], "query": r[1], "intent": r[2],
+            "total_ms": int(r[3] or 0), "status": r[4],
+        }
+        for r in slow_rows
+    ]
+
+    # 失败分布：按 error_type 聚合 failed 请求
+    fail_rows = (
+        await db.execute(
+            select(RagTrace.error_type, func.count(RagTrace.id))
+            .where(*cond, RagTrace.status == "failed")
+            .group_by(RagTrace.error_type)
+            .order_by(func.count(RagTrace.id).desc())
+        )
+    ).all()
+    failure_distribution = [{"error_type": r[0], "count": int(r[1])} for r in fail_rows]
+
     def _rate(n: int, base: int) -> float:
         return round(n / base, 4) if base else 0.0
 
@@ -369,6 +434,8 @@ async def get_trace_summary(db: AsyncSession, range_key: str = "1h") -> dict:
         "retrieval_cache_hit_rate": _rate(cache_hit, rag_ask_total),
         "active_users": int(totals[1]),
         "intent_distribution": intent_distribution,
+        "slowest": slowest,
+        "failure_distribution": failure_distribution,
     }
 
 

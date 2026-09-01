@@ -33,7 +33,7 @@
 ```mermaid
 flowchart LR
     subgraph Web["FastAPI 服务"]
-        A["/chat 问答页<br/>/api/*"]
+        A["Web 前端(5173)<br/>/api/*"]
         B[认证 JWT + RBAC]
         C[文档管理<br/>上传/删除/列表]
         D[问答编排<br/>意图识别→检索→Agent]
@@ -105,7 +105,7 @@ cp .env.example .env
 docker compose up -d --build
 
 # 3. 访问
-#    问答页  http://localhost:8010/chat      Swagger: http://localhost:8010/docs
+#    前端(开发) http://localhost:5173     Swagger: http://localhost:8010/docs
 ```
 
 > **生产部署建议**：API 8010 前置 Nginx/Caddy 反代 + HTTPS；如不需要宿主机直连数据库，
@@ -169,7 +169,7 @@ mysql -uroot -p rag_demo < rag个人知识库/models/vector.sql
 uvicorn rag个人知识库.api.main:app --host 0.0.0.0 --port 8010
 ```
 
-- **问答页面**：http://localhost:8010/chat （内置 HTML 问答页，登录后提问）
+- **前端页面**：开发 http://localhost:5173（`cd rag_frontend && npm run dev`）；生产由 Nginx 托管构建产物
 - **Swagger 文档**：http://localhost:8010/docs
 - **队列状态**：`GET /api/ingest/stats`
 
@@ -276,6 +276,16 @@ curl -X POST http://localhost:8010/api/documents/upload \
 - 登录成功后**后台预热**「会话列表 + 最近 10 个会话记录」，不阻塞登录响应；
 - 全部走 Cache-Aside：命中直接返回，未命中回源 DB/Postgres 后写回；Redis 不可用时自动降级，行为与无缓存一致。
 
+### RAG 全链路可观测
+
+**每次请求（chat 或 search）写一条 `rag_traces`**，覆盖「入口 → 意图 → 检索 → 精排 → 生成 → 落库」每一跳：
+
+- **入口**：chat 与 `/api/search` 都写 trace（`trace_type=chat/search`）；记录 `query_raw`（原始输入）与 `query`（提炼后），可定位「相同问题缓存 miss」是否为意图提炼漂移。
+- **检索分跳计时**：`embedding_ms` / `milvus_ms` / `rerank_ms` / `cache_ms` 分开统计（`retrieval_ms` 为整段，含前三者）。
+- **监控页（ObsView）**：时间范围聚合（请求量 / 成功率 / 各阶段均耗时 / 零命中率 / 降级率 / **缓存命中率**，聚合 chat+search）、**Top 慢请求**、**失败分布**、意图分布、单条 trace **瀑布图**。
+- **缓存命中计费**：回答命中 `ans:` 缓存时，用量记录一条 `type=answer_cached`（tokens=0 / cost=0，`status=cached`），「最近用量」可看到省下的生成费用；检索缓存命中率以 trace 聚合为准，进程内计数标注「本进程实时」。
+- **写记忆异步**：`append_thread_exchange`（Postgres 对话记忆）改为后台异步写入，不阻塞回答返回，避免未计时的写库拖慢总耗时。
+
 ## 评测与测试
 
 ```bash
@@ -300,7 +310,32 @@ python -m pytest tests/
 
 - 检索基线：**hit@1 = 80% / hit@3 = 100% / hit@5 = 100%**，平均精排分 0.89（`evaluation/report.json`）。
 - DeepEval 报告：`evaluation/deepeval_report.json`（生成侧质量，与检索 hit@k 互补）。
-- 说明：已适配 deepeval 4.x（judge 经 metric 的 `model=` 传入 OpenAIModel 指向 OpenAI 兼容端点）；仅检索模式下 `Faithfulness` 因 top-1 即上下文而恒为 1.0（代理值），`AnswerRelevancy` 是有效信号；golden 每题补 `expected_answer` 后还会启用 ContextualPrecision / ContextualRecall。
+- 说明：已适配 deepeval 4.x（judge 经 metric 的 `model=` 传入 OpenAIModel 指向 OpenAI 兼容端点）；仅检索模式下 `Faithfulness` 因 top-1 即上下文而恒为 1.0（代理值），`AnswerRelevancy` 是有效信号；golden 每题补 `expected_answer`（旁挂 `evaluation/expected_answers.json`）后还会启用 ContextualPrecision / ContextualRecall。
+
+#### DeepEval 端到端评测基线（24 题，排除未入库的 langchain-1）
+
+> judge = `deepseek-v4-flash` · mode = end-to-end · k=5 / recall_k=20 / threshold=0.7 · 结果见 `evaluation/deepeval_report_no_langchain1.json`
+
+| 指标 | 数值 |
+| --- | --- |
+| hit@1 / hit@k | 79.2%（19/24）/ 100% |
+| **Faithfulness** | **0.99** |
+| **AnswerRelevancy** | **0.93** |
+| **ContextualPrecision** | **0.97** |
+| **ContextualRecall** | **0.93** |
+
+- **结论**：端到端生成质量良好（AR 0.93 / Faith 0.99）。此前 retrieval 模式 AR=0.65 是「Top-1 片段必须直接回答」的严格代理，不代表真实生成质量。
+- **未通过（任一指标 < 0.7，jwt-3 已修复剔除）**：
+  - `session-2`（AR 0.56）—— 生成跑题（答里掺杂 TTL/summarizer 等无关内容）
+  - `queue-4`（CR 0.50）/ `session-3`（CR 0.50）/ `loader-2`（CR 0.67）—— 答案跨多个小节、Top-5 未完全覆盖（真实覆盖缺口）
+  - ~~`jwt-3`~~ —— 原 CR 0.67 为 draft expected_answer 假低分；修正后单跑 CR = **1.0**（详见 `evaluation/deepeval_report.md`）
+
+#### 提高 DeepEval 通过率的方法
+
+1. **先修 `expected_answer` 口径**（成本最低）：CR 是「每句都必须在检索上下文里被支持」的逐句指标。若 draft 含源文档里没有的推断句（如 jwt-3 的「攻击者无法换算法」）会假低分；把 draft 收紧到源文档可验证的表述，重跑即可区分「真缺口 vs 假低分」。
+2. **提升检索覆盖（治 CR 低分）**：queue-4 / session-3 / loader-2 的答案分散在多个小节、Top-5 抓不全 → 各节开头补「结论一句话」、或小 chunk + Parent-Child 分层检索、或按需放大 `recall_k`。
+3. **生成聚焦（治 AR 低分）**：session-2 回答跑题 → 收紧生成 prompt，让回答直接命中问题、避免堆砌无关模块细节。
+4. **评测侧**：judge 多轮取均值（消 LLM 方差）、阈值用 0.65~0.7、报告里保存 `actual_output` 便于定位生成问题；补 `expected_answer` 后 CR/CP 才有意义。
 
 ## API 一览
 
@@ -333,7 +368,6 @@ python -m pytest tests/
 | POST | `/api/ingest/dead/{msg_id}/retry` | 管理员 | 死信单条重新入库 |
 | POST | `/api/ingest/dead/retry-all` | 管理员 | 死信全部重新入库 |
 | DELETE | `/api/ingest/dead` | 管理员 | 清空死信队列 |
-| GET | `/chat` | 公开 | 浏览器问答页面 |
 | GET | `/docs` | 公开 | Swagger |
 
 ## 项目结构

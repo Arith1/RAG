@@ -4,6 +4,8 @@
 import asyncio
 import logging
 import os
+import threading
+import time
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
@@ -38,6 +40,9 @@ SPARSE_FIELD = "sparse"
 
 # 复用 HTTP 连接池：避免每次 rerank 请求都重新建立 TCP/TLS 连接
 _session = requests.Session()
+
+# 线程级 embedding 计时：embed_query 内写入，检索结束后读取，用于可观测性分跳
+_embedding_timer = threading.local()
 
 
 def _require_env(name: str) -> str:
@@ -81,22 +86,30 @@ class CachedEmbeddings(OpenAIEmbeddings):
     """
 
     def embed_query(self, text: str):
-        key = cache_key("emb", text)
-        cached = cache_get_sync(key)
-        if cached is not None:
-            return cached
-        vector = super().embed_query(text)
-        cache_set_sync(key, vector, EMBEDDING_CACHE_TTL)
-        return vector
+        t0 = time.monotonic()
+        try:
+            key = cache_key("emb", text)
+            cached = cache_get_sync(key)
+            if cached is not None:
+                return cached
+            vector = super().embed_query(text)
+            cache_set_sync(key, vector, EMBEDDING_CACHE_TTL)
+            return vector
+        finally:
+            _embedding_timer.ms = int((time.monotonic() - t0) * 1000)
 
     async def aembed_query(self, text: str):
-        key = cache_key("emb", text)
-        cached = await cache_get(key)
-        if cached is not None:
-            return cached
-        vector = await super().aembed_query(text)
-        await cache_set(key, vector, EMBEDDING_CACHE_TTL)
-        return vector
+        t0 = time.monotonic()
+        try:
+            key = cache_key("emb", text)
+            cached = await cache_get(key)
+            if cached is not None:
+                return cached
+            vector = await super().aembed_query(text)
+            await cache_set(key, vector, EMBEDDING_CACHE_TTL)
+            return vector
+        finally:
+            _embedding_timer.ms = int((time.monotonic() - t0) * 1000)
 
 
 @lru_cache(maxsize=1)
@@ -346,6 +359,7 @@ def search(
     }
     if filter_expr:
         kwargs["expr"] = filter_expr
+    _embedding_timer.ms = 0  # 重置，避免读到上一次检索的计时
     return _milvus_op(vector_store.similarity_search, query, k=k, **kwargs)
 
 
@@ -380,6 +394,9 @@ def _empty_retrieval_metrics() -> dict:
         "rerank_avg_score": None,
         "rerank_max_score": None,
         "rerank_degraded": False,
+        "embedding_ms": 0,
+        "milvus_ms": 0,
+        "rerank_ms": 0,
     }
 
 
@@ -401,17 +418,23 @@ def _search_with_rerank_metrics(
     expr 与 source 互斥（同 search）：同时传参会抛 ValueError。
     file_ids: 按文件 id 集合过滤（可见性控制），透传给 search。
     """
+    t_retr0 = time.monotonic()
     candidates = search(query, k=recall_k, expr=expr, source=source, file_ids=file_ids)
+    t_retr1 = time.monotonic()
+    embedding_ms = int(getattr(_embedding_timer, "ms", 0) or 0)
+    milvus_ms = max(0, int((t_retr1 - t_retr0) * 1000) - embedding_ms)
     if not candidates:
         return [], _empty_retrieval_metrics()
 
     try:
         # 对全部召回候选做精排，避免阈值过滤后无法用后续候选补位
+        t_rr0 = time.monotonic()
         results = _rerank(
             query,
             [c.page_content for c in candidates],
             top_n=len(candidates),
         )
+        rerank_ms = int((time.monotonic() - t_rr0) * 1000)
     except Exception as e:
         # 精排只是质量增强，接口/响应异常时退回双路召回结果，保检索可用；
         # 降级结果没有精排分，显式写 None 并打 rerank_degraded 标记，供展示层区分
@@ -426,6 +449,9 @@ def _search_with_rerank_metrics(
             "rerank_avg_score": None,
             "rerank_max_score": None,
             "rerank_degraded": True,
+            "embedding_ms": embedding_ms,
+            "milvus_ms": milvus_ms,
+            "rerank_ms": 0,
         }
 
     # results 已按 relevance_score 降序返回（rerank 接口保证）
@@ -482,6 +508,9 @@ def _search_with_rerank_metrics(
         "rerank_avg_score": round(sum(scores) / len(scores), 4) if scores else None,
         "rerank_max_score": round(max(scores), 4) if scores else None,
         "rerank_degraded": False,
+        "embedding_ms": embedding_ms,
+        "milvus_ms": milvus_ms,
+        "rerank_ms": rerank_ms,
     }
 
 

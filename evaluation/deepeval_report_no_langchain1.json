@@ -1,0 +1,908 @@
+{
+  "tool": "deepeval",
+  "deepeval_version": "4.2.0",
+  "judge_model": "deepseek-v4-flash",
+  "mode": "end-to-end",
+  "k": 5,
+  "recall_k": 20,
+  "threshold": 0.7,
+  "total": 24,
+  "hit@1": 0.7917,
+  "hit@k": 1.0,
+  "metric_summary": {
+    "Faithfulness": 0.9902,
+    "Answer Relevancy": 0.9296,
+    "Contextual Precision": 0.9724,
+    "Contextual Recall": 0.9306
+  },
+  "details": [
+    {
+      "input": "JWT 的三段结构分别是什么？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output fully and accurately addresses the input with no irrelevant statements, so it cannot be higher."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because both retrieval contexts are relevant and ranked optimally: the first node directly gives the three-part JWT structure ('一个 token 由三部分组成，用 `.` 分隔'), so it is correctly placed above the second node, which only remotely confirms the structure via 'header, payload, signature = token.split(\".\")'. With no irrelevant nodes ranked before relevant ones, the contextual precision is perfect."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is directly supported by node 1 in retrieval context. Sentence 1 matches the node's statement about JWT having three parts separated by `.`; sentence 2 matches the node's table describing header, payload, and signature roles; sentence 3 matches the node's warning about Base64URL encoding being reversible and not safe for sensitive data."
+      },
+      "id": "jwt-1",
+      "question": "JWT 的三段结构分别是什么？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "recall_count": 2,
+      "expected_answer": "JWT 由三部分组成，用 `.` 分隔：header、payload、signature。header 内容如 {\"alg\":\"HS256\",\"typ\":\"JWT\"}，作用是声明签名算法；payload 内容如 {\"sub\":\"1\",\"role\":\"admin\",\"exp\":...}，存放业务数据与过期时间；signature 是签名值，作用是防篡改的指纹。注意三部分都是 Base64URL 编码，不是加密，任何人都能解码看到内容，所以不要把密码等敏感信息放进 payload。"
+    },
+    {
+      "input": "JWT 怎么防止 token 被篡改？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context—everything aligns perfectly. Great job!"
+      },
+      "Answer Relevancy": {
+        "score": 0.875,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.88 because the response mainly addresses JWT's signature-based tamper prevention, but it also includes two extraneous points about post-verification user existence checks and token invalidation after deletion, which are relevant to user status/revocation rather than the core anti-tampering mechanism; hence it is not perfect, but the primary focus is still on-topic."
+      },
+      "Contextual Precision": {
+        "score": 0.9704861111111112,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.97 because the retrieval contexts rank six highly relevant nodes at positions 1–6, with reasons like \"该条直接给出了签名生成和验签比对流程\" and \"该条说明 PyJWT 实际验签时会重新计算 HMAC_SHA256 并做 constant_time_compare\", correctly placing the core anti-tampering evidence near the top. The only irrelevant node appears at rank 7, with reason \"该条讲的是 token 的存放位置以及无状态认证的代价\", which is not about signature-based tamper prevention, so it is ranked lower than the first six relevant nodes. It is not higher because that irrelevant node still appears before two relevant nodes at ranks 8 and 9, whose reasons \"该条描述了服务端每次请求时通过 jwt.decode...进行验签 + 验过期\" and \"该条展示了签发 token 时使用 jwt.encode...说明 payload 是由密钥签名生成的\" provide useful supporting context. Thus the ranking is almost perfect but not fully precision-optimal."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because all three sentences in the expected output are directly supported by node(s) in retrieval context: node 1 covers the signature generation formula, node 1 (with node 2) covers the verification logic, and node 1 also covers the JWT_SECRET tamper-resistance point. No part of the expected output is left unsupported."
+      },
+      "id": "jwt-2",
+      "question": "JWT 怎么防止 token 被篡改？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "recall_count": 9,
+      "expected_answer": "签名生成方式为 signature = HMAC_SHA256(base64(header) + \".\" + base64(payload), JWT_SECRET)。校验时服务端取出 token 的 header 和 payload，用 JWT_SECRET 重新计算 HMAC_SHA256，再与 token 自带的 signature 比对：一致则签名合法，说明 header/payload 没被改过；不一致则非法，拒绝。关键点：JWT_SECRET 只有服务端知道，攻击者想篡改 payload（如把 role 改成 admin）必须重新算签名，但没有密钥就算不出来，任何改动都会导致验签失败。"
+    },
+    {
+      "input": "什么是 JWT 算法混淆攻击？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "得分是1.00，因为实际输出完全围绕输入问题展开，没有包含任何不相关或偏离主题的陈述。"
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the only retrieval context node is relevant and ranked first, and its content directly covers the defense against algorithm confusion by confirming 'alg 是白名单里的 HS256（防算法混淆攻击）' and 'raise InvalidAlgorithmError'. This perfect ranking leaves no irrelevant nodes above it, so the score is at its maximum."
+      },
+      "Contextual Recall": {
+        "score": 0.6666666666666666,
+        "success": false,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.67 because node 1 in retrieval context supports the first and second sentences of the expected output, covering the whitelist check for HS256 and raising InvalidAlgorithmError when header alg is not in the allowed algorithms; however, no node in retrieval context mentions attackers changing alg to none or other algorithms to bypass signature verification, so the third sentence is not grounded. Thus 2 out of 3 expected sentences are supported."
+      },
+      "id": "jwt-3",
+      "question": "什么是 JWT 算法混淆攻击？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "recall_count": 1,
+      "expected_answer": "算法混淆攻击的防御方式是验证时必须确认 header 里的 alg 在白名单中。PyJWT 内部执行流程第④步就是验算法：确认 alg 是白名单里的 HS256，如果 header 的 alg 不在 jwt.decode(..., algorithms=[\"HS256\"]) 指定的白名单内，则抛出 InvalidAlgorithmError。这样攻击者无法把 alg 换成 none 或其它算法来绕过验签。"
+    },
+    {
+      "input": "JWT 的过期时间是怎么判断的？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context; the output is fully faithful."
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output fully addresses the input with no irrelevant statements, providing a clear and complete explanation of how JWT expiration is determined."
+      },
+      "Contextual Precision": {
+        "score": 0.9861111111111112,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.99 because the vast majority of relevant nodes are ranked above the irrelevant node: the first seven nodes all directly support the exp-based expiration check, and the only irrelevant node appears at rank 8 with the reason 'mainly discusses where the token is stored and the consequences of statelessness such as 只能等 exp 过期; it does not explain how the expiration time is judged.' This means the irrelevant node is ranked quite low, but it is still placed above the relevant node at rank 9, which states that 'except jwt.PyJWTError catches all failure cases including 过期 and uniformly maps them to 401.' Since that relevant node should have been ranked above the irrelevant one, the score is not a perfect 1."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is directly supported by node(s) in retrieval context: sentence 1 matches the 1st node's explanation of `exp` as a Unix timestamp and the default 24h `timedelta(minutes=1440)`; sentence 2 matches the 1st node's expiry comparison logic (`now > exp` reject, `now < exp` allow); and sentence 3 is supported by the 3rd node's `raise ExpiredSignatureError` and the 9th node's `except jwt.PyJWTError` converting failures to 401. All expected content is fully accounted for, so the recall is perfect."
+      },
+      "id": "jwt-4",
+      "question": "JWT 的过期时间是怎么判断的？",
+      "expected": "JWT认证原理与验证流程.md",
+      "hit_rank": 1,
+      "recall_count": 9,
+      "expected_answer": "exp 是签发时写入 payload 的 Unix 时间戳（秒），默认 24 小时（\"exp\": datetime.now(timezone.utc) + timedelta(minutes=1440)）。校验逻辑是比对 exp 与当前时间：now > exp 则已过期，拒绝；now < exp 则未过期，放行。PyJWT 校验时会抛 ExpiredSignatureError，统一被 except jwt.PyJWTError 捕获转成 401。"
+    },
+    {
+      "input": "为什么用 Redis Streams 做入库任务队列？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 0.9375,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "得分为0.94，因为回答整体围绕选择 Redis Streams 作为入库任务队列的原因展开，相关性较高；但不能更高是因为其中提到了“/api/ingest/stats 指标暴露”这一与队列选型无关的细节，略微拉低了相关性。"
+      },
+      "Contextual Precision": {
+        "score": 0.8686752136752135,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.87 because the retrieval contexts are mostly well-ranked: the first five nodes are all relevant, with strong reasons like “Consumer Group + PEL ... 任务不丢” and “XACK 显式确认”, and most later relevant nodes also appear before the final relevant node. However, it is not higher because some irrelevant nodes are interleaved above later relevant nodes: node 6 “只展示入队实现...没有说明为何选 Streams”, node 7 “仅说明...来源说明，与选型理由无关”, node 11 “未解释为什么选 Redis Streams”, node 12 “不是选 Streams 的理由”, and node 14 “与‘为什么用 Redis Streams’没有直接关系” are ranked before the relevant nodes at ranks 8, 9, 10, 13, and 15. This prevents a perfect score, but the overall ranking is still strong because the majority of relevant nodes appear earlier than most irrelevant nodes."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is directly supported by nodes in the retrieval context: sentence 1 matches the opening of node 3; sentence 2 is covered by the table in node 1 and further reinforced by nodes 2 and 15 for crash recovery/retry/dead-letter details; sentence 3 matches the closing statement in node 2. No expected content is left unattributed."
+      },
+      "id": "queue-1",
+      "question": "为什么用 Redis Streams 做入库任务队列？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 15,
+      "expected_answer": "基于 Redis Streams + Consumer Group 实现可靠任务队列。Consumer Group + PEL 保证任务被 worker 领取后、ACK 前若进程崩溃，消息留在 PEL，重启后 XAUTOCLAIM 回收重新投递，任务不丢；XACK 显式确认，处理失败不 ACK，配合重试计数与死信队列；mkstream 自动建流，多 worker 可横向扩展（GROUP 消费）。这是选 Streams 而非简单 List 的核心原因。"
+    },
+    {
+      "input": "PEL 是什么？崩溃后未完成的任务怎么恢复？",
+      "Faithfulness": {
+        "score": 0.875,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.88 because the actual output incorrectly claims no information about PEL was found, while the retrieval context contains details about PEL (unACKed messages, XAUTOCLAIM reclaiming idle tasks, and crash recovery). This is a minor contradiction, so the score remains high but not perfect."
+      },
+      "Answer Relevancy": {
+        "score": 0.9,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.90 because the response mostly addresses PEL and crash recovery, but includes one irrelevant statement about knowledge base retrieval results that does not explain either concept, preventing a perfect score."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because all retrieval contexts are relevant and correctly ranked higher, with no irrelevant nodes present. The first node directly provides the crash recovery method, the second node explains PEL and the recovery mechanism, and the third node reinforces the reliability summary—all aligned with the input."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every sentence in the expected output is fully attributable to node(s) in retrieval context: sentences 1 and 2 are directly supported by node 2, which explains PEL as the Consumer Group's pending/unacknowledged message list and states that messages remain in PEL after a crash before ACK; sentence 3 is supported by node 1, which provides the XAUTOCLAIM call and recovery behavior for unACKed tasks idle over 10 seconds, and is also corroborated by node 2's mention of restart recovery via XAUTOCLAIM. No expected content lacks retrieval support."
+      },
+      "id": "queue-2",
+      "question": "PEL 是什么？崩溃后未完成的任务怎么恢复？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 3,
+      "expected_answer": "PEL 是 Consumer Group 的待确认消息列表（Pending Entries List）。任务被 worker 领取后、ACK 前若进程崩溃，消息会留在 PEL 中。worker 启动时调用 XAUTOCLAIM(STREAM, GROUP, \"recovery\", 10000, \"0\", count=100) 回收上次崩溃未 ACK 的任务（PEL 中空闲超过 10 秒的残留），重新投递，任务不丢。"
+    },
+    {
+      "input": "入库任务失败重试超过几次会进入死信队列？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly aligned!"
+      },
+      "Answer Relevancy": {
+        "score": 0.8333333333333334,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.83 because the actual output mostly addresses the input, but includes a statement about the dead-letter queue's subsequent processing capability, which is not directly relevant to the specific question of how many retries trigger entry into the dead-letter queue."
+      },
+      "Contextual Precision": {
+        "score": 0.8736394557823128,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.87 because the first two nodes are highly relevant and directly answer the retry threshold ('重试计数达到 3 次后送入死信队列' and '超 3 次进死信'), so the most important information is ranked at the top. However, the third node is irrelevant because it only mentions '死信队列目前只有写入，没有自动重放/告警机制', which does not help determine the retry count, and it is ranked above several later relevant nodes that describe the retry/dead-letter flow. This prevents a perfect score, but since only one irrelevant node appears after two exact relevant nodes and the remaining contexts are mostly relevant, the score remains high at 0.87."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "上下文召回得分为 1.00，因为期望输出的第1句“重试计数达到 3 次后送入死信队列”可在检索上下文中的节点1（以及节点2/4提及超3次进死信、重试超限→ingest_queue:dead）得到支持；第2句关于_handle_failure 中 hincrby 计数、XACK+XDEL 出队、retries >= MAX_RETRIES 判断、指数退避 2s/4s 后重新入队等细节，也能由节点1完整覆盖，且死信流名称由节点3/4补充。因此所有内容均能在检索上下文中找到依据。"
+      },
+      "id": "queue-3",
+      "question": "入库任务失败重试超过几次会进入死信队列？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 8,
+      "expected_answer": "重试计数达到 3 次后送入死信队列。_handle_failure 里 retries = await r.hincrby(RETRY_HASH, path, 1) 对重试计数加 1，先 XACK + XDEL 把原消息出队，若 retries >= MAX_RETRIES（3 次）则 XADD 到 ingest_queue:dead 死信流；否则按指数退避 2 ** retries（2s / 4s）后重新入队。"
+    },
+    {
+      "input": "入库时删除文档的竞态防护是怎么实现的？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 0.8333333333333334,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.83 because the response correctly addresses the general queue processing flow but includes an irrelevant statement about enqueue/consume/retry/dead-letter handling, which does not pertain to the specific race condition protection between deletion and document ingestion. The response is partially relevant, but not fully focused on the asked implementation detail."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every retrieval context node is relevant and optimally ranked, with no irrelevant nodes appearing earlier. The first node directly provides the core implementation, including the quote \"if await is_inflight(record.source): raise HTTPException(409...)\" and the explanation of the ingest inflight Set preventing orphan vectors, making it the strongest match. The second node supports this by explicitly listing \"竞态防护：inflight Set 协调删除与入库\", and the third node reinforces the mechanism with \"配合崩溃恢复与 inflight 竞态防护\". Since the most detailed and directly relevant node is ranked first and the supporting nodes follow in decreasing relevance, the precision is perfect."
+      },
+      "Contextual Recall": {
+        "score": 0.5,
+        "success": false,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.50 because expected output sentence 1 and sentence 3 can be attributed to nodes in retrieval context: node 1 explicitly mentions the `ingest:inflight` Set guarantee, and node 2 also coordinates deletion with ingestion. However, sentence 2 is only partially attributable—node 1 supports the delete-side 409 check but does not mention the enqueue-time `SADD INFLIGHT_KEY file_path` marking—and sentence 4 is not attributable at all, since nodes 1, 2, and 3 in retrieval context do not mention the worker's `SREM` removal of the inflight marker. Thus about half of the expected output is grounded in the retrieval context."
+      },
+      "id": "queue-4",
+      "question": "入库时删除文档的竞态防护是怎么实现的？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 3,
+      "expected_answer": "通过 ingest:inflight Set 做竞态防护。入队时 enqueue_ingest 会 SADD INFLIGHT_KEY file_path 标记正在入库；删除接口先检查 is_inflight(record.source)，命中则抛 HTTP 409（文档正在入库中，请稍后重试删除）。这保证\"删除先执行、入库后写完向量\"的孤儿向量竞态不会发生。worker 处理完会 SREM 移除 inflight 标记。"
+    },
+    {
+      "input": "入库队列里 inflight 集合的作用是什么？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Perfect alignment!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output directly and fully addresses the input question about the purpose of the inflight collection in the inbound queue, with no irrelevant statements."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every retrieval context node is relevant to the input, and no irrelevant nodes appear anywhere in the ranking. For example, the first node's reason 'The context mentions inflight 竞态防护...' and the fourth node's reason '竞态防护：inflight Set 协调删除与入库' directly support the role of the inflight set, while all subsequent nodes also reinforce this with concrete code and table evidence. Since all nodes are relevant and ranked in a useful order, the contextual precision is perfect."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because all parts of the expected output are fully supported by node(s) in retrieval context: sentence 1 aligns with node 3, sentence 2 is backed by nodes 2 and 7, and sentence 3 is confirmed by nodes 3 and 6. Perfect grounding!"
+      },
+      "id": "queue-5",
+      "question": "入库队列里 inflight 集合的作用是什么？",
+      "expected": "Redis入库队列设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 7,
+      "expected_answer": "ingest:inflight 是一个 Set，记录正在入库的文件路径。入队时 SADD 标记\"正在入库\"，worker 消费完成后 SREM 移除。它的作用是协调删除与入库的竞态：删除接口据此返回 409 拒绝删除正在入库的文档，从而避免\"先删 MySQL 记录、后写 Milvus 向量\"导致的孤儿向量问题。"
+    },
+    {
+      "input": "意图识别为什么要分规则层和 LLM 层？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions, and the actual output aligns perfectly with the retrieval context. Great job!"
+      },
+      "Answer Relevancy": {
+        "score": 0.8333333333333334,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "得分是0.83，因为回答整体上说明了意图识别分规则层和LLM层的原因，但包含一些与划分原因无关的细节（如流程起点、兜底层处理方式及query细节），这些冗余信息降低了相关性，因此未达到更高分。"
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every node in the retrieval contexts is relevant to the input and supports the explanation of why intent recognition uses a rule layer and an LLM layer. The first node directly describes the three-tier architecture with '规则层（零延迟、不耗 LLM）命中' and 'LLM 层...一次返回 {intent, query, confidence, reason}', while the later nodes reinforce the cost/experience balance, the rule fast path, and the fallback behavior. Since there are no irrelevant nodes ranked among them, the contextual precision is at its maximum and cannot be higher."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is grounded in node(s) in retrieval context: sentence 1 is supported by nodes 1, 4, 6, and 7 (rule-layer zero-latency/no-LLM chat hit, LLM-layer output with {intent, query, confidence, reason}, and fallback with original query), and sentence 2 is supported by node 2 (three-layer degradation balancing cost and experience)."
+      },
+      "id": "intent-1",
+      "question": "意图识别为什么要分规则层和 LLM 层？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 7,
+      "expected_answer": "因为规则层零延迟、不耗 LLM，命中即返回 chat 直接闲聊，不触发检索；未命中才走 LLM 层，一次调用同时输出 {intent, query, confidence, reason}（intent 为 rag_ask/chat/other，query 是提炼后的核心检索词）；LLM 失败再落到兜底层按 rag_ask 处理、query 用原文。三层降级让免费规则处理高频闲聊、LLM 处理精准意图、兜底保证对话不中断，成本与体验平衡。"
+    },
+    {
+      "input": "指代性追问（如'那它呢'）是怎么补全的？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 0.9333333333333333,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.93 because the response mostly addresses how referential follow-ups like '那它呢' are completed, but it includes an irrelevant statement about fault-tolerant behavior on read failure, which prevents a higher score."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every node in the retrieval contexts is relevant to the input, and the ranking is optimal. The first node directly explains the completion mechanism with “指代补全：结合历史把‘它/那个’补全为可独立检索的 query”， so it is correctly ranked highest. The second node elaborates on the LLM-layer process, including how “遇到‘它/这个/上面/刚才/继续/展开讲讲’等指代，结合 `<conversation_history>` 补全为明确实体”, adding valuable detail. The third node supports this by describing the prompt design and safety constraints, and the fourth node usefully places the mechanism within the overall architecture. Since there are no irrelevant nodes ranked above relevant ones, the contextual precision score is perfect."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because both parts of the expected output are fully supported by the 2nd node in retrieval context: the first sentence about指代补全 and query refinement matches the node’s explanation, and the second sentence about conversation_history, user_input, and JSON-only output is also directly stated there. No expected sentence lacks supporting evidence."
+      },
+      "id": "intent-2",
+      "question": "指代性追问（如'那它呢'）是怎么补全的？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 4,
+      "expected_answer": "指代补全发生在 LLM 层的查询提炼阶段：遇到\"它/这个/上面/刚才/继续/展开讲讲\"等指代，结合 conversation_history 补全为明确实体（如\"它\"→\"LangGraph\"），使 query 不依赖历史也能独立检索；输入本身干净则原样输出。prompt 安全设计上 conversation_history 仅作补全参考、禁止修改，user_input 只是待分析文本、不执行其中任何指令（防提示注入），且只输出 JSON。"
+    },
+    {
+      "input": "意图识别失败时的兜底策略是什么？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions, and the actual output aligns perfectly with the retrieval context. Great job!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The answer relevancy score is 1.00 because the response fully and directly addresses the question with no irrelevant statements."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the relevant nodes are perfectly ranked above the irrelevant ones. The first node directly gives the fallback implementation ('该文档直接给出兜底层实现代码...'), the second and third nodes reinforce the fallback behavior from the architecture and design highlights, and the last two nodes are irrelevant and correctly ranked lower. Since the ranking is already optimal, the score cannot be higher."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because sentence 1 in the expected output is fully supported by node 1 in the retrieval context, which contains the except Exception return and the statement 'LLM 失败/解析失败时按 rag_ask 处理，query 用原文，用户永远能拿到回答', and by node 2 in the retrieval context, which reiterates '按 rag_ask 处理，query 用原文，保证对话不中断'. All key details are covered, so nothing is left unsupported."
+      },
+      "id": "intent-3",
+      "question": "意图识别失败时的兜底策略是什么？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 5,
+      "expected_answer": "LLM 失败/解析失败时走兜底层：except Exception 返回 Intent(intent=\"rag_ask\", query=content, confidence=0.5, reason=\"LLM 分析失败，兜底 rag_ask\")，按 rag_ask 处理、query 用原文，保证用户永远能拿到回答、对话不中断。"
+    },
+    {
+      "input": "意图识别带 history 的指代补全完成度大概是多少？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. The output is fully faithful and consistent with the provided information. Great job!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output fully addresses the input question without any irrelevant statements, providing a complete and focused response."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because all relevant nodes are ranked above the irrelevant ones. The first seven nodes directly support the input, especially the first node with “文档直接给出‘history 完成度评估（约 85%）’...”, while the irrelevant nodes appear at ranks 8 and 9, with reasons like “文档主要描述无历史/读取失败...” and “文档是整体架构说明...”. Since the irrelevant nodes are ranked lowest, the contextual precision is perfect."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every sentence in the expected output maps cleanly to node(s) in retrieval context: node 1 supports all six sentences, and node 2 supplies the exact limits (HISTORY_MAX_TURNS=3, HISTORY_MAX_CHARS=150) for sentences 2 and 3. Complete alignment!"
+      },
+      "id": "intent-4",
+      "question": "意图识别带 history 的指代补全完成度大概是多少？",
+      "expected": "意图识别模块设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 9,
+      "expected_answer": "带 history 的指代补全完成度约为 85%。存在的限制：只取最近 3 轮（HISTORY_MAX_TURNS=3），长对话中更早的指代无法补全；单条消息截断 150 字符（HISTORY_MAX_CHARS=150），长消息可能截断关键指代信息；纯文本拼接，未区分消息重要性；依赖 LLM 补全质量且无结果校验；InMemorySaver 场景下多 worker 历史不共享，指代补全可能失效。"
+    },
+    {
+      "input": "对话记忆的 checkpointer 支持哪两种后端？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 0.9230769230769231,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.92 because the response mostly addresses which two backends the checkpointer supports, but includes one irrelevant statement about MySQL storage content, preventing a perfect score."
+      },
+      "Contextual Precision": {
+        "score": 0.95,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.95 because the first three retrieval contexts are relevant nodes that directly mention both backends, and the only irrelevant node is ranked fourth, below three relevant nodes. However, it is not higher because that irrelevant node is still ranked before the fifth relevant node, which explicitly states '双后端可切换：Postgres / InMemory 一键切换'. Since contextual precision requires all relevant nodes to be ranked above irrelevant ones, this one inversion prevents a perfect score."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is grounded in the retrieval context: node 1 in retrieval context directly supports PostgresSaver.from_conn_string(url) with cross-process sharing, restart persistence, multi-worker consistency, and InMemorySaver() for dev only with restart/multi-worker loss; node 2 in retrieval context reinforces InMemorySaver's in-process and restart-loss behavior. Great job!"
+      },
+      "id": "session-1",
+      "question": "对话记忆的 checkpointer 支持哪两种后端？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 5,
+      "expected_answer": "checkpointer 支持两种后端：配置 MEMORY_DATABASE_URL 时用 PostgresSaver.from_conn_string(url)，跨进程共享、重启不丢、多 worker 一致；未配置时用 InMemorySaver()，仅进程内存储，重启或多 worker 都会丢失，只适合开发调试。"
+    },
+    {
+      "input": "会话标识 thread_id 是怎么组成的？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 0.5555555555555556,
+        "success": false,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "当前分数为 0.56：回答并非完全离题，有一定内容涉及 thread_id 的组成，但因大量篇幅偏离问题，转而描述 checkpointer、SummarizationMiddleware、TTL 清理及表关联等与 thread_id 组成方式无关的细节，所以不能更高；仍有部分相关性，故维持中等分数。"
+      },
+      "Contextual Precision": {
+        "score": 0.8333333333333334,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.83 because the first two nodes in retrieval contexts are relevant and directly explain thread_id composition with quotes like 'thread_id = f\"{user.id}:{session_id}\" # 按用户隔离' and 'thread_id = f\"{user.id}:{session_id}\" ← 按用户隔离的会话标识', so they are correctly ranked above the irrelevant nodes at ranks 3, 4, and 5, which only mention '生成 thread_id', '三表通过 thread_id 关联', or 'thread_id 隔离会话' without composition details. However, a relevant node appears again at rank 6 with '用户级隔离：user.id:session_id 双段 thread_id', and it is ranked below those irrelevant nodes, so the precision is not perfect."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the single sentence in the expected output is fully supported by node 1 and node 2 in the retrieval context: both nodes state that session_id comes from the frontend or server-side uuid generation, and that thread_id is composed of user id + session id for user isolation. There are no gaps in the retrieved information."
+      },
+      "id": "session-2",
+      "question": "会话标识 thread_id 是怎么组成的？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 7,
+      "expected_answer": "session_id 由前端传入或服务端 uuid.uuid4().hex 生成；thread_id = f\"{user.id}:{session_id}\"，即由用户 id 和会话 id 拼接而成，实现按用户隔离——不同用户即使 session_id 相同也不会串记忆。"
+    },
+    {
+      "input": "会话记忆的 TTL 过期清理规则是什么？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 0.9375,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.94 because the response is almost entirely relevant to the TTL expiration rules, but includes one extraneous statement about where table structure changes are maintained, which is not directly about the TTL cleanup rules themselves."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every retrieval context node is relevant to the TTL cleanup question. The first node directly provides the cleanup details ('MEMORY_TTL_DAYS = 1', 'CLEANUP_INTERVAL_SECONDS = 60 * 60', '超过 1 天未活动的线程整线程删除（三表联动）'), and subsequent nodes reinforce the same rule, such as 'TTL 默认仅 1 天' and '1 天未活动 → 整线程删除（三表联动）'. Since there are no irrelevant nodes, no lower-ranked irrelevant nodes exist, so the ranking is perfect."
+      },
+      "Contextual Recall": {
+        "score": 0.5,
+        "success": false,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.50 because node 1 in retrieval context supports sentence 2 regarding hourly FastAPI lifespan cleanup and automatic skip when Postgres is not configured, but sentence 1 is only partially supported by nodes 1 and 3: although TTL default 1 day, last-active countdown, and whole-thread deletion across three tables are mentioned, the specific MySQL chat_sessions.updated_at and checkpoints / checkpoint_writes / checkpoint_blobs table names are absent, so about half of the expected output is attributable."
+      },
+      "id": "session-3",
+      "question": "会话记忆的 TTL 过期清理规则是什么？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 5,
+      "expected_answer": "TTL 默认 1 天（MEMORY_TTL_DAYS=1），以 MySQL chat_sessions.updated_at（会话最后活跃时间）为基准倒计时，超过 1 天未活动的线程整线程删除（checkpoints / checkpoint_writes / checkpoint_blobs 三表联动）。由 FastAPI lifespan 后台任务每小时执行一次清理（CLEANUP_INTERVAL_SECONDS=3600），未配置 Postgres 时自动跳过。"
+    },
+    {
+      "input": "上下文达到多少时触发摘要压缩？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions; the actual output aligns perfectly with the retrieval context. Great job!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the output directly and fully addresses the input question with no irrelevant statements, so there is no reason for it to be lower; it is already perfect."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "得分是 1.00，因为检索上下文中的三个节点均按相关度正确排列：第1个节点直接说明触发条件（“约 20 轮对话或 6000 tokens 触发，摘要后保留最近 10 条消息”），第2个节点给出具体阈值（“40 条消息 或 6000 tokens 触发摘要 → 保留最近 10 条”），第3个节点进一步列出配置常量（“SUMMARIZE_TRIGGER_MESSAGES = 40”、“SUMMARIZE_TRIGGER_TOKENS = 6000”），没有不相关节点排在前面，因此上下文精度满分。"
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the single sentence in the expected output is fully supported by nodes 1, 2, and 3 in the retrieval context, which together cover the trigger conditions, token/message thresholds, and the keep-last-10-messages behavior."
+      },
+      "id": "session-4",
+      "question": "上下文达到多少时触发摘要压缩？",
+      "expected": "会话管理模型设计与实现.md",
+      "hit_rank": 2,
+      "recall_count": 3,
+      "expected_answer": "上下文达到约 20 轮对话（40 条消息，SUMMARIZE_TRIGGER_MESSAGES=40）或 6000 tokens（SUMMARIZE_TRIGGER_TOKENS=6000，防止单轮超大参考资料撑爆）任一条件时触发摘要压缩，由 SummarizationMiddleware 自动执行；摘要后仅保留最近 10 条原始消息（SUMMARIZE_KEEP_MESSAGES=10），防止上下文无限增长。"
+    },
+    {
+      "input": "word_complicatedness 评估文档复杂度有什么用？",
+      "Faithfulness": {
+        "score": 0.8888888888888888,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.89 because the actual output slightly contradicts the context by suggesting PDFs can undergo word_complicatedness evaluation, whereas the context clearly states PDFs always go through MinerU and word_complicatedness only applies to .docx files. Apart from this, the output aligns well with the rest of the context."
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output perfectly addresses the input with no irrelevant statements, fully answering the question about the usefulness of assessing document complexity."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every retrieval context node is relevant and directly supports the input, and they are all ranked appropriately from the first node onward. For example, the first node states 'loader 里先用 word_complicatedness 评估复杂度再分流，兼顾成本与质量', which precisely answers the purpose, and later nodes expand on threshold, scoring dimensions, and pipeline flow. Since no irrelevant nodes are present, contextual precision is perfect."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the expected output is fully attributable to node(s) in retrieval context: sentence 1's 9-dimension weighted scoring and threshold are grounded in nodes 3 and 5, with node 3 stating COMPLEXITY_THRESHOLD = 3 and node 5 listing the +2 / +2~4 / +3 weights; sentence 2's routing logic is grounded in nodes 1, 4, 7, and 11, where node 11 explicitly maps score < 3 to local Unstructured parsing and ≥ 3 to MinerU, while nodes 1, 4, and 7 confirm the cost-quality balance. All details are covered, so the contextual recall score is 1.00."
+      },
+      "id": "loader-1",
+      "question": "word_complicatedness 评估文档复杂度有什么用？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 3,
+      "recall_count": 12,
+      "expected_answer": "word_complicatedness 用 9 维度加权打分评估 Word 文档复杂度（内嵌图片 +2、表格含嵌套/合并单元格 +2~4、多栏布局 +3、VML 文本框 +2、浮动图形 +2、SmartArt +3、图表 +3、OLE 嵌入对象 +3、OMML 数学公式 +2 等），得分 >= 3（COMPLEXITY_THRESHOLD）判定为复杂文档。用途是分级解析：简单文档走本地 Unstructured 免费解析，复杂文档才走 MinerU 云端解析，平衡成本与质量，避免简单文档浪费解析额度、复杂文档本地解析丢内容。"
+    },
+    {
+      "input": "复杂文档为什么要走 MinerU 解析？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Perfect alignment!"
+      },
+      "Answer Relevancy": {
+        "score": 0.8823529411764706,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.88 because the main response correctly addresses why complex documents use MinerU parsing, but it includes some irrelevant details about the source field and md_path flow/traceability that do not directly relate to the question."
+      },
+      "Contextual Precision": {
+        "score": 0.9821780783319245,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.98 because nearly all relevant nodes are ranked above irrelevant ones: the first ten nodes directly support why complex documents go through MinerU (e.g., node 1 says '复杂文档...保真度高' and node 7 describes 'Word: 复杂度评估 → 简单走本地解析 / 复杂走 MinerU'). The only irrelevant node is at rank 11, whose reason is '该节点只是项目概览中提及 loader...没有解释复杂文档为什么要走 MinerU', so it should have been ranked lower than the relevant nodes at ranks 12-14. Since that single irrelevant node appears before three relevant nodes, the score is not 1.0, but it is still 0.98 because the irrelevant node is late and all earlier nodes are relevant."
+      },
+      "Contextual Recall": {
+        "score": 0.6666666666666666,
+        "success": false,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.67 because node(s) in retrieval context (1st, 2nd, 4th, 12th, 14th) support sentence 1 and most of sentence 3, but sentence 2 is only partially supported: the aspects of MinerU service parsing, polling, downloading zip, fidelity, and local parsing for simple docs appear across these nodes, while '预签名 URL 直传 OSS' and 'full.md' are absent, so that sentence cannot be fully attributed."
+      },
+      "id": "loader-2",
+      "question": "复杂文档为什么要走 MinerU 解析？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 2,
+      "recall_count": 14,
+      "expected_answer": "因为本地 Unstructured 对含图片、公式、图表、复杂布局的文档会丢失内容。MinerU 是服务化云端解析（提交预签名 URL 直传 OSS → 轮询直到 done/failed → 下载 zip 内存解压定位 full.md），保真度高，能还原公式、图片、表格、扫描排版；而简单文档（纯文字）用本地解析快、免费、离线。所以先评估复杂度，超过阈值才动用 MinerU，兼顾成本与质量。"
+    },
+    {
+      "input": "表格和公式在切分时是怎么被保护的？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context, indicating perfect faithfulness."
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output fully and directly addresses the input with no irrelevant statements, perfectly matching the question's focus."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because all retrieved nodes are relevant to how tables and formulas are protected during splitting. The first node directly states '切分前替换为 `<ATOMIC_N>` 占位符，切分后还原', and nodes through the ninth consistently reinforce the same atomic-block protection mechanism, such as '公式（$$...$$）和表格是原子块，切分前用占位符保护、切完还原'. Since there are no irrelevant nodes that need to be ranked lower, every relevant node appears in the correct ranking position, giving perfect contextual precision."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is fully backed by the retrieval context: nodes 1 and 5 in the retrieval context confirm the atomic-block protection mechanism with regexes and placeholder restoration for sentence 1, while nodes 2 and 3 in the retrieval context confirm the long-table splitting and repeated header behavior for sentence 2. All details align perfectly."
+      },
+      "id": "loader-3",
+      "question": "表格和公式在切分时是怎么被保护的？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 1,
+      "recall_count": 9,
+      "expected_answer": "表格和公式作为原子块被保护：切分前用 _QA_PAIR_RE（问答对）、_FORMULA_RE（$$...$$ 块级公式）、_TABLE_RE（连续 | 开头的表格行）正则匹配，替换为 <ATOMIC_N> 占位符，切分完成后再还原，保证公式/表格/问答对永不被拆散。超长表格还会按行组拆成多个子表，每个子表重复表头（前两行），保证子表可独立理解。"
+    },
+    {
+      "input": "大文件入库时 smart_load 是怎么处理的？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Perfect alignment!"
+      },
+      "Answer Relevancy": {
+        "score": 0.8666666666666667,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.87 because the response primarily addresses smart_load's large-file handling, but it includes irrelevant statements about UTF-8 encoding and GBK fallback that are unrelated to the large-file ingestion mechanism, preventing a higher score."
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the retrieval contexts are perfectly ordered: the first three nodes in retrieval contexts are relevant and directly explain smart_load's 5MB/10MB threshold and lazy_load behavior, e.g. 'smart_load 按文件大小分流：≤5MB 用 load() 一次性返回，>5MB 用 lazy_load() 迭代加载' and 'LARGE_FILE_THRESHOLD = 5 * 1024 * 1024'. The later irrelevant nodes, ranked 4th to 7th, discuss type-based dispatch, encoding fallback, pipeline summaries, and module overviews, such as '未说明大文件阈值或 lazy_load 的分流处理' and '未涉及 smart_load 按 5MB/10MB 和大文件 lazy_load 的具体处理'. Since all relevant nodes appear before the irrelevant nodes, the ranking is ideal and the score cannot be higher."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is fully grounded in the retrieval context: sentence 1 (smart_load's file-size branching, 5MB threshold, lazy_load vs load) is supported by nodes 1 and 3 in the retrieval context, and sentence 2 (10MB MAX_FILE_SIZE hard limit and rejection) is supported by nodes 1, 2, and 3 in the retrieval context. All details align perfectly, leaving no gaps."
+      },
+      "id": "loader-4",
+      "question": "大文件入库时 smart_load 是怎么处理的？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 3,
+      "recall_count": 7,
+      "expected_answer": "smart_load 按文件大小分流：超过 5MB（LARGE_FILE_THRESHOLD）时用 loader.lazy_load() 逐条迭代加载，避免大文件整份进内存溢出；否则用 loader.load() 一次性返回。另有 10MB（MAX_FILE_SIZE）的入库上限做硬校验，超限拒绝入库。"
+    },
+    {
+      "input": "QA 文档的问答对为什么不能拆散，怎么保证？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly faithful!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "回答与问题高度相关，清晰解释了问答对不可拆散的原因和保证方法，没有无关表述，因此获得满分1.00。"
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the first four nodes are all directly relevant: node 1 explains why chunks split and the atomic-block fix, node 2 details placeholder protection, node 3 covers length-based regrouping, and node 4 lists QA-pair atomic protection. The only irrelevant node is ranked 5th, and its reason only mentions '如问答对原子保护' as a code-adaptation example, so it correctly belongs below all relevant nodes. Perfect ranking!"
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is fully grounded in the retrieval context: node 1 in the retrieval context directly supports the problem statement in sentence 1 and the atomic-block idea in sentence 2, node 2 supports the placeholder replacement and restoration mechanism, and node 3 supports the restored-length grouping and greedy merging guarantee. Thus the entire expected output is completely covered."
+      },
+      "id": "loader-5",
+      "question": "QA 文档的问答对为什么不能拆散，怎么保证？",
+      "expected": "文档加载与切分模块设计与实现.md",
+      "hit_rank": 2,
+      "recall_count": 5,
+      "expected_answer": "因为 chunk 按 \\n\\n + 字符数贪心合并时，边界会恰好落在 **Q：...** 与 A：... 之间，产生\"只有问题没答案 / 只有答案没问题\"的无效 chunk。保证方式：把 **Q：...** 与紧随的 A：... 识别为原子块，与公式、表格用同一套占位符保护机制（切分前替换为 <ATOMIC_N>、切分后还原），并配套按\"还原后长度\"分组——占位符按其原始块长度参与计算，在段落之间贪心合并，保证问答对不拆散且 chunk 不超长。"
+    },
+    {
+      "input": "文件指纹有几把钥匙，各自作用是什么？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context. Great job staying perfectly aligned!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output perfectly addresses the input with no irrelevant statements, making it fully relevant and on-point. Great job!"
+      },
+      "Contextual Precision": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the first retrieval context is directly relevant and fully answers the input, providing the expected output: '三把，全部用 SHA256，口径统一：...'. There are no irrelevant nodes ranked above it, so the relevant node is optimally positioned."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the expected output is fully and directly supported by node 1 in the retrieval context, which contains the same key details about the three SHA256 hashes, their formulas, and the Milvus primary key usage."
+      },
+      "id": "qa-1",
+      "question": "文件指纹有几把钥匙，各自作用是什么？",
+      "expected": "项目开发经验QA.md",
+      "hit_rank": 1,
+      "recall_count": 1,
+      "expected_answer": "三把钥匙，全部用 SHA256，口径统一：identity_hash = SHA256(file_name | source) 是文件身份唯一键，判断\"同名同源\"，作为 vector_files 表唯一索引；file_content_hash = SHA256(文件原始字节) 判断内容是否变化，流式读取避免大文件占内存；chunk_fingerprint = SHA256(source | content) 是 chunk 去重指纹，同时作为 Milvus 主键。"
+    },
+    {
+      "input": "MySQL 和 Milvus 为什么用两阶段落库？",
+      "Faithfulness": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because there are no contradictions between the actual output and the retrieval context; the output is perfectly faithful and aligns seamlessly. Great job!"
+      },
+      "Answer Relevancy": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because the actual output directly and fully addresses the question about why MySQL and Milvus use two-phase storage, with no irrelevant statements."
+      },
+      "Contextual Precision": {
+        "score": 0.8734371184371182,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 0.87 because the top five retrieval contexts are highly relevant and directly explain MySQL/Milvus two-phase persistence, such as “两阶段 + 状态机” and “先 MySQL 后 Milvus：MySQL 提交失败直接回滚，Milvus 一次都没碰”. Most irrelevant nodes are ranked lower, which keeps precision high. However, it is not higher because the 6th and 7th nodes are irrelevant—one mainly discusses SQLAlchemy async and embedding selection and “没有涉及两阶段落库、孤儿向量或状态机”, while the other focuses on intent recognition, Milvus async, and service/CLI decoupling—yet they appear before the relevant nodes at ranks 8, 9, 10, 13, and 14, which explain state-machine consistency, deterministic IDs, Milvus idempotent writes, and source-口径 alignment. Those irrelevant nodes should have been ranked below all relevant nodes, so the score reflects the otherwise strong ordering with only this mid-ranked contamination."
+      },
+      "Contextual Recall": {
+        "score": 1.0,
+        "success": true,
+        "passed": null,
+        "threshold": 0.7,
+        "reason": "The score is 1.00 because every part of the expected output is fully supported by node(s) in retrieval context. Sentence 1 is directly supported by node 4 in retrieval context, which describes the original Milvus-then-MySQL order causing orphan vectors and the retry blockage. Sentence 2 is supported by nodes 1 and 4 in retrieval context, which together provide the two-phase + state machine solution, including MySQL pending/rollback, Milvus deterministic ID idempotent sync, and full rebuild by source. Sentence 3 is supported by node 1 in retrieval context, confirming that MySQL commit failure leaves Milvus untouched and avoids mismatched residual data. All expected content aligns perfectly with the retrieval context."
+      },
+      "id": "qa-2",
+      "question": "MySQL 和 Milvus 为什么用两阶段落库？",
+      "expected": "项目开发经验QA.md",
+      "hit_rank": 1,
+      "recall_count": 14,
+      "expected_answer": "因为早期是先写 Milvus 再写 MySQL，Milvus 成功而 MySQL 失败时会留下孤儿向量，且失败后重跑会被\"内容未变\"逻辑跳过卡死。解决方案改为两阶段 + 状态机：阶段一 MySQL 先落期望状态并提交（sync_status=pending），失败即回滚，此时 Milvus 完全没动；阶段二 Milvus 按确定性 ID 幂等同步（先删后插），成功置 in_sync，失败置 failed 并保留 MySQL 期望状态；重跑时按 source 全量重建。这样 MySQL 提交失败时 Milvus 不会有孤儿向量。"
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+{
+  "jwt-1": {
+    "expected_answer": "JWT 由三部分组成，用 `.` 分隔：header、payload、signature。header 内容如 {\"alg\":\"HS256\",\"typ\":\"JWT\"}，作用是声明签名算法；payload 内容如 {\"sub\":\"1\",\"role\":\"admin\",\"exp\":...}，存放业务数据与过期时间；signature 是签名值，作用是防篡改的指纹。注意三部分都是 Base64URL 编码，不是加密，任何人都能解码看到内容，所以不要把密码等敏感信息放进 payload。",
+    "draft": false,
+    "source": "JWT认证原理与验证流程.md"
+  },
+  "jwt-2": {
+    "expected_answer": "签名生成方式为 signature = HMAC_SHA256(base64(header) + \".\" + base64(payload), JWT_SECRET)。校验时服务端取出 token 的 header 和 payload，用 JWT_SECRET 重新计算 HMAC_SHA256，再与 token 自带的 signature 比对：一致则签名合法，说明 header/payload 没被改过；不一致则非法，拒绝。关键点：JWT_SECRET 只有服务端知道，攻击者想篡改 payload（如把 role 改成 admin）必须重新算签名，但没有密钥就算不出来，任何改动都会导致验签失败。",
+    "draft": false,
+    "source": "JWT认证原理与验证流程.md"
+  },
+  "jwt-3": {
+    "expected_answer": "算法混淆攻击的防御方式是验证时必须确认 header 里的 alg 在白名单中。PyJWT 内部执行流程第④步就是验算法：确认 alg 是白名单里的 HS256，如果 header 的 alg 不在 jwt.decode(..., algorithms=[\"HS256\"]) 指定的白名单内，则抛出 InvalidAlgorithmError。",
+    "draft": false,
+    "source": "JWT认证原理与验证流程.md"
+  },
+  "jwt-4": {
+    "expected_answer": "exp 是签发时写入 payload 的 Unix 时间戳（秒），默认 24 小时（\"exp\": datetime.now(timezone.utc) + timedelta(minutes=1440)）。校验逻辑是比对 exp 与当前时间：now > exp 则已过期，拒绝；now < exp 则未过期，放行。PyJWT 校验时会抛 ExpiredSignatureError，统一被 except jwt.PyJWTError 捕获转成 401。",
+    "draft": false,
+    "source": "JWT认证原理与验证流程.md"
+  },
+  "queue-1": {
+    "expected_answer": "基于 Redis Streams + Consumer Group 实现可靠任务队列。Consumer Group + PEL 保证任务被 worker 领取后、ACK 前若进程崩溃，消息留在 PEL，重启后 XAUTOCLAIM 回收重新投递，任务不丢；XACK 显式确认，处理失败不 ACK，配合重试计数与死信队列；mkstream 自动建流，多 worker 可横向扩展（GROUP 消费）。这是选 Streams 而非简单 List 的核心原因。",
+    "draft": false,
+    "source": "Redis入库队列设计与实现.md"
+  },
+  "queue-2": {
+    "expected_answer": "PEL 是 Consumer Group 的待确认消息列表（Pending Entries List）。任务被 worker 领取后、ACK 前若进程崩溃，消息会留在 PEL 中。worker 启动时调用 XAUTOCLAIM(STREAM, GROUP, \"recovery\", 10000, \"0\", count=100) 回收上次崩溃未 ACK 的任务（PEL 中空闲超过 10 秒的残留），重新投递，任务不丢。",
+    "draft": false,
+    "source": "Redis入库队列设计与实现.md"
+  },
+  "queue-3": {
+    "expected_answer": "重试计数达到 3 次后送入死信队列。_handle_failure 里 retries = await r.hincrby(RETRY_HASH, path, 1) 对重试计数加 1，先 XACK + XDEL 把原消息出队，若 retries >= MAX_RETRIES（3 次）则 XADD 到 ingest_queue:dead 死信流；否则按指数退避 2 ** retries（2s / 4s）后重新入队。",
+    "draft": false,
+    "source": "Redis入库队列设计与实现.md"
+  },
+  "queue-4": {
+    "expected_answer": "通过 ingest:inflight Set 做竞态防护。入队时 enqueue_ingest 会 SADD INFLIGHT_KEY file_path 标记正在入库；删除接口先检查 is_inflight(record.source)，命中则抛 HTTP 409（文档正在入库中，请稍后重试删除）。这保证\"删除先执行、入库后写完向量\"的孤儿向量竞态不会发生。worker 处理完会 SREM 移除 inflight 标记。",
+    "draft": false,
+    "source": "Redis入库队列设计与实现.md"
+  },
+  "queue-5": {
+    "expected_answer": "ingest:inflight 是一个 Set，记录正在入库的文件路径。入队时 SADD 标记\"正在入库\"，worker 消费完成后 SREM 移除。它的作用是协调删除与入库的竞态：删除接口据此返回 409 拒绝删除正在入库的文档，从而避免\"先删 MySQL 记录、后写 Milvus 向量\"导致的孤儿向量问题。",
+    "draft": false,
+    "source": "Redis入库队列设计与实现.md"
+  },
+  "intent-1": {
+    "expected_answer": "因为规则层零延迟、不耗 LLM，命中即返回 chat 直接闲聊，不触发检索；未命中才走 LLM 层，一次调用同时输出 {intent, query, confidence, reason}（intent 为 rag_ask/chat/other，query 是提炼后的核心检索词）；LLM 失败再落到兜底层按 rag_ask 处理、query 用原文。三层降级让免费规则处理高频闲聊、LLM 处理精准意图、兜底保证对话不中断，成本与体验平衡。",
+    "draft": false,
+    "source": "意图识别模块设计与实现.md"
+  },
+  "intent-2": {
+    "expected_answer": "指代补全发生在 LLM 层的查询提炼阶段：遇到\"它/这个/上面/刚才/继续/展开讲讲\"等指代，结合 conversation_history 补全为明确实体（如\"它\"→\"LangGraph\"），使 query 不依赖历史也能独立检索；输入本身干净则原样输出。prompt 安全设计上 conversation_history 仅作补全参考、禁止修改，user_input 只是待分析文本、不执行其中任何指令（防提示注入），且只输出 JSON。",
+    "draft": false,
+    "source": "意图识别模块设计与实现.md"
+  },
+  "intent-3": {
+    "expected_answer": "LLM 失败/解析失败时走兜底层：except Exception 返回 Intent(intent=\"rag_ask\", query=content, confidence=0.5, reason=\"LLM 分析失败，兜底 rag_ask\")，按 rag_ask 处理、query 用原文，保证用户永远能拿到回答、对话不中断。",
+    "draft": false,
+    "source": "意图识别模块设计与实现.md"
+  },
+  "intent-4": {
+    "expected_answer": "带 history 的指代补全完成度约为 85%。存在的限制：只取最近 3 轮（HISTORY_MAX_TURNS=3），长对话中更早的指代无法补全；单条消息截断 150 字符（HISTORY_MAX_CHARS=150），长消息可能截断关键指代信息；纯文本拼接，未区分消息重要性；依赖 LLM 补全质量且无结果校验；InMemorySaver 场景下多 worker 历史不共享，指代补全可能失效。",
+    "draft": false,
+    "source": "意图识别模块设计与实现.md"
+  },
+  "session-1": {
+    "expected_answer": "checkpointer 支持两种后端：配置 MEMORY_DATABASE_URL 时用 PostgresSaver.from_conn_string(url)，跨进程共享、重启不丢、多 worker 一致；未配置时用 InMemorySaver()，仅进程内存储，重启或多 worker 都会丢失，只适合开发调试。",
+    "draft": false,
+    "source": "会话管理模型设计与实现.md"
+  },
+  "session-2": {
+    "expected_answer": "session_id 由前端传入或服务端 uuid.uuid4().hex 生成；thread_id = f\"{user.id}:{session_id}\"，即由用户 id 和会话 id 拼接而成，实现按用户隔离——不同用户即使 session_id 相同也不会串记忆。",
+    "draft": false,
+    "source": "会话管理模型设计与实现.md"
+  },
+  "session-3": {
+    "expected_answer": "TTL 默认 1 天（MEMORY_TTL_DAYS=1），以 MySQL chat_sessions.updated_at（会话最后活跃时间）为基准倒计时，超过 1 天未活动的线程整线程删除（checkpoints / checkpoint_writes / checkpoint_blobs 三表联动）。由 FastAPI lifespan 后台任务每小时执行一次清理（CLEANUP_INTERVAL_SECONDS=3600），未配置 Postgres 时自动跳过。",
+    "draft": false,
+    "source": "会话管理模型设计与实现.md"
+  },
+  "session-4": {
+    "expected_answer": "上下文达到约 20 轮对话（40 条消息，SUMMARIZE_TRIGGER_MESSAGES=40）或 6000 tokens（SUMMARIZE_TRIGGER_TOKENS=6000，防止单轮超大参考资料撑爆）任一条件时触发摘要压缩，由 SummarizationMiddleware 自动执行；摘要后仅保留最近 10 条原始消息（SUMMARIZE_KEEP_MESSAGES=10），防止上下文无限增长。",
+    "draft": false,
+    "source": "会话管理模型设计与实现.md"
+  },
+  "loader-1": {
+    "expected_answer": "word_complicatedness 用 9 维度加权打分评估 Word 文档复杂度（内嵌图片 +2、表格含嵌套/合并单元格 +2~4、多栏布局 +3、VML 文本框 +2、浮动图形 +2、SmartArt +3、图表 +3、OLE 嵌入对象 +3、OMML 数学公式 +2 等），得分 >= 3（COMPLEXITY_THRESHOLD）判定为复杂文档。用途是分级解析：简单文档走本地 Unstructured 免费解析，复杂文档才走 MinerU 云端解析，平衡成本与质量，避免简单文档浪费解析额度、复杂文档本地解析丢内容。",
+    "draft": false,
+    "source": "文档加载与切分模块设计与实现.md"
+  },
+  "loader-2": {
+    "expected_answer": "因为本地 Unstructured 对含图片、公式、图表、复杂布局的文档会丢失内容。MinerU 是服务化云端解析（提交预签名 URL 直传 OSS → 轮询直到 done/failed → 下载 zip 内存解压定位 full.md），保真度高，能还原公式、图片、表格、扫描排版；而简单文档（纯文字）用本地解析快、免费、离线。所以先评估复杂度，超过阈值才动用 MinerU，兼顾成本与质量。",
+    "draft": false,
+    "source": "文档加载与切分模块设计与实现.md"
+  },
+  "loader-3": {
+    "expected_answer": "表格和公式作为原子块被保护：切分前用 _QA_PAIR_RE（问答对）、_FORMULA_RE（$$...$$ 块级公式）、_TABLE_RE（连续 | 开头的表格行）正则匹配，替换为 <ATOMIC_N> 占位符，切分完成后再还原，保证公式/表格/问答对永不被拆散。超长表格还会按行组拆成多个子表，每个子表重复表头（前两行），保证子表可独立理解。",
+    "draft": false,
+    "source": "文档加载与切分模块设计与实现.md"
+  },
+  "loader-4": {
+    "expected_answer": "smart_load 按文件大小分流：超过 5MB（LARGE_FILE_THRESHOLD）时用 loader.lazy_load() 逐条迭代加载，避免大文件整份进内存溢出；否则用 loader.load() 一次性返回。另有 10MB（MAX_FILE_SIZE）的入库上限做硬校验，超限拒绝入库。",
+    "draft": false,
+    "source": "文档加载与切分模块设计与实现.md"
+  },
+  "loader-5": {
+    "expected_answer": "因为 chunk 按 \\n\\n + 字符数贪心合并时，边界会恰好落在 **Q：...** 与 A：... 之间，产生\"只有问题没答案 / 只有答案没问题\"的无效 chunk。保证方式：把 **Q：...** 与紧随的 A：... 识别为原子块，与公式、表格用同一套占位符保护机制（切分前替换为 <ATOMIC_N>、切分后还原），并配套按\"还原后长度\"分组——占位符按其原始块长度参与计算，在段落之间贪心合并，保证问答对不拆散且 chunk 不超长。",
+    "draft": false,
+    "source": "文档加载与切分模块设计与实现.md"
+  },
+  "qa-1": {
+    "expected_answer": "三把钥匙，全部用 SHA256，口径统一：identity_hash = SHA256(file_name | source) 是文件身份唯一键，判断\"同名同源\"，作为 vector_files 表唯一索引；file_content_hash = SHA256(文件原始字节) 判断内容是否变化，流式读取避免大文件占内存；chunk_fingerprint = SHA256(source | content) 是 chunk 去重指纹，同时作为 Milvus 主键。",
+    "draft": false,
+    "source": "项目开发经验QA.md"
+  },
+  "qa-2": {
+    "expected_answer": "因为早期是先写 Milvus 再写 MySQL，Milvus 成功而 MySQL 失败时会留下孤儿向量，且失败后重跑会被\"内容未变\"逻辑跳过卡死。解决方案改为两阶段 + 状态机：阶段一 MySQL 先落期望状态并提交（sync_status=pending），失败即回滚，此时 Milvus 完全没动；阶段二 Milvus 按确定性 ID 幂等同步（先删后插），成功置 in_sync，失败置 failed 并保留 MySQL 期望状态；重跑时按 source 全量重建。这样 MySQL 提交失败时 Milvus 不会有孤儿向量。",
+    "draft": false,
+    "source": "项目开发经验QA.md"
+  },
+  "langchain-1": {
+    "expected_answer": "LangChain 是开发 AI 应用的基础框架，主要提供调用大模型的统一接口以及搜索、文档处理、向量数据库处理等工具，还有链式调用（Chains）、记忆管理和提示词模板等基础功能，方便快速实现功能、加快开发速度。LangGraph 比 LangChain 更高阶，是基于 LangChain 的工作流编排框架，把复杂的智能体工作流抽象成图（Graph），核心功能包括有状态的工作流、支持循环和条件执行、Checkpoints（状态快照，可从失败处恢复执行）。",
+    "draft": false,
+    "source": "AI智能体开发框架LangChain.docx"
+  }
+}

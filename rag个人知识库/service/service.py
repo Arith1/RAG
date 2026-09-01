@@ -4,6 +4,7 @@
 - search_documents：双路召回 + rerank 精排检索
 - list_documents：列出已入库文档
 """
+import time
 from typing import List, Optional
 
 from rag个人知识库.config.db_config import async_session
@@ -92,6 +93,7 @@ async def search_documents(
         "rerank_avg_score": None,
         "rerank_max_score": None,
         "rerank_degraded": False,
+        "cache_ms": 0,
     }
     owner_ids_digest = ",".join(
         sorted({str(x) for x in (retrieve_owner_ids or []) if x is not None})
@@ -108,10 +110,13 @@ async def search_documents(
         int(bool(retrieve_own_private)), int(bool(retrieve_own_public)),
         int(bool(retrieve_kb_public)), owner_ids_digest, file_ids_digest,
     )
+    _t_cache = time.monotonic()
     cached = await cache_get(cache_key_)
+    cache_ms = int((time.monotonic() - _t_cache) * 1000)
     if cached is not None:
         record_retrieval_cache(True)
         metrics["cache_hit"] = True
+        metrics["cache_ms"] = cache_ms
         # 缓存命中时无法拿到召回数，仅记录最终命中条数
         metrics["rerank_count"] = len(cached)
         return (cached, metrics) if return_metrics else cached
@@ -145,8 +150,10 @@ async def search_documents(
         }
         for hit in hits
     ]
+    _t_write = time.monotonic()
     await cache_set(cache_key_, result, SEARCH_CACHE_TTL)
     await cache_index_sources(cache_key_, [h.get("source") for h in result])
+    metrics["cache_ms"] = cache_ms + int((time.monotonic() - _t_write) * 1000)
     return (result, metrics) if return_metrics else result
 
 

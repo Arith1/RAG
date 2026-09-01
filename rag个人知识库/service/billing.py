@@ -69,6 +69,35 @@ def billing_stage(stage: str):
         _llm_stage.reset(token)
 
 
+def record_cached_answer(model: str = "") -> None:
+    """回答缓存命中：记一条 type=answer_cached 的计费（tokens=0/cost=0，status=cached）。
+
+    让「最近用量」能看到这次回答来自缓存（省了生成费用），而不是凭空消失。
+    未处于请求计费作用域（billing_request 外）时静默跳过。
+    """
+    ctx = _billing_ctx.get()
+    if ctx is None:
+        return
+    ctx.rows.append({
+        "user_id": ctx.user_id,
+        "session_id": ctx.session_id,
+        "request_id": ctx.request_id,
+        "provider": "cache",
+        "model": model or "answer-cache",
+        "type": "answer_cached",
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "uncached_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "credits": Decimal("0"),
+        "estimated_cost": Decimal("0"),
+        "latency_ms": 0,
+        "status": "cached",
+    })
+    logger.info("[billing] 回答缓存命中记账（request_id=%s）", ctx.request_id)
+
+
 def _price_for(model: str) -> Dict[str, float]:
     """按模型名返回每百万 token 单价（元）；未知模型回退默认价。"""
     if model == "deepseek-v4-flash":
