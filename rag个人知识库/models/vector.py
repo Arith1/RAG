@@ -31,6 +31,8 @@ class VectorFile(Base):
     __table_args__ = (
         Index("idx_owner_id", "owner_id"),
         Index("idx_is_public", "is_public"),
+        # M21：可见性/列表高频查询复合索引（own 过滤 + 共享检索组合条件）
+        Index("idx_owner_public", "owner_id", "is_public"),
     )
 
     # 字段定义
@@ -165,3 +167,53 @@ class ChunkRecord(Base):
 
     def __repr__(self):
         return f"<ChunkRecord(id={self.id}, file_id={self.file_id}, fingerprint='{self.chunk_fingerprint[:8]}...')>"
+
+
+class ParentChunk(Base):
+    """分层检索父块（切片回填源，不参与 ANN 检索）。
+
+    - parent_id = sha256(source|parent_text)，内容派生、不含 version——内容变化即换新 id，
+      父块缓存/切片版本自失效；version 列记录产出该父块的文件版本。
+    - parent_index 仅表示当前文件版本的阅读顺序，易变，不参与 id/缓存 key/差集身份判断。
+    - parent_text 为切片回填源，子块 metadata 的 parent_char_start/end 对齐此列。
+    """
+
+    __tablename__ = "parent_chunks"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger(), primary_key=True, autoincrement=True, comment="内部主键（稳定，供FK/内部引用）"
+    )
+    parent_id: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True,
+        comment="业务唯一ID = sha256(source|parent_text)，内容派生，不含version",
+    )
+    file_id: Mapped[int] = mapped_column(
+        BigInteger(), ForeignKey('vector_files.id', ondelete='CASCADE'), nullable=False, index=True,
+        comment="所属文档 id（级联删除）",
+    )
+    source: Mapped[str] = mapped_column(
+        String(512), nullable=False, comment="相对 source（uploads/{uid}/file）"
+    )
+    parent_index: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0,
+        comment="当前版本阅读顺序(0起)，易变，不参与ID/缓存key/差集身份",
+    )
+    parent_title: Mapped[Optional[str]] = mapped_column(
+        String(512), nullable=True, comment="标题路径/锚点标题，如 第三章 > 3.2"
+    )
+    parent_text: Mapped[str] = mapped_column(
+        Text, nullable=False, comment="父块全文（切片源，子块偏移对齐此列）"
+    )
+    char_len: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, comment="父块字符数"
+    )
+    version: Mapped[Decimal] = mapped_column(
+        Numeric(5, 1), nullable=False, default=Decimal("1.0"), server_default="1.0",
+        comment="产出该父块的文件版本（审计/差集刷版本）",
+    )
+
+    def __repr__(self):
+        return (
+            f"<ParentChunk(id={self.id}, parent_id='{self.parent_id[:8]}...', "
+            f"file_id={self.file_id}, index={self.parent_index})>"
+        )

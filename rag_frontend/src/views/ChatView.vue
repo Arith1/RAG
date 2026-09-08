@@ -36,6 +36,8 @@ const waitStart = ref(0)
 const waitSeconds = ref(0)
 const waitPhase = ref<'retrieving' | 'generating'>('retrieving')
 let waitTimer: number | undefined
+// H8：当前流式请求的中止控制器——组件卸载/登出时 abort，避免 token 浪费与写已卸载组件
+let streamAbort: AbortController | null = null
 const box = ref<HTMLElement | null>(null)
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 
@@ -263,6 +265,7 @@ function newConversation() {
 
 async function openSession(id: string) {
   if (streaming.value || id === sessionId.value) return
+  const requested = id
   sessionId.value = id
   input.value = ''
   scopeLocked.value = true
@@ -270,6 +273,8 @@ async function openSession(id: string) {
   loadingSession.value = true
   try {
     const detail = await getChatSession(id)
+    // H8：连点会话 A→B 时，A 的慢响应后到必须丢弃，避免覆盖 B 的内容
+    if (sessionId.value !== requested) return
     scope.ownPrivate = detail.retrieve_own_private
     scope.ownPublic = detail.retrieve_own_public
     scope.kbPublic = detail.retrieve_kb_public
@@ -283,11 +288,12 @@ async function openSession(id: string) {
       error: false,
     }))
   } catch {
+    if (sessionId.value !== requested) return
     messages.value = []
   } finally {
-    loadingSession.value = false
+    if (sessionId.value === requested) loadingSession.value = false
   }
-  scrollToBottom()
+  if (sessionId.value === requested) scrollToBottom()
 }
 
 function startRename(s: ChatSessionInfo) {
@@ -394,6 +400,9 @@ async function send() {
     retrieve_kb_public: scope.kbPublic,
     retrieve_owner_ids: scope.ownerIds,
   }
+  // H8：可中止的流式请求（卸载/登出时 abort）
+  const abortController = new AbortController()
+  streamAbort = abortController
   try {
     await streamChat(body, (evt) => {
       if (evt.type === 'meta') {
@@ -415,11 +424,17 @@ async function send() {
         assistant.content = evt.message
         assistant.error = true
       }
-    })
+    }, { signal: abortController.signal })
   } catch (e) {
-    assistant.content = e instanceof Error ? e.message : String(e)
-    assistant.error = true
+    if (streamAbort?.signal.aborted) {
+      // 用户主动中断（切路由/登出/离开页面）：保留已生成内容，不标记为错误
+      assistant.error = false
+    } else {
+      assistant.content = e instanceof Error ? e.message : String(e)
+      assistant.error = true
+    }
   } finally {
+    streamAbort = null
     streaming.value = false
     stopWaitTimer()
     scopeLocked.value = true
@@ -446,6 +461,8 @@ watch(isLoggedIn, (v) => {
   if (v) {
     refreshSessions()
   } else {
+    // H8：登出时中止在途流式请求，避免后端继续生成、onEvent 写已清理状态
+    streamAbort?.abort()
     sessions.value = []
     sessionId.value = null
     messages.value = []
@@ -468,6 +485,8 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('resize', onResize)
   stopWaitTimer()
+  // H8：组件卸载时中止在途流式请求（切路由/离开问答页）
+  streamAbort?.abort()
 })
 </script>
 

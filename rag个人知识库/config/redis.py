@@ -4,9 +4,13 @@ Redis 服务于：入库任务队列（Streams）、限流计数、检索/embedd
 Redis 不可用时各功能自动回退（任务队列回退进程内执行、限流回退进程内 dict、
 缓存直接未命中），系统不因 Redis 故障而中断。
 """
+import asyncio
 import hashlib
 import json
 import os
+import random
+import time
+import uuid
 
 import redis
 import redis.asyncio as aioredis
@@ -123,6 +127,57 @@ def _source_index_key(source: str) -> str:
     return f"src_idx:{source}"
 
 
+# M14：src_idx 索引集合的过期时间（秒）：写入时刷新，与最长缓存 TTL 对齐 + 缓冲，
+# 防集合成员只增不减、随流量无限累积。默认 2h（检索缓存 10min / 回答缓存 1h 都覆盖）。
+SOURCE_INDEX_TTL = int(os.getenv("SOURCE_INDEX_TTL", str(2 * 3600)))
+
+
+# 单飞锁释放（仅持有者可释放）：防旧任务/超时锁误删新锁
+_RELEASE_LOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def jitter_ttl(ttl: int, ratio: float = 0.1) -> int:
+    """固定 TTL ±ratio 随机抖动（缓存雪崩防护：避免整批 key 同时过期）。"""
+    return max(1, int(ttl * random.uniform(1 - ratio, 1 + ratio)))
+
+
+async def cache_singleflight(cache_key_: str, compute, ttl: int, wait_ms: int = 300):
+    """缓存单飞（M13）：多个并发 miss 只让一个执行 compute，其余等待其写入缓存。
+
+    compute 内需自行 cache_set（可按结果选择 TTL/抖动）并返回值；
+    返回 (value, from_cache)。锁用 SETNX + 持有者校验释放；获得锁者算完即释放，
+    等待者轮询缓存至多 wait_ms，超时兜底自行计算（不重复加锁）。
+    """
+    r = get_redis()
+    lock_key = f"{cache_key_}:lock"
+    token = uuid.uuid4().hex
+    acquired = False
+    try:
+        acquired = await r.set(lock_key, token, nx=True, ex=min(ttl, 60))
+    except Exception:
+        acquired = False
+    if acquired:
+        try:
+            return await compute(), False
+        finally:
+            try:
+                await r.eval(_RELEASE_LOCK_LUA, 1, lock_key, token)
+            except Exception:
+                pass
+    deadline = time.monotonic() + wait_ms / 1000
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+        cached = await cache_get(cache_key_)
+        if cached is not None:
+            return cached, True
+    return await compute(), False
+
+
 async def cache_index_sources(key: str, sources) -> None:
     """把缓存 key 登记到其引用的每个 source 索引集合中。"""
     unique_sources = {s for s in sources if s}
@@ -133,6 +188,9 @@ async def cache_index_sources(key: str, sources) -> None:
         pipe = r.pipeline(transaction=False)
         for source in unique_sources:
             pipe.sadd(_source_index_key(source), key)
+            # M14：索引集合写入时刷新过期（与最长缓存 TTL 对齐 + 缓冲），
+            # 否则集合成员只增不减、随流量无限累积；过期后陈旧成员自然消失
+            pipe.expire(_source_index_key(source), SOURCE_INDEX_TTL)
         await pipe.execute()
     except Exception:
         pass

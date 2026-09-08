@@ -194,6 +194,10 @@ class TokenUsageCallback(BaseCallbackHandler):
         except Exception as e:
             logger.warning("[billing] 收集 LLM 用量失败（不影响问答）：%s", e)
 
+    def on_llm_error(self, error, *, run_id, parent_run_id=None, **kwargs):
+        # M11：LLM 调用报错时 on_llm_end 不触发，这里清掉 _started，防止字典随错误无限增长
+        self._started.pop(run_id, None)
+
 
 token_usage_callback = TokenUsageCallback()
 

@@ -55,6 +55,14 @@ _KEEPALIVE_DEFAULTS = (
     ("keepalives_count", "3"),
 )
 
+# 记忆 Postgres 连接池参数（H7 断线自愈）：from_conn_string 用单条常驻连接，
+# DB 重启/网络抖动后连接永久损坏、记忆功能失效直至重启进程；改用
+# psycopg_pool.ConnectionPool 让 pool 在下次操作时自动重建连接。
+# 注意：PostgresSaver 自带 threading.Lock 串行化所有 checkpoint 操作，
+# 并发访问安全（仅串行）；pool 的 max_size 主要用于断线重建留余量。
+MEMORY_POOL_MIN_SIZE = int(os.getenv("MEMORY_POOL_MIN_SIZE", "1"))
+MEMORY_POOL_MAX_SIZE = int(os.getenv("MEMORY_POOL_MAX_SIZE", "4"))
+
 
 def memory_conninfo_with_keepalives(url: str) -> str:
     """给 Postgres conninfo 追加缺失的 keepalives* 参数，已显式配置的项保持不动。"""
@@ -68,7 +76,18 @@ def memory_conninfo_with_keepalives(url: str) -> str:
 
 
 def get_checkpointer():
-    """创建/复用对话记忆 checkpointer（进程内单例）。"""
+    """创建/复用对话记忆 checkpointer（进程内单例）。
+
+    H7 修复：改用 psycopg_pool.ConnectionPool 构造 PostgresSaver（库原生支持
+    Conn | ConnectionPool）。
+      - 断线自愈：from_conn_string 用单条常驻连接，DB 重启/断网后连接永久损坏、
+        记忆功能失效直至重启进程；ConnectionPool 会按需重建连接，坏连接被丢弃、
+        下次操作即恢复（与 Milvus _invalidate_vector_store 同思路）。
+      - 线程安全：PostgresSaver 自带 threading.Lock 串行化所有 checkpoint 操作，
+        多线程并发访问安全（仅串行，本应用规模 + chat 限流下可接受）。
+      - 未配置 MEMORY_DATABASE_URL 或初始化失败时回退进程内 InMemorySaver
+        （仅开发调试用，重启/多 worker 均会丢失）。
+    """
     global _checkpointer, _checkpointer_stack
     if _checkpointer is not None:
         return _checkpointer
@@ -78,17 +97,34 @@ def get_checkpointer():
             from contextlib import ExitStack
 
             from langgraph.checkpoint.postgres import PostgresSaver
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
 
-            # from_conn_string 是上下文管理器，连接仅在 with 块内有效；
-            # 用 ExitStack 保持连接存活到进程结束（单例复用）
-            stack = ExitStack()
-            saver = stack.enter_context(
-                PostgresSaver.from_conn_string(memory_conninfo_with_keepalives(url))
+            # 与 from_conn_string 相同的连接参数，但走连接池：
+            # 坏连接由 pool 自动丢弃并重建（自愈），连接生命周期由 pool 管理。
+            pool = ConnectionPool(
+                memory_conninfo_with_keepalives(url),
+                min_size=MEMORY_POOL_MIN_SIZE,
+                max_size=MEMORY_POOL_MAX_SIZE,
+                kwargs={
+                    "autocommit": True,
+                    "prepare_threshold": 0,
+                    "row_factory": dict_row,
+                },
+                open=False,
             )
+            pool.open()
+            pool.wait()  # 初始连接建立失败会抛错，进入下面的回退分支
+            stack = ExitStack()
+            stack.callback(pool.close)  # 进程退出时关闭池
+            saver = PostgresSaver(pool)
             saver.setup()  # 建 checkpoint 表（幂等）
             _checkpointer_stack = stack
             _checkpointer = saver
-            logger.info("[ai_assist] 对话记忆已启用 Postgres 持久化")
+            logger.info(
+                "[ai_assist] 对话记忆已启用 Postgres 持久化（连接池 min=%s max=%s）",
+                MEMORY_POOL_MIN_SIZE, MEMORY_POOL_MAX_SIZE,
+            )
         except Exception as e:
             logger.warning("[ai_assist] Postgres 记忆初始化失败（%s），回退进程内 InMemorySaver", e)
             _checkpointer = InMemorySaver()
@@ -200,6 +236,22 @@ async def astream(messages: List[BaseMessage], thread_id: str = "default"):
 def clear_thread(thread_id: str = "default") -> None:
     """清除指定会话的短期记忆。"""
     get_checkpointer().delete_thread(thread_id)
+
+
+def close_memory() -> None:
+    """关闭对话记忆连接池并重置单例（进程退出 / FastAPI 优雅停机时调用）。
+
+    释放 Postgres 连接与 psycopg_pool 后台线程，避免停机时连接泄漏与析构噪音。
+    回退到 InMemorySaver 时无可关内容，直接重置即可。
+    """
+    global _checkpointer, _checkpointer_stack
+    if _checkpointer_stack is not None:
+        try:
+            _checkpointer_stack.close()
+        except Exception as e:
+            logger.warning("[ai_assist] 关闭对话记忆连接池失败：%s", e)
+    _checkpointer = None
+    _checkpointer_stack = None
 
 def append_thread_exchange(thread_id: str, user_text: str, assistant_text: str) -> None:
     """把一轮未经过 LLM 的问答（无资料命中 / other / 回答缓存命中）写入对话记忆。

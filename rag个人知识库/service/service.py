@@ -4,16 +4,27 @@
 - search_documents：双路召回 + rerank 精排检索
 - list_documents：列出已入库文档
 """
+import asyncio
+import os
 import time
 from typing import List, Optional
 
 from rag个人知识库.config.db_config import async_session
-from rag个人知识库.config.redis import cache_clear_prefix, cache_clear_source, cache_get, cache_index_sources, cache_key, cache_set
+from rag个人知识库.config.redis import (
+    cache_clear_prefix, cache_clear_source, cache_get, cache_index_sources, cache_key,
+    cache_set, cache_singleflight, jitter_ttl,
+)
 from rag个人知识库.crud.vector import count_file_names, select_file_names, select_visible_file_ids
 from rag个人知识库.service.ingest import ingest_files_batched
 from rag个人知识库.service.oss_archive import rel_source_from_local
 from rag个人知识库.service.obs import record_retrieval_cache
+from rag个人知识库.service.parent_child import assemble_context, load_parents
 from rag个人知识库.vector_store.milvus_store import DEFAULT_RECALL_K, SEARCH_CACHE_TTL, asearch_with_rerank
+
+# 分层检索（Parent-Child）开关（与 spliter/ingest 保持一致；默认关，保持现状）
+RAG_PARENT_CHILD = os.getenv("RAG_PARENT_CHILD", "false").strip().lower() in ("1", "true", "yes", "on")
+# M8：空结果检索缓存的短 TTL（秒）——新文档入库后最多该时长内仍可能命中「无结果」缓存
+EMPTY_SEARCH_CACHE_TTL = int(os.getenv("EMPTY_SEARCH_CACHE_TTL", "30"))
 
 # 数据发生变更（新增/更新/重放）的状态集合：命中任一即需清检索/回答缓存，
 # 避免旧数据在 TTL 内继续被返回；skipped/error 不涉及数据变更，无需清缓存。
@@ -105,10 +116,11 @@ async def search_documents(
         "<explicit>:" + ",".join(sorted({str(x) for x in file_ids}))
     )
     cache_key_ = cache_key(
-        "search", query, k, source or "", expr or "",
+        "search", query, k, source or "", expr or "", recall_k or DEFAULT_RECALL_K,  # M16：recall_k 入 key
         user_id if user_id is not None else "",
         int(bool(retrieve_own_private)), int(bool(retrieve_own_public)),
         int(bool(retrieve_kb_public)), owner_ids_digest, file_ids_digest,
+        int(RAG_PARENT_CHILD),  # 分层模式位：新旧策略结果不串用缓存
     )
     _t_cache = time.monotonic()
     cached = await cache_get(cache_key_)
@@ -121,39 +133,95 @@ async def search_documents(
         metrics["rerank_count"] = len(cached)
         return (cached, metrics) if return_metrics else cached
 
-    # file_ids 可由调用方（chat 编排层）预先计算并复用；未传入时再查 MySQL
-    if file_ids is None and user_id is not None:
-        async with async_session() as db:
-            file_ids = await select_visible_file_ids(
-                db,
-                user_id,
-                retrieve_own_private=retrieve_own_private,
-                retrieve_own_public=retrieve_own_public,
-                retrieve_kb_public=retrieve_kb_public,
-                retrieve_owner_ids=retrieve_owner_ids,
-            )
-    if user_id is not None and not file_ids:
-        # 当前用户在当前检索范围内无任何可见文档，直接返回空，不发起 Milvus 检索
-        record_retrieval_cache(False)
-        metrics["has_scope"] = False
-        return ([], metrics) if return_metrics else []
+    # M13：单飞计算——多个并发 miss 只让一个真正检索，其余等待其写入缓存
+    async def _compute():
+        nonlocal file_ids
+        # file_ids 可由调用方（chat 编排层）预先计算并复用；未传入时再查 MySQL
+        if file_ids is None and user_id is not None:
+            async with async_session() as db:
+                file_ids = await select_visible_file_ids(
+                    db, user_id,
+                    retrieve_own_private=retrieve_own_private,
+                    retrieve_own_public=retrieve_own_public,
+                    retrieve_kb_public=retrieve_kb_public,
+                    retrieve_owner_ids=retrieve_owner_ids,
+                )
+        if user_id is not None and not file_ids:
+            # 当前用户在当前检索范围内无任何可见文档，直接返回空，不发起 Milvus 检索
+            record_retrieval_cache(False)
+            metrics["has_scope"] = False
+            return []
 
-    hits, hit_metrics = await asearch_with_rerank(query, k=k, recall_k=recall_k or DEFAULT_RECALL_K, expr=expr, source=source, file_ids=file_ids)
-    record_retrieval_cache(False)
-    metrics.update(hit_metrics)
-    result = [
-        {
-            "content": hit.page_content,
-            "score": hit.metadata.get("rerank_score"),
-            "source": hit.metadata.get("source"),
-            "metadata": hit.metadata,
-        }
-        for hit in hits
-    ]
-    _t_write = time.monotonic()
-    await cache_set(cache_key_, result, SEARCH_CACHE_TTL)
-    await cache_index_sources(cache_key_, [h.get("source") for h in result])
-    metrics["cache_ms"] = cache_ms + int((time.monotonic() - _t_write) * 1000)
+        hits, hit_metrics = await asearch_with_rerank(
+            query, k=k, recall_k=recall_k or DEFAULT_RECALL_K, expr=expr, source=source, file_ids=file_ids,
+        )
+        record_retrieval_cache(False)
+        metrics.update(hit_metrics)
+
+        # 分层检索：命中子块带 parent 元信息时，回填「命中点动态开窗」的父块上下文
+        if RAG_PARENT_CHILD and hits and any(h.metadata.get("parent_id") for h in hits):
+            child_hits = [
+                {
+                    "parent_id": h.metadata.get("parent_id"),
+                    "parent_index": h.metadata.get("parent_index"),
+                    "source": h.metadata.get("source"),
+                    "start": h.metadata.get("parent_char_start"),
+                    "end": h.metadata.get("parent_char_end"),
+                    "score": h.metadata.get("rerank_score"),
+                }
+                for h in hits if h.metadata.get("parent_id")
+            ]
+            parents = await load_parents([h["parent_id"] for h in child_hits])
+            windowed, _used_tokens = await asyncio.to_thread(assemble_context, child_hits, parents)
+            # 退化路径：无 parent_id 的旧数据命中，或 parent_id 对应父块缺失（父块表被清/
+            # 数据不一致）——均直接回填子块本身，避免命中被静默丢弃
+            missing_parent_ids = {h["parent_id"] for h in child_hits} - set(parents.keys())
+            legacy = [
+                {
+                    "content": h.page_content,
+                    "score": h.metadata.get("rerank_score"),
+                    "source": h.metadata.get("source"),
+                    "metadata": h.metadata,
+                }
+                for h in hits
+                if not h.metadata.get("parent_id")
+                or h.metadata.get("parent_id") in missing_parent_ids
+            ]
+            result = windowed + legacy
+        else:
+            result = [
+                {
+                    "content": hit.page_content,
+                    "score": hit.metadata.get("rerank_score"),
+                    "source": hit.metadata.get("source"),
+                    "metadata": hit.metadata,
+                }
+                for hit in hits
+            ]
+        # P3：统一按 score 降序输出（legacy 回退项按自身分数参与排序，不再垫底）；
+        # 同分时 windowed 按 (parent_index, start) 保持文档内阅读序，legacy（无 parent_index）排在窗口之后
+        result.sort(key=lambda h: (
+            -(h.get("score") if h.get("score") is not None else -1.0),
+            h.get("metadata", {}).get("parent_index", 2 ** 31),
+            h.get("metadata", {}).get("parent_char_start", h.get("metadata", {}).get("start", 0)),
+        ))
+        # M8：空结果用短 TTL 缓存（新文档入库后最多 30s 内可见），非空用正常 TTL + 抖动（M13 雪崩防护）
+        await cache_set(
+            cache_key_, result,
+            EMPTY_SEARCH_CACHE_TTL if not result else jitter_ttl(SEARCH_CACHE_TTL),
+        )
+        await cache_index_sources(cache_key_, [h.get("source") for h in result])
+        return result
+
+    result, from_cache = await cache_singleflight(cache_key_, _compute, SEARCH_CACHE_TTL, wait_ms=300)
+    if from_cache:
+        # 单飞等待者：他人已计算结果并写入缓存
+        record_retrieval_cache(True)
+        metrics["cache_hit"] = True
+        metrics["cache_ms"] = cache_ms
+        metrics["rerank_count"] = len(result)
+        return (result, metrics) if return_metrics else result
+    metrics["cache_ms"] = cache_ms
     return (result, metrics) if return_metrics else result
 
 

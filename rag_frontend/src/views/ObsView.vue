@@ -100,14 +100,19 @@ function wfPct(ms: number | null | undefined): number {
 }
 
 async function loadSummary() {
+  const r = range.value
   loading.value = true
   error.value = ''
   try {
-    summary.value = await getObsSummary(range.value)
+    const data = await getObsSummary(r)
+    // M29：快速切换 range 时，旧周期的慢响应后到必须丢弃
+    if (range.value !== r) return
+    summary.value = data
   } catch (e) {
+    if (range.value !== r) return
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
-    loading.value = false
+    if (range.value === r) loading.value = false
   }
 }
 
@@ -138,15 +143,20 @@ async function loadStorage() {
 }
 
 async function openDetail(item: ObsTraceItem) {
+  const requested = item.request_id
   selected.value = item
   detailError.value = ''
   detailLoading.value = true
   try {
-    selected.value = await getObsTraceDetail(item.request_id)
+    const detail = await getObsTraceDetail(requested)
+    // 快速连点不同链路时，旧响应后到需丢弃，避免覆盖当前选中的链路
+    if (selected.value?.request_id !== requested) return
+    selected.value = detail
   } catch (e) {
+    if (selected.value?.request_id !== requested) return
     detailError.value = e instanceof Error ? e.message : String(e)
   } finally {
-    detailLoading.value = false
+    if (selected.value?.request_id === requested) detailLoading.value = false
   }
 }
 

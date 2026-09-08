@@ -27,7 +27,9 @@ from rag个人知识库.agent.ai_assist import (
 )
 from rag个人知识库.agent.intent import analyze
 from rag个人知识库.config.db_config import async_session
-from rag个人知识库.config.redis import cache_get, cache_index_sources, cache_key, cache_set
+from rag个人知识库.config.redis import (
+    cache_get, cache_index_sources, cache_key, cache_set, cache_singleflight, jitter_ttl,
+)
 from rag个人知识库.crud.vector import select_visible_file_ids
 from rag个人知识库.service.billing import billing_stage, record_cached_answer
 from rag个人知识库.service.obs import (
@@ -41,13 +43,20 @@ from rag个人知识库.vector_store.milvus_store import ANSWER_CACHE_TTL
 
 logger = logging.getLogger(__name__)
 
+# 后台任务集合：持有引用防止 fire-and-forget 任务被 GC 提前取消
+_background_memory_tasks: set = set()
+
+
 def _write_memory_async(thread_id: str, content: str, answer: str) -> None:
     """后台写对话记忆：不阻塞主链路，失败只记日志（火忘即忘，不影响回答返回）。"""
     try:
-        asyncio.create_task(asyncio.to_thread(append_thread_exchange, thread_id, content, answer))
+        task = asyncio.create_task(
+            asyncio.to_thread(append_thread_exchange, thread_id, content, answer)
+        )
+        _background_memory_tasks.add(task)
+        task.add_done_callback(_background_memory_tasks.discard)
     except Exception:
         logger.warning("[chat] 记忆写入调度失败（不影响回答）", exc_info=True)
-
 # analyze 用到的历史：最多取最近 N 轮（每轮 user+assistant 两条），单条截断长度
 HISTORY_MAX_TURNS = 3
 HISTORY_MAX_CHARS = 150
@@ -389,23 +398,29 @@ async def chat(
         _write_memory_async(thread_id, content, answer)
     else:
         try:
-            gen_t0 = time.monotonic()
-            with billing_stage("answer"):
-                answer = await asyncio.to_thread(
-                    ask,
-                    [HumanMessage(content=user_prompt)],
-                    thread_id,
+            # M13：回答缓存单飞——同一 user_prompt 并发只让一个调 LLM，其余等待其写入缓存
+            async def _gen():
+                gen_t0 = time.monotonic()
+                with billing_stage("answer"):
+                    ans = await asyncio.to_thread(
+                        ask,
+                        [HumanMessage(content=user_prompt)],
+                        thread_id,
+                    )
+                trace_set_generation(len(ans), int((time.monotonic() - gen_t0) * 1000))
+                await cache_set(
+                    ans_key,
+                    {"answer": ans, "source_list": [hit.get("source") for hit in all_hits]},
+                    jitter_ttl(ANSWER_CACHE_TTL),  # TTL 抖动：防整批 key 同时过期
                 )
-            trace_set_generation(len(answer), int((time.monotonic() - gen_t0) * 1000))
-            await cache_set(
-                ans_key,
-                {
-                    "answer": answer,
-                    "source_list": [hit.get("source") for hit in all_hits],
-                },
-                ANSWER_CACHE_TTL,
-            )
-            await cache_index_sources(ans_key, [hit.get("source") for hit in all_hits])
+                await cache_index_sources(ans_key, [hit.get("source") for hit in all_hits])
+                return ans
+
+            answer, from_cache = await cache_singleflight(ans_key, _gen, ANSWER_CACHE_TTL, wait_ms=500)
+            if from_cache:
+                # 单飞等待者：他人已生成并缓存
+                record_cached_answer()
+                _write_memory_async(thread_id, content, answer)
         except Exception as exc:
             logger.exception("[chat] 问答模型调用失败")
             trace_fail("model_unavailable", _friendly_model_error(exc))

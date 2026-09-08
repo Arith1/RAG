@@ -45,6 +45,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   etcd:
     image: quay.io/coreos/etcd:v3.5.18
@@ -57,13 +58,15 @@ services:
     volumes:
       - etcd-data:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    restart: unless-stopped
 
   minio:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     container_name: rag-minio
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # E3：MinIO 凭据环境变量化（默认 minioadmin/minioadmin，仅容器内网，建议 .env 覆盖）
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
     volumes:
       - minio-data:/minio_data
     command: minio server /minio_data
@@ -72,6 +75,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   milvus:
     image: milvusdb/milvus:v2.6.20
@@ -96,6 +100,7 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
+    restart: unless-stopped
 
   redis:
     image: redis:8-alpine
@@ -110,6 +115,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   postgres:
     image: postgres:18-alpine
@@ -127,6 +133,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   api:
     build:
@@ -150,7 +157,9 @@ services:
       ASYNC_DATABASE_URL: mysql+aiomysql://root:${MYSQL_PASSWORD:?请在 .env 中设置 MYSQL_PASSWORD（强口令）}@mysql:3306/rag_demo?charset=utf8
       MEMORY_DATABASE_URL: postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD（强口令）}@postgres:5432/rag-demo
       REDIS_URL: redis://:${REDIS_PASSWORD:?请在 .env 中设置 REDIS_PASSWORD（强口令）}@redis:6379/0
-      MILVUS_URI: http://root:Milvus@milvus:19530   # Milvus 认证 root/Milvus，启动后请立即改密
+      # E3：Milvus 认证凭据环境变量化（默认 root/Milvus 与 docker/milvus.yaml 一致；
+      # 改密需同时改 docker/milvus.yaml 的 authorization 配置）
+      MILVUS_URI: http://${MILVUS_USERNAME:-root}:${MILVUS_PASSWORD:-Milvus}@milvus:19530
     volumes:
       # 文档与上传产物持久化到宿主机（resources 已 gitignore）
       - ./rag个人知识库/resources:/app/rag个人知识库/resources

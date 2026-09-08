@@ -241,9 +241,14 @@ async def _recover_pending() -> None:
                 path = fields.get("path", "")
                 logger.info("[ingest_queue] 回收崩溃残留任务 %s 并重新处理: %s", msg_id, path)
                 ok = await process_message(msg_id, fields)
-                if ok:
+                if ok == "lock_busy":
+                    await _schedule_retry(fields, 15)
                     await r.xack(STREAM, GROUP, msg_id)
                     await r.xdel(STREAM, msg_id)
+                elif ok:
+                    await r.xack(STREAM, GROUP, msg_id)
+                    await r.xdel(STREAM, msg_id)
+                    await r.hdel(RETRY_HASH, path)  # M7：成功重置重试计数
                 else:
                     await _handle_failure(msg_id, fields)
                 await release_inflight(path, fields.get("inflight_token"))
@@ -252,8 +257,9 @@ async def _recover_pending() -> None:
         logger.warning("[ingest_queue] 崩溃任务回收失败：%s", e)
 
 
-async def process_message(msg_id: str, fields: dict) -> bool:
-    """执行一次入库，成功返回 True。文件已不存在视为成功（可能被删除接口清理）。
+async def process_message(msg_id: str, fields: dict) -> "bool | str":
+    """执行一次入库：成功返回 True；锁被占用返回 "lock_busy"（M15：不计数延迟重试）；
+    其它失败返回 False 走重试。文件已不存在视为成功（可能被删除接口清理）。
 
     时序（原件保管关键）：
       入库成功 → 归档原件到 OSS → 成功才删本地 upload
@@ -272,26 +278,32 @@ async def process_message(msg_id: str, fields: dict) -> bool:
         owner_id = int(fields["owner_id"])
         is_public = fields.get("is_public") == "1"
         # 账户删除也持有同一把用户级锁，确保删除与入库不会交叉写 Milvus。
-        async with owner_operation_lock(owner_id):
-            result = await ingest_files([path], owner_id=owner_id, is_public=is_public)
-            # 缓存失效（search/ans）已下沉到 service.ingest_files 统一处理
-            if any(r.get("status") == "error" for r in result):
-                # 入库失败：不归档、不删原件，走重试（本地文件仍在）
-                return False
-            if any(r.get("status") == "cancelled" for r in result):
-                # 账号已删除/禁用时安全丢弃队列任务，不再归档或无限重试。
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    logger.exception("[ingest_queue] 取消任务清理本地原件失败：%s", path)
-                return True
-            # 入库成功（inserted/updated/retried/skipped）：归档原件到 OSS，成功才删本地
-            archived = await archive_local_file(path)
-            if not archived:
-                logger.warning("[ingest_queue] 任务 %s 归档 OSS 失败，保留本地原件重试：%s", msg_id, path)
-            return archived
+        try:
+            async with owner_operation_lock(owner_id):
+                result = await ingest_files([path], owner_id=owner_id, is_public=is_public)
+                # 缓存失效（search/ans）已下沉到 service.ingest_files 统一处理
+                if any(r.get("status") == "error" for r in result):
+                    # 入库失败：不归档、不删原件，走重试（本地文件仍在）
+                    return False
+                if any(r.get("status") == "cancelled" for r in result):
+                    # 账号已删除/禁用时安全丢弃队列任务，不再归档或无限重试。
+                    # M9：保留本地原件（账号若只是临时禁用，恢复后可人工重试；删除账号时由删除队列清理）
+                    return True
+                # 入库成功（inserted/updated/retried/skipped）：归档原件到 OSS，成功才删本地
+                archived = await archive_local_file(path)
+                if not archived:
+                    logger.warning("[ingest_queue] 任务 %s 归档 OSS 失败，保留本地原件重试：%s", msg_id, path)
+                return archived
+        except RuntimeError as e:
+            # M15：owner 锁竞争（崩溃恢复 XAUTOCLAIM 抢占仍在处理中的任务等）——
+            # 不是业务失败，不计数，走短延迟重试，避免虚增重试计数/过早死信
+            if "当前有其他操作" in str(e):
+                logger.info(
+                    "[ingest_queue] 任务 %s 用户 %s 操作锁被占用（可能被崩溃恢复抢占），不计数延迟重试",
+                    msg_id, owner_id,
+                )
+                return "lock_busy"
+            raise
     except Exception as e:
         logger.warning("[ingest_queue] 任务 %s 处理失败：%s", msg_id, e)
         return False
@@ -357,8 +369,14 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
             for _stream, messages in resp:
                 for msg_id, fields in messages:
                     ok = await process_message(msg_id, fields)
-                    if ok:
+                    if ok == "lock_busy":
+                        # M15：锁占用（崩溃恢复抢占）——不计数，短延迟重试；XACK 清除 PEL 防恢复重复
+                        await _schedule_retry(fields, 15)
                         await r.xack(STREAM, GROUP, msg_id)
+                    elif ok:
+                        await r.xack(STREAM, GROUP, msg_id)
+                        # M7：成功即重置重试计数，避免下次同名文件 1 次失败即进死信
+                        await r.hdel(RETRY_HASH, fields.get("path", ""))
                     else:
                         await _handle_failure(msg_id, fields)
                     # ACK 后删除消息本体，避免 stream 无限增长（XACK 不会移除条目）

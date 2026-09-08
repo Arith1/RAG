@@ -15,6 +15,8 @@ const error = ref('')
 const loading = ref(false)
 
 async function submit() {
+  // M25：防重入（Enter 由表单隐式提交触发，这里兜底双击/双触发）
+  if (loading.value) return
   error.value = ''
   const name = username.value.trim()
   if (name.length < 2) {
@@ -66,7 +68,6 @@ async function submit() {
           autocomplete="username"
           placeholder="至少 2 个字符"
           maxlength="32"
-          @keyup.enter="submit"
         />
 
         <label class="field-label" for="password">密码</label>
@@ -78,7 +79,6 @@ async function submit() {
           autocomplete="new-password"
           placeholder="至少 6 位"
           maxlength="64"
-          @keyup.enter="submit"
         />
 
         <label class="field-label" for="confirm">确认密码</label>
@@ -90,7 +90,6 @@ async function submit() {
           autocomplete="new-password"
           placeholder="再次输入密码"
           maxlength="64"
-          @keyup.enter="submit"
         />
 
         <p v-if="error" class="error" role="alert">{{ error }}</p>

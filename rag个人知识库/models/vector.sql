@@ -63,6 +63,7 @@ CREATE TABLE `vector_files` (
     KEY `idx_updated_at` (`updated_at`) COMMENT '按更新时间排序',
     KEY `idx_owner_id` (`owner_id`) COMMENT '按归属用户过滤（我的文档）',
     KEY `idx_is_public` (`is_public`) COMMENT '按共享状态过滤（检索共享文档）',
+    KEY `idx_owner_public` (`owner_id`, `is_public`) COMMENT 'M21：可见性/列表高频查询复合索引（own + is_public 组合过滤）',
     CONSTRAINT `fk_vector_files_owner` FOREIGN KEY (`owner_id`) REFERENCES `users` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='向量文件元数据';
 
@@ -254,3 +255,57 @@ CREATE TABLE `rag_traces` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='RAG 请求链路追踪';
 
 -- 6.1 迁移说明（已有数据库执行）：把上方 CREATE TABLE 语句整体执行一次即可。
+
+-- ============================================
+-- 8. 分层检索父块表 (parent_chunks) —— 切片回填源，不参与 ANN 检索
+--    语义：子块(children, Milvus) 命中后按 parent_id 取父块文本做「命中点动态开窗」回填。
+--    parent_id = sha256(source|parent_text)，内容派生、不含 version（内容变→新id，版本自失效）。
+--    parent_index 仅表示当前文件版本的阅读顺序，易变，不参与 id/缓存 key/差集身份判断。
+--    开启 RAG_PARENT_CHILD=true 且本表存在时才写入；FK 级联随文档删除清理。
+-- ============================================
+CREATE TABLE `parent_chunks` (
+    `id`            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '内部主键（稳定，供FK/内部引用）',
+    `parent_id`     CHAR(64) NOT NULL COMMENT '业务唯一ID = sha256(source|parent_text)，内容派生，不含version',
+    `file_id`       BIGINT UNSIGNED NOT NULL COMMENT '所属文档 id（级联删除）',
+    `source`        VARCHAR(512) NOT NULL COMMENT '相对 source（uploads/{uid}/file）',
+    `parent_index`  INT UNSIGNED NOT NULL COMMENT '当前版本阅读顺序(0起)，易变，不参与ID/缓存key/差集身份',
+    `parent_title`  VARCHAR(512) NULL COMMENT '标题路径/锚点标题，如 第三章 > 3.2',
+    `parent_text`   MEDIUMTEXT NOT NULL COMMENT '父块全文（切片源，子块偏移对齐此列）',
+    `char_len`      INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '父块字符数',
+    `version`       DECIMAL(5,1) NOT NULL DEFAULT 1.0 COMMENT '产出该父块的文件版本（审计/差集刷版本）',
+    `created_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_parent_id` (`parent_id`),
+    KEY `idx_parent_file` (`file_id`, `version`),
+    KEY `idx_parent_order` (`source`, `parent_index`),
+    CONSTRAINT `fk_parent_chunks_file` FOREIGN KEY (`file_id`)
+        REFERENCES `vector_files` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分层检索父块（切片回填源，不参与ANN）';
+
+-- 8.1 迁移说明（已有数据库执行）：把上方 CREATE TABLE 语句整体执行一次即可。
+--     执行：mysql -u root -p rag_demo -e "CREATE TABLE ... (见上)"
+
+-- ============================================
+-- 7. 账号删除请求表 (account_deletions) —— 两阶段删除的宽限期调度与留痕
+--    语义：用户请求删除账号 → status='deleting'（立即锁定）+ 本表记一行
+--          （delete_after = 请求时间 + 宽限期）；删除 worker 周期性扫描本表，
+--          到期后把该用户加入 delete_queue 彻底删除（Milvus/OSS/本地/MySQL/记忆）。
+--    状态: pending(宽限期内) / enqueued(已入队待删) / done(已彻底删除)
+--    说明：user_id 不设外键，彻底删除后保留本行作为留痕（与 audit_logs 口径一致）。
+-- ============================================
+CREATE TABLE `account_deletions` (
+    `user_id` BIGINT UNSIGNED NOT NULL COMMENT '待删除用户 id（users.id，不设外键，保留删除留痕）',
+    `requested_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '删除请求时间（宽限期起点）',
+    `delete_after` DATETIME NOT NULL COMMENT '宽限期结束时间（到点后彻底删除）',
+    `status` VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT '状态: pending(宽限期内)/enqueued(已入队待删)/done(已彻底删除)',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+
+    PRIMARY KEY (`user_id`),
+    KEY `idx_delete_after` (`status`, `delete_after`) COMMENT '宽限期到期扫描'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='账号删除请求（两阶段删除调度）';
+
+-- 7.1 迁移说明（已有数据库执行）：把上方 CREATE TABLE 语句整体执行一次即可。
+--     执行：mysql -u root -p rag_demo -e "CREATE TABLE ... (见上)"

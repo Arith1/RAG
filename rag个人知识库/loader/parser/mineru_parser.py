@@ -19,6 +19,16 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+# ── 网络与解压防护（H3/H4）──
+# 提交/上传请求超时（秒）：poll 与 download 已有 timeout，唯独这两处缺失，
+# 连接挂起会让入库 worker 线程无限阻塞、线程池被耗尽拖垮整条入库链路。
+MINERU_SUBMIT_TIMEOUT = int(os.getenv("MINERU_SUBMIT_TIMEOUT", "30"))      # 申请上传链接 POST
+MINERU_UPLOAD_TIMEOUT = int(os.getenv("MINERU_UPLOAD_TIMEOUT", "300"))     # 直传 OSS PUT（文件≤10MB，放宽）
+# MinerU 产物 zip 解压防护：成员数上限与解压后总大小上限（zip 炸弹防护），
+# 成员路径必须在目标目录内（zip-slip 防护）。
+ZIP_MAX_MEMBERS = int(os.getenv("MINERU_ZIP_MAX_MEMBERS", "2000"))
+ZIP_MAX_UNCOMPRESSED_BYTES = int(os.getenv("MINERU_ZIP_MAX_UNCOMPRESSED_BYTES", str(200 * 1024 * 1024)))
+
 
 def _build_header() -> dict:
     """加载 .env 并构造带鉴权的请求头"""
@@ -90,6 +100,45 @@ def download_zip(zip_url, retries=3):
     raise RuntimeError(f"zip 下载失败，已重试 {retries} 次: {zip_url}")
 
 
+def _safe_extractall(zf: zipfile.ZipFile, output_dir: str) -> None:
+    """安全解压 MinerU 产物 zip：拒绝路径穿越成员、限制成员数与解压总大小。
+
+    - zip-slip：成员名含绝对路径或 `..` 穿越时拒绝（MinerU 为受信服务，但产物
+      经外部链路下载，纵深防御不可少），否则 extractall 可写出目标目录之外。
+    - 解压炸弹：解压后总大小（info.file_size）与成员数超上限直接拒绝，
+      避免恶意/异常产物一次性撑爆磁盘或内存。
+    """
+    dest = os.path.abspath(output_dir)
+    infos = zf.infolist()
+    if len(infos) > ZIP_MAX_MEMBERS:
+        raise RuntimeError(f"MinerU 产物 zip 成员数 {len(infos)} 超过上限 {ZIP_MAX_MEMBERS}")
+    total = 0
+    for info in infos:
+        total += info.file_size
+        if total > ZIP_MAX_UNCOMPRESSED_BYTES:
+            raise RuntimeError(
+                f"MinerU 产物 zip 解压后总大小超过上限 {ZIP_MAX_UNCOMPRESSED_BYTES} 字节"
+            )
+        name = info.filename.replace("\\", "/")
+        # 跨平台统一的路径校验（zip-slip 关键）：按 POSIX 段语义判断，
+        # 不依赖 os.path 在 Windows 上把 "/" 折成 "\\" 的差异行为。
+        # 1) 绝对路径（以 / 开头）一律拒绝
+        if name.startswith("/"):
+            raise RuntimeError(f"MinerU 产物 zip 含非法路径成员：{info.filename!r}")
+        segments = [s for s in name.split("/") if s not in ("", ".")]
+        # 2) 任何 ".." 段（向上穿越）或首段含盘符冒号（C:evil）一律拒绝
+        if segments and (".." in segments or ":" in segments[0]):
+            raise RuntimeError(f"MinerU 产物 zip 含非法路径成员：{info.filename!r}")
+        # 3) 兜底：解析后必须仍在目标目录内（跨盘符 commonpath 抛 ValueError，一并拒绝）
+        target = os.path.abspath(os.path.join(dest, name))
+        try:
+            if os.path.commonpath([dest, target]) != dest:
+                raise RuntimeError(f"MinerU 产物 zip 含非法路径成员：{info.filename!r}")
+        except ValueError:
+            raise RuntimeError(f"MinerU 产物 zip 含非法路径成员：{info.filename!r}")
+    zf.extractall(output_dir)
+
+
 def download_and_extract(extract_results, output_root, file_paths) -> dict:
     """下载解析结果 zip 并解压到 output_root，返回以原始路径为 key 的结构化结果。
 
@@ -116,9 +165,9 @@ def download_and_extract(extract_results, output_root, file_paths) -> dict:
             output_dir = os.path.join(output_root, "{}_{}".format(item["file_name"], item["data_id"]))
             # output_dir = os.path.join(output_root, "{}".format(item["file_name"]))
             os.makedirs(output_dir, exist_ok=True)
-            # 内存流直接解压，不落盘临时 zip 文件
+            # 内存流直接解压，不落盘临时 zip 文件；解压走 _safe_extractall（zip-slip/炸弹防护）
             with zipfile.ZipFile(io.BytesIO(zip_content)) as zf:
-                zf.extractall(output_dir)
+                _safe_extractall(zf, output_dir)
         except Exception as e:
             logger.warning("%s 结果下载/解压失败，原因:%s", item["file_name"], e)
             results[src_path] = {
@@ -153,7 +202,8 @@ def submit_batch(file_paths: list, header: dict) -> tuple[str, dict[str, str]]:
         "model_version": "vlm"  # 使用 VLM 模型解析（支持公式/表格/多语言）
     }
     # 第 1 步：申请上传链接，成功后返回 batch_id 和预签名上传 URL 列表
-    response = requests.post(url, headers=header, json=data)
+    # H3：必须带超时——否则 MinerU 服务端挂起会让入库 worker 线程无限阻塞
+    response = requests.post(url, headers=header, json=data, timeout=MINERU_SUBMIT_TIMEOUT)
     if response.status_code != 200:
         raise RuntimeError(f"申请上传链接失败 status:{response.status_code}")
     result = response.json()
@@ -172,7 +222,8 @@ def submit_batch(file_paths: list, header: dict) -> tuple[str, dict[str, str]]:
         file_name = os.path.basename(file_paths[i])
         try:
             with open(file_paths[i], 'rb') as f:
-                res_upload = requests.put(upload_url, data=f)
+                # H3：上传同样必须带超时（文件最大 10MB，300s 足够且避免线程永久挂死）
+                res_upload = requests.put(upload_url, data=f, timeout=MINERU_UPLOAD_TIMEOUT)
             if res_upload.ok:
                 logger.info("%s upload success", file_name)
             else:

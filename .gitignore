@@ -10,11 +10,11 @@
 
 # ===== Python 环境与缓存 =====
 /.venv/
-/uv.lock
 /.uv-cache/
 __pycache__/
 *.pyc
 .pytest_cache/
+pytest-of-*/
 /_test_*_tmp/
 .idea/
 .DS_Store
@@ -29,7 +29,7 @@ __pycache__/
 node_modules/
 dist/
 
-# ===== 评测/基准/测试报告（保留 tests/*.py 源码）=====
+# ===== 评测/基准/测试报告（本地评测数据与报告，不入库）=====
 /evaluation/
 /benchmark/
 /docs/
@@ -39,6 +39,9 @@ dist/
 
 # 日志与系统文件
 *.log
+*.err
 Thumbs.db
 desktop.ini
+
+# ===== 单元测试（有意不入库：仅本地开发/CI 环境跑；运行 pytest tests/）=====
 /tests/

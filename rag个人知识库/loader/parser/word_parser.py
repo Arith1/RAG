@@ -13,6 +13,22 @@ logger = logging.getLogger(__name__)
 COMPLEXITY_THRESHOLD = 3
 
 
+def docx_has_images(file_path: str) -> bool:
+    """docx 是否含图片（内嵌 inline_shapes 或 word/media 目录有媒体）。
+
+    供 load_word 做「图片兜底」：即使复杂度得分 < 阈值，只要含图就应走 MinerU，
+    否则 UnstructuredWordDocumentLoader 会静默丢图（M20）。
+    """
+    try:
+        doc = DocxDocument(file_path)
+        if len(doc.inline_shapes) > 0:
+            return True
+        with ZipFile(file_path) as z:
+            return any(n.startswith("word/media/") for n in z.namelist())
+    except Exception:
+        return False
+
+
 def word_complicatedness(file_path: str) -> int:
     """
     评估 Word 文档的复杂度，返回一个整数得分。

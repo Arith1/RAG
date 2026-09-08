@@ -11,6 +11,8 @@ const error = ref('')
 const loading = ref(false)
 
 async function submit() {
+  // M25：防重入（Enter 由表单隐式提交触发，这里兜底双击/双触发）
+  if (loading.value) return
   error.value = ''
   if (!username.value.trim() || !password.value) {
     error.value = '请输入用户名和密码'
@@ -51,7 +53,6 @@ async function submit() {
           type="text"
           autocomplete="username"
           placeholder="请输入用户名"
-          @keyup.enter="submit"
         />
         <label class="field-label" for="password">密码</label>
         <input
@@ -61,7 +62,6 @@ async function submit() {
           type="password"
           autocomplete="current-password"
           placeholder="请输入密码"
-          @keyup.enter="submit"
         />
 
         <p v-if="error" class="error" role="alert">{{ error }}</p>

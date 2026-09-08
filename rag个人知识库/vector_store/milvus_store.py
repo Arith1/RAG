@@ -350,7 +350,11 @@ def search(
         parts.append(_source_expr(source))
     if expr:
         parts.append(expr)
-    filter_expr = " and ".join(parts) if parts else None
+    # 每个子句都用括号包裹后再以 and 连接（H2 修复）：expr 或未来任何可包含
+    # "or" 的片段优先级低于外层 "and"，若裸拼（"A and B or true"）会因 and 优先
+    # 整体恒真，从而绕过 file_ids/source 可见性过滤。包裹后各子句边界被隔离，
+    # 无论子句内部是单比较、in 子句还是带 or 的组合表达式，都不会污染整条过滤。
+    filter_expr = " and ".join(f"({p})" for p in parts) if parts else None
     kwargs: dict = {
         # 每路各自预取 fetch_k 条再融合（库内默认只预取 4 条，必须显式放大）。
         # 默认与 k 相同；调用方可单独放大召回宽度（如 rerank 前先召回更多候选）。

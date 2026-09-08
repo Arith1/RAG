@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import { ApiError } from '../api/client'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -17,14 +18,27 @@ const router = createRouter({
   ],
 })
 
-// 已登录用户访问登录页时直接回到问答首页；个人详情/用量需登录
+// 已登录用户访问登录页时直接回到问答首页；个人详情/用量/监控需登录，监控仅管理员
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   if ((to.name === 'login' || to.name === 'register') && auth.isLoggedIn) {
     return { name: 'chat' }
   }
-  if ((to.name === 'billing' || to.name === 'obs') && !auth.isLoggedIn) {
-    return { name: 'login', query: { redirect: to.fullPath } }
+  if (to.name === 'billing' || to.name === 'obs') {
+    if (!auth.isLoggedIn) {
+      return { name: 'login', query: { redirect: to.fullPath } }
+    }
+    // M27：监控页仅管理员；role 未知时先回源用户信息再判断
+    if (to.name === 'obs' && !auth.user) {
+      try {
+        await auth.fetchMe()
+      } catch {
+        /* api() 已处理 401；其余错误保留登录态 */
+      }
+    }
+    if (to.name === 'obs' && !auth.isAdmin) {
+      return { name: 'chat' }
+    }
   }
   if (to.name === 'profile' || to.name === 'profile-user') {
     if (!auth.isLoggedIn) {
@@ -35,9 +49,12 @@ router.beforeEach(async (to) => {
     if (!auth.user) {
       try {
         await auth.fetchMe()
-      } catch {
-        auth.logout()
-        return { name: 'login', query: { redirect: to.fullPath } }
+      } catch (e) {
+        // M24：仅 401 视为登录失效；网络/5xx 瞬时错误保留 token，不误登出
+        if (e instanceof ApiError && e.status === 401) {
+          return { name: 'login', query: { redirect: to.fullPath } }
+        }
+        return true
       }
     }
     if (to.name === 'profile' && auth.user?.id) {

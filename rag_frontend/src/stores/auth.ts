@@ -52,15 +52,13 @@ export const useAuthStore = defineStore('auth', {
       this.user = await api<UserInfo>('/api/auth/me')
     },
     async logout() {
-      // 通知后端清除鉴权用户行缓存（失败不影响本地退出；多端在线时也允许）
+      // 通知后端清除鉴权缓存（fire-and-forget：M30——不 await，慢响应/失败都不卡退出按钮）
       const token = this.token
       if (token) {
-        try {
-          await fetch('/api/auth/logout', {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${token}` },
-          })
-        } catch { /* 网络异常忽略，本地照常退出 */ }
+        fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }).catch(() => { /* 网络异常忽略，本地照常退出 */ })
       }
       this.token = ''
       this.user = null

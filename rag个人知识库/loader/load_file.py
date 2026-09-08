@@ -1,6 +1,7 @@
 import inspect
 import logging
 import os
+import shutil
 from typing import Optional, List
 
 from langchain_community.document_loaders import (
@@ -12,7 +13,7 @@ from langchain_core.documents import Document
 from rag个人知识库.loader.parser.document_validation_exception import DocumentValidationErrorType, \
     DocumentValidationError
 from rag个人知识库.loader.parser.mineru_parser import minerU_files
-from rag个人知识库.loader.parser.word_parser import word_complicatedness, COMPLEXITY_THRESHOLD
+from rag个人知识库.loader.parser.word_parser import word_complicatedness, docx_has_images, COMPLEXITY_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -57,32 +58,58 @@ def needs_mineru(file_path: str) -> bool:
     return False
 
 
+def _cleanup_mineru_output_dir(output_dir: Optional[str]) -> None:
+    """best-effort 删除 MinerU 解析产物目录（H4：磁盘泄漏修复）。
+
+    产物（full.md + images/ + content_list.json）只在加载时消费一次，
+    读取后立即清理，避免 uploads/{uid}/mineru_results 随每次解析永久堆积。
+    失败只记日志，绝不影响入库主流程。
+    """
+    if not output_dir:
+        return
+    try:
+        if os.path.isdir(output_dir):
+            shutil.rmtree(output_dir, ignore_errors=True)
+            logger.info("[load_file] 已清理 MinerU 解析产物目录：%s", output_dir)
+    except Exception as e:
+        logger.warning("[load_file] 清理 MinerU 产物目录失败（不影响入库）：%s（%s）", output_dir, e)
+
+
 def load_mineru_md_from_result(
     file_path: str,
     result: Optional[dict],
     doc_type_label: str,
 ) -> Optional[List[Document]]:
-    """读取 MinerU 已解析结果中的 Markdown，返回 Document 列表。"""
-    if result is None or result.get("status") != "success":
-        error = (result or {}).get("error") or "未返回解析结果"
-        logger.warning("%s 解析失败：%s，原因：%s", doc_type_label, file_path, error)
-        return None
+    """读取 MinerU 已解析结果中的 Markdown，返回 Document 列表。
 
-    # md_path 由 MinerU 批量结果直接给出，无需自己拼产物目录结构
-    md_path = result.get("md_path")
-    if not md_path or not os.path.exists(md_path):
-        logger.warning("未找到解析结果：%s", md_path)
-        return None
-    logger.info("读取解析结果：%s", md_path)
-    # 产物是 Markdown，按原文读入，切分交给切分层
-    documents = Loader.load_md(md_path)
-    if documents:
-        for doc in documents:
-            # source 指回原始文件便于溯源，解析产物路径另存 md_path
-            doc.metadata["source"] = file_path
-            doc.metadata["md_path"] = md_path
-    logger.info("成功加载文档：%s", md_path)
-    return documents
+    H4：产物目录只在本函数消费一次，读取后（无论成败）在 finally 中
+    best-effort 清理——全项目唯一消费点，批量（ingest_files_batched）与
+    单文件（load_mineru_md）两条路径都经过这里，一处修复覆盖全部。
+    """
+    output_dir = (result or {}).get("output_dir")
+    try:
+        if result is None or result.get("status") != "success":
+            error = (result or {}).get("error") or "未返回解析结果"
+            logger.warning("%s 解析失败：%s，原因：%s", doc_type_label, file_path, error)
+            return None
+
+        # md_path 由 MinerU 批量结果直接给出，无需自己拼产物目录结构
+        md_path = result.get("md_path")
+        if not md_path or not os.path.exists(md_path):
+            logger.warning("未找到解析结果：%s", md_path)
+            return None
+        logger.info("读取解析结果：%s", md_path)
+        # 产物是 Markdown，按原文读入，切分交给切分层
+        documents = Loader.load_md(md_path)
+        if documents:
+            for doc in documents:
+                # source 指回原始文件便于溯源，解析产物路径另存 md_path
+                doc.metadata["source"] = file_path
+                doc.metadata["md_path"] = md_path
+        logger.info("成功加载文档：%s", md_path)
+        return documents
+    finally:
+        _cleanup_mineru_output_dir(output_dir)
 
 
 def load_mineru_md(file_path: str, doc_type_label: str) -> Optional[List[Document]]:
@@ -114,9 +141,10 @@ def load_word(file_path: str) -> Optional[List[Document]]:
     logger.info("正在分析 Word 文档复杂度：%s", file_path)
     score = word_complicatedness(file_path)
 
-    if score < COMPLEXITY_THRESHOLD:
-        # ── 简单文档：docx 本身结构化，本地解析可靠且不消耗解析额度 ──
-        logger.info("复杂度较低，使用 UnstructuredWordDocumentLoader 直接解析")
+    if score < COMPLEXITY_THRESHOLD and not docx_has_images(file_path):
+        # ── 简单文档且无图片：docx 本身结构化，本地解析可靠且不消耗解析额度。
+        #    M20：含图文档即使得分 <3 也走 MinerU（Unstructured 本地解析会静默丢图）
+        logger.info("复杂度较低且无图片，使用 UnstructuredWordDocumentLoader 直接解析")
         loader = UnstructuredWordDocumentLoader(
             file_path=file_path,
             mode="single",
@@ -181,8 +209,51 @@ class Loader:
         return documents
 
 
+# ── M5：上传内容嗅探（防伪装扩展名 / 恶意内容进解析库）──
+# 只读文件头做 magic-byte 校验，与扩展名白名单互相印证：
+#   - pdf：前 1024 字节须含 %PDF（PDF 规范允许头部在文件前 1KB，容忍 BOM/前导空白）
+#   - docx：须为 zip 且含 [Content_Types].xml；限制 zip 成员数 / 解压总大小（防解压炸弹）
+#   - txt/md：拒绝含 NUL 字节的二进制伪装
+_PDF_HEADER = b"%PDF"
+_DOCX_ZIP_MARK = b"PK\x03\x04"
+_DOCX_MAX_MEMBERS = int(os.getenv("DOCX_MAX_MEMBERS", "10000"))
+_DOCX_MAX_UNCOMPRESSED = int(os.getenv("DOCX_MAX_UNCOMPRESSED_BYTES", str(500 * 1024 * 1024)))
+
+
+def _sniff_content(file_path: str, ext: str) -> Optional[str]:
+    """按扩展名嗅探文件内容是否与宣称格式一致；返回错误文案，None 表示通过。"""
+    try:
+        with open(file_path, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        return "文件读取失败"
+
+    if ext == "pdf":
+        if _PDF_HEADER not in head:
+            return DocumentValidationErrorType.MIME_TYPE_MISMATCH
+    elif ext == "docx":
+        if not head.startswith(_DOCX_ZIP_MARK):
+            return DocumentValidationErrorType.MIME_TYPE_MISMATCH
+        try:
+            import zipfile
+            with zipfile.ZipFile(file_path) as zf:
+                infos = zf.infolist()
+                if len(infos) > _DOCX_MAX_MEMBERS:
+                    return "docx 文件包含过多条目"
+                if sum(i.file_size for i in infos) > _DOCX_MAX_UNCOMPRESSED:
+                    return "docx 文件解压后体积过大"
+                if "[Content_Types].xml" not in zf.namelist():
+                    return DocumentValidationErrorType.MIME_TYPE_MISMATCH
+        except Exception:
+            return DocumentValidationErrorType.CORRUPTED_FILE
+    elif ext in ("txt", "md"):
+        if b"\x00" in head:
+            return DocumentValidationErrorType.MIME_TYPE_MISMATCH
+    return None
+
+
 def validate_file(file_path: str) -> Optional[DocumentValidationError]:
-    """基础校验：存在性 / 格式支持 / 大小限制。返回 None 表示校验通过。"""
+    """基础校验：存在性 / 格式支持 / 大小限制 / 内容嗅探。返回 None 表示校验通过。"""
     # 获取所有方法名, 生成 {方法名: 绑定方法} 的映射,静态方法要用isfunction
     load_map = dict(inspect.getmembers(Loader, predicate=inspect.isfunction))
     valid_file_types = [s.split("_")[-1] for s in list(load_map.keys())]
@@ -206,6 +277,11 @@ def validate_file(file_path: str) -> Optional[DocumentValidationError]:
     if os.path.getsize(file_path) > MAX_FILE_SIZE:
         logger.warning("%s", DocumentValidationErrorType.FILE_TOO_LARGE)
         return DocumentValidationError(file_path, DocumentValidationErrorType.FILE_TOO_LARGE)
+    # M5：内容嗅探——伪装扩展名（如可执行文件改名 .pdf）不允许进入解析库
+    content_err = _sniff_content(file_path, file_path.rsplit(".", 1)[-1].lower())
+    if content_err is not None:
+        logger.warning("%s：%s", content_err, file_path)
+        return DocumentValidationError(file_path, content_err)
     return None
 
 

@@ -4,6 +4,7 @@ from typing import List, Optional, Sequence
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from rag个人知识库.models.user import User
 from rag个人知识库.models.vector import ChunkRecord, VectorFile
 from rag个人知识库.utils.hash_utils import compute_identity_hash
 
@@ -11,6 +12,11 @@ from rag个人知识库.utils.hash_utils import compute_identity_hash
 SYNC_PENDING = "pending"
 SYNC_IN_SYNC = "in_sync"
 SYNC_FAILED = "failed"
+
+# 可见性查询统一附加的 owner 状态条件：非 active（deleting/deleted/disabled）账号的文档
+# 一律不可见——纵深防御，防止"账号已删除但内容仍被检索/列表/下载"的幽灵数据
+# （删除接口本身已把公开文档下架，这里兜底兼容历史遗留数据与其它入口）。
+_ACTIVE_OWNER = VectorFile.owner_id.in_(select(User.id).where(User.status == "active"))
 
 
 async def get_file_by_identity(
@@ -195,7 +201,7 @@ async def select_visible_file_ids(
     if not conds:
         return []
     result = await db.execute(
-        select(VectorFile.id).where(or_(*conds))
+        select(VectorFile.id).where(or_(*conds), _ACTIVE_OWNER)
     )
     return [r for r in result.scalars().all()]
 
@@ -211,7 +217,8 @@ async def count_file_names(
     stmt = select(func.count(VectorFile.id))
     if user_id is not None:
         stmt = stmt.where(
-            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True))
+            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True)),
+            _ACTIVE_OWNER,  # 用户可见路径排除非 active 账号的文档（幽灵数据纵深防御）
         )
     result = await db.execute(stmt)
     return int(result.scalar() or 0)
@@ -231,7 +238,8 @@ async def select_file_names(
     stmt = select(VectorFile).order_by(VectorFile.updated_at.desc())
     if user_id is not None:
         stmt = stmt.where(
-            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True))
+            (VectorFile.owner_id == user_id) | (VectorFile.is_public.is_(True)),
+            _ACTIVE_OWNER,  # 用户可见路径排除非 active 账号的文档（幽灵数据纵深防御）
         )
     if limit is not None:
         stmt = stmt.limit(limit)

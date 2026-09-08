@@ -12,11 +12,14 @@
 入口 split_documents 按 metadata 中的 doc_type 自动分发策略。
 """
 import logging
+import os
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
+from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,18 @@ HEADERS_TO_SPLIT_ON = [
 # 中文场景默认 chunk 参数：bge 系 embedding 有效窗口约 512 token
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 50
+# M18：超过此长度的原子块（公式/表格/问答对）不再整体保护——会被按正常规则切分，
+# 避免「超长原子块整段保留」产生超 bge 窗口/超 Milvus 上限的巨型 chunk（强制截断兜底）
+MAX_ATOMIC_CHARS = int(os.getenv("MAX_ATOMIC_CHARS", "2000"))
+
+# ── 分层检索（Parent-Child）配置（默认关，保持现状；开启见 docs/PARENT_CHILD_RETRIEVAL_DESIGN.md）──
+RAG_PARENT_CHILD = os.getenv("RAG_PARENT_CHILD", "false").strip().lower() in ("1", "true", "yes", "on")
+CHILD_CHUNK_SIZE = int(os.getenv("CHILD_CHUNK_SIZE", "250"))      # 子块大小（检索单位）
+CHILD_OVERLAP = int(os.getenv("CHILD_OVERLAP", "30"))             # 子块重叠
+PARENT_MAX_CHARS = int(os.getenv("PARENT_MAX_CHARS", "2000"))     # Markdown 父块封顶（超长再切）
+PARENT_OVERLAP = int(os.getenv("PARENT_OVERLAP", "50"))            # 超长父块再切时的重叠（保边界上下文）
+PLAIN_PARENT_CHARS = int(os.getenv("PLAIN_PARENT_CHARS", "2000"))  # 纯文本父块大小
+PLAIN_PARENT_OVERLAP = 100
 
 # 块级公式：$$...$$（跨行）
 _FORMULA_RE = re.compile(r'\$\$.*?\$\$', re.DOTALL)
@@ -86,6 +101,9 @@ def _protect_atomic_blocks(text: str) -> Tuple[str, Dict[str, str]]:
     blocks: Dict[str, str] = {}
 
     def _repl(match):
+        # M18：超长原子块不保护（按正常规则切分），避免整段保留产生超限巨型 chunk
+        if len(match.group(0)) > MAX_ATOMIC_CHARS:
+            return match.group(0)
         key = f"<ATOMIC_{len(blocks)}>"
         blocks[key] = match.group(0)
         return key
@@ -247,3 +265,212 @@ def split_documents(
     logger.info("[split_documents] markdown 文档 %d 个，纯文本文档 %d 个，共 %d 个 chunk",
             len(md_docs), len(plain_docs), len(chunks))
     return chunks
+
+
+# ═══ 分层检索（Parent-Child）：父块 + 子块（含精确偏移）═══
+
+def _atomic_ranges(text: str) -> List[Tuple[int, int]]:
+    """原子块（公式/表格/问答对）区间：子块切分不得穿越这些区间。"""
+    ranges: List[Tuple[int, int]] = []
+    for pat in (_QA_PAIR_RE, _FORMULA_RE, _TABLE_RE):
+        for m in pat.finditer(text):
+            ranges.append((m.start(), m.end()))
+    return sorted(ranges)
+
+
+def _split_text_with_offsets(text: str, size: int, overlap: int) -> List[Tuple[int, int]]:
+    """按段落/句末边界切分并返回精确字符区间 [(start, end)]（子块用）。
+
+    优先在 \\n 段落边界断，其次在句末标点（。；！？）断，找不到才按 size 硬切。
+    - 原子块（公式/表格/问答对）：切点落在块内 → 延到块尾，**块永不被拦腰切断**
+      （超长原子块独立成一块，可略超 size）。
+    - 自然边界（段落/句末/块尾）处：下一块从边界后开始，不跨界重叠（防碎片级联）。
+    - 硬切（满 size）：下一块用 overlap 回退，保留跨块上下文。
+    - 剩余不足 size 时整段收尾。
+    start/end 直接对齐入参 text（即最终父块文本，切片偏移一致）。
+    """
+    n = len(text)
+    para = [m.start() for m in re.finditer(r"\n", text)]
+    blocks = _atomic_ranges(text)
+
+    def _block_end(pos: int) -> Optional[int]:
+        """pos 严格位于某原子块内部时返回块尾，否则 None（blocks 按起点有序）。"""
+        for b_s, b_e in blocks:
+            if b_s < pos < b_e:
+                return b_e
+            if pos <= b_s:
+                return None
+        return None
+
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    while start < n:
+        # start 落到原子块内部（overlap 回退导致）→ 跳到块尾，不从中切开
+        be = _block_end(start)
+        if be is not None:
+            start = be
+            if start >= n:
+                break
+        if n - start <= size:
+            ranges.append((start, n))
+            break
+        limit = start + size
+        cut = None
+        from_sentence = False
+        # 段落边界：取 (start, limit] 内最后一个 \n
+        for b in para:
+            if start < b <= limit:
+                cut = b
+        if cut is None:
+            # 句末标点：取 (start, limit] 内最后一个
+            m = None
+            for mm in re.finditer(r"[。；！？]\s*", text[start:limit]):
+                m = mm
+            if m:
+                cut = start + m.end()
+                from_sentence = True
+        if cut is None or cut <= start:
+            cut = limit
+            from_sentence = False
+        # 原子块：切点落在块内 → 延到块尾（块保持完整）
+        be = _block_end(cut)
+        snapped = be is not None
+        if snapped:
+            cut = be
+            from_sentence = False
+        end = min(cut, n)
+        ranges.append((start, end))
+        if end >= n:
+            break
+        if from_sentence or snapped:
+            # 句末/原子块尾：不跨界重叠
+            start = end
+        elif end < n and text[end] == "\n":
+            # 段落边界：跳过换行
+            start = end + 1
+        else:
+            # 硬切（满 size）：允许 overlap
+            start = max(start + 1, end - overlap)
+    return ranges
+
+
+def _split_parent_pieces(text: str, max_chars: int, overlap: int = 0) -> List[Tuple[int, str]]:
+    """超长父块按 max_chars 再切（可选 overlap），返回 [(base, piece)]，base 为 piece 在 text 中的偏移。"""
+    if len(text) <= max_chars:
+        return [(0, text)]
+    return [
+        (i, text[i:i + max_chars])
+        for i in range(0, len(text), max_chars - overlap)
+    ]
+
+
+def _emit_parent(
+    base_meta: dict,
+    text: str,
+    title: str,
+    source: str,
+    parent_index: int,
+    parents: List[dict],
+    children: List[Document],
+    sec_ranges: Optional[List[Tuple[int, int, dict]]] = None,
+    piece_base: int = 0,
+) -> None:
+    """把一个父块产出为 parents 记录 + 其子块（含偏移 + 所属节的 Header/images 元数据）。"""
+    parent_id = compute_chunk_fingerprint(text, source)  # 内容派生（不含 version）
+    parents.append({
+        "parent_id": parent_id,
+        "source": source,
+        "parent_index": parent_index,
+        "parent_title": title,
+        "parent_text": text,
+        "char_len": len(text),
+    })
+    for start, end in _split_text_with_offsets(text, CHILD_CHUNK_SIZE, CHILD_OVERLAP):
+        child_text = text[start:end]
+        content = f"{title}\n\n{child_text}" if title else child_text
+        meta = dict(base_meta)
+        # 补齐子块的节级溯源元数据（Header N / images）：按子块中点定位所属节
+        if sec_ranges:
+            abs_mid = piece_base + (start + end) // 2
+            sec_meta = next((sm for s, e, sm in sec_ranges if s <= abs_mid < e), None)
+            if sec_meta:
+                for k in ("Header 1", "Header 2", "Header 3", "Header 4"):
+                    if k in sec_meta:
+                        meta[k] = sec_meta[k]
+                if sec_meta.get("images"):
+                    meta["images"] = sec_meta["images"]
+        meta.update({
+            "parent_id": parent_id,
+            "parent_index": parent_index,
+            "parent_char_start": start,
+            "parent_char_end": end,
+        })
+        children.append(Document(page_content=content, metadata=meta))
+
+
+def split_documents_parent_child(
+    documents: List[Document],
+) -> Tuple[List[Document], List[dict]]:
+    """分层切分（Parent-Child）：返回 (children, parents)。
+
+    - children：CHILD_CHUNK_SIZE(250) 子块（参与 ANN 检索），metadata 含
+      parent_id / parent_index / parent_char_start / parent_char_end（偏移精确对齐 parent_text）。
+    - parents：[{parent_id, source, parent_index, parent_title, parent_text, char_len}]，
+      parent_text 为切片回填源（存一次）；parent_id = sha256(source|text) 内容派生。
+    - Markdown 按 H2 锚定成父块（无 H2 回退 H1/(intro)），超长父块按 PARENT_MAX_CHARS 再切（PARENT_OVERLAP 重叠）；
+      纯文本按 PLAIN_PARENT_CHARS 固定父块。
+    - 子块切分不穿越原子块（公式/表格/问答对）；子块 metadata 含所属节的 Header N / images 溯源。
+    """
+    md_docs, plain_docs = [], []
+    for doc in documents:
+        doc_type = doc.metadata.get("doc_type")
+        source = str(doc.metadata.get("source", ""))
+        if doc_type == "markdown" or (doc_type is None and source.lower().endswith(".md")):
+            md_docs.append(doc)
+        else:
+            plain_docs.append(doc)
+
+    parents: List[dict] = []
+    children: List[Document] = []
+    header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADERS_TO_SPLIT_ON)
+
+    for doc in md_docs:
+        source = str(doc.metadata.get("source", ""))
+        text = _normalize_long_tables(doc.page_content, CHILD_CHUNK_SIZE)
+        sections = header_splitter.split_text(text)
+        # H2 锚定分组：同 (H2 or H1 or intro) 标题的连续节并入同一父块，保留各节元数据
+        groups: List[Tuple[str, List[Tuple[str, dict]]]] = []
+        for sec in sections:
+            title = sec.metadata.get("Header 2") or sec.metadata.get("Header 1") or "(intro)"
+            if groups and groups[-1][0] == title:
+                groups[-1][1].append((sec.page_content, dict(sec.metadata)))
+            else:
+                groups.append((title, [(sec.page_content, dict(sec.metadata))]))
+        parent_index = 0
+        for title, parts in groups:
+            contents = [c for c, _ in parts]
+            parent_text = "\n".join(contents)
+            # 各节在 parent_text 中的区间（含 \n 分隔符），供子块定位所属节元数据；
+            # 图片链接跟随段落，按节提取入 sec_meta（与单层切分口径一致）
+            sec_ranges: List[Tuple[int, int, dict]] = []
+            off = 0
+            for content, meta in parts:
+                imgs = _IMAGE_RE.findall(content)
+                if imgs:
+                    meta["images"] = ",".join(imgs)
+                sec_ranges.append((off, off + len(content), meta))
+                off += len(content) + 1
+            for piece_base, piece in _split_parent_pieces(parent_text, PARENT_MAX_CHARS, PARENT_OVERLAP):
+                _emit_parent(doc.metadata, piece, title, source, parent_index, parents, children,
+                             sec_ranges=sec_ranges, piece_base=piece_base)
+                parent_index += 1
+
+    for doc in plain_docs:
+        source = str(doc.metadata.get("source", ""))
+        parent_index = 0
+        for piece_base, piece in _split_parent_pieces(doc.page_content, PLAIN_PARENT_CHARS, PLAIN_PARENT_OVERLAP):
+            _emit_parent(doc.metadata, piece, "", source, parent_index, parents, children)
+            parent_index += 1
+
+    logger.info("[ParentChildSplitter] 分层产出 %d 个父块、%d 个子块", len(parents), len(children))
+    return children, parents

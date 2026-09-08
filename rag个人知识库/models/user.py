@@ -77,3 +77,32 @@ class AuditLog(Base):
 
     def __repr__(self):
         return f"<AuditLog(id={self.id}, user='{self.username}', action='{self.action}', target='{self.target}')>"
+
+
+class AccountDeletion(Base):
+    """账号删除请求（两阶段删除调度）：请求删除 → 立即锁定并下架公开文档，
+    宽限期（delete_after）到期后由 Redis Streams 删除队列彻底清除。
+
+    - user_id 不设外键：彻底删除后保留本行作为留痕（与 audit_logs 口径一致）。
+    - status: pending(宽限期内) / enqueued(已入队待删) / done(已彻底删除)。
+    """
+
+    __tablename__ = "account_deletions"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger(), primary_key=True, autoincrement=False, comment="待删除用户 id（users.id）"
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(), nullable=False, server_default=text('CURRENT_TIMESTAMP'),
+        comment="删除请求时间（宽限期起点）"
+    )
+    delete_after: Mapped[datetime] = mapped_column(
+        DateTime(), nullable=False, comment="宽限期结束时间（到点后彻底删除）"
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending",
+        comment="状态: pending(宽限期内)/enqueued(已入队待删)/done(已彻底删除)"
+    )
+
+    def __repr__(self):
+        return f"<AccountDeletion(user_id={self.user_id}, status='{self.status}', delete_after={self.delete_after})>"

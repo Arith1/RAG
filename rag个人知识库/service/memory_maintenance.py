@@ -37,6 +37,20 @@ def _connect():
     return psycopg.connect(url, connect_timeout=5)
 
 
+def _purge_postgres(thread_ids: list) -> None:
+    """在线程池中删除 Postgres checkpoints（M10：psycopg 是同步阻塞调用，移到 asyncio.to_thread）。"""
+    conn = _connect()
+    if conn is None:
+        return
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        for table in ("checkpoint_blobs", "checkpoint_writes", "checkpoints"):
+            cur.execute(f"DELETE FROM {table} WHERE thread_id = ANY(%s)", (thread_ids,))
+    finally:
+        conn.close()
+
+
 async def cleanup_expired_memory(ttl_days: float = MEMORY_TTL_DAYS) -> int:
     """清理超过 ttl_days 未活动的会话，返回清理的会话数。
 
@@ -51,21 +65,15 @@ async def cleanup_expired_memory(ttl_days: float = MEMORY_TTL_DAYS) -> int:
         logger.info("[memory_maintenance] 无过期会话（TTL %s 天）", ttl_days)
         return 0
 
-    conn = _connect()
-    if conn is None:
-        logger.info("[memory_maintenance] 未配置 MEMORY_DATABASE_URL，仅清理 MySQL 会话元信息")
-    else:
+    # M10：同步 psycopg 阻塞调用放到线程池，避免卡住事件循环（过期会话多时 DELETE 会阻塞全站）
+    if os.getenv("MEMORY_DATABASE_URL"):
         try:
-            conn.autocommit = True
-            cur = conn.cursor()
-            thread_ids = [f"{uid}:{sid}" for uid, sid in keys]
-            for table in ("checkpoint_blobs", "checkpoint_writes", "checkpoints"):
-                cur.execute(f"DELETE FROM {table} WHERE thread_id = ANY(%s)", (thread_ids,))
+            await asyncio.to_thread(_purge_postgres, [f"{uid}:{sid}" for uid, sid in keys])
         except Exception as e:
             logger.warning("[memory_maintenance] 删除 Postgres 记忆失败（本轮跳过，下轮重试）：%s", e)
             return 0
-        finally:
-            conn.close()
+    else:
+        logger.info("[memory_maintenance] 未配置 MEMORY_DATABASE_URL，仅清理 MySQL 会话元信息")
 
     # 2) 删 MySQL 会话元信息（此后这些会话不再出现在清理列表）
     deleted = await delete_by_keys(keys)

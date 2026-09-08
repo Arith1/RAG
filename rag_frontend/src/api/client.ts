@@ -17,6 +17,20 @@ function detailMessage(data: unknown, status: number): string {
   return `HTTP ${status}`
 }
 
+/** API 错误：携带 HTTP 状态码（401 表示登录失效；0/负值表示本地错误如超时/协议校验）。 */
+export class ApiError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+/** 普通 API 请求超时（毫秒）：防挂起请求无限等待；流式问答走 streamChat 不受此限。 */
+const API_TIMEOUT_MS = 60_000
+
 export interface SourceItem {
   index: number
   source: string | null
@@ -103,22 +117,36 @@ export type ChatStreamEvent =
   | { type: 'answer'; session_id: string | null; intent: string; query: string | null; answer: string; sources: SourceItem[] }
   | { type: 'error'; session_id?: string | null; message: string }
 
-/** 带 JWT 的 fetch 封装：401 自动登出并回登录页。JSON 响应自动解析。 */
+/** 带 JWT 的 fetch 封装：401 自动登出并回登录页；JSON 响应自动解析。
+ *  M23：内置超时（API_TIMEOUT_MS），204/空 body 不再 res.json() 抛错；
+ *  错误统一抛 ApiError（带 status），调用方可区分 401 与网络/超时。 */
 export async function api<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
   const auth = useAuthStore()
   const headers = new Headers(options.headers)
   if (auth.token) headers.set('Authorization', `Bearer ${auth.token}`)
-  const res = await fetch(path, { ...options, headers })
+  // 超时与调用方信号（若有）合并：任一触发都会中止请求
+  const timeoutSignal = AbortSignal.timeout(API_TIMEOUT_MS)
+  const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal
+  let res: Response
+  try {
+    res = await fetch(path, { ...options, headers, signal })
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'TimeoutError') {
+      throw new ApiError('请求超时，请稍后重试', 0)
+    }
+    throw e
+  }
   if (res.status === 401) {
     auth.logout()
     window.location.href = '/login'
-    throw new Error('登录已过期')
+    throw new ApiError('登录已过期', 401)
   }
   if (!res.ok) {
     const data = (await res.json().catch(() => null)) as unknown
-    throw new Error(detailMessage(data, res.status))
+    throw new ApiError(detailMessage(data, res.status), res.status)
   }
-  return (await res.json()) as T
+  const text = await res.text()
+  return (text ? JSON.parse(text) : undefined) as T
 }
 
 function decodeFrame(frame: string): ChatStreamEvent | null {
@@ -130,7 +158,9 @@ function decodeFrame(frame: string): ChatStreamEvent | null {
   }
 }
 
-/** SSE 流式问答：逐事件回调 onEvent（fetch ReadableStream 解析，非 EventSource——POST 不支持）。 */
+/** SSE 流式问答：逐事件回调 onEvent（fetch ReadableStream 解析，非 EventSource——POST 不支持）。
+ *  H8/M26：支持外部 AbortSignal（组件卸载/登出时中断流，避免 token 浪费与写已卸载组件）；
+ *  401 与 api() 同语义（自动登出并回登录页）。 */
 export async function streamChat(
   body: {
     content: string
@@ -142,6 +172,7 @@ export async function streamChat(
     retrieve_owner_ids?: number[]
   },
   onEvent: (evt: ChatStreamEvent) => void,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const auth = useAuthStore()
   const res = await fetch('/api/chat/stream', {
@@ -151,10 +182,16 @@ export async function streamChat(
       Authorization: `Bearer ${auth.token}`,
     },
     body: JSON.stringify(body),
+    signal: opts.signal,
   })
+  if (res.status === 401) {
+    auth.logout()
+    window.location.href = '/login'
+    throw new ApiError('登录已过期', 401)
+  }
   if (!res.ok) {
     const data = (await res.json().catch(() => null)) as unknown
-    throw new Error(detailMessage(data, res.status))
+    throw new ApiError(detailMessage(data, res.status), res.status)
   }
 
   const reader = res.body!.getReader()
@@ -174,6 +211,42 @@ export async function streamChat(
       }
     }
   }
+}
+
+
+/** 下载文档原件：优先后端返回的 OSS/签名 URL（仅放行 http/https，防 javascript: 协议注入），
+ *  否则下载为本地文件。401 与 api() 同语义；M28：三处视图共用，消除重复实现。 */
+export async function downloadDocument(fileId: number | string, fileName: string): Promise<void> {
+  const auth = useAuthStore()
+  const res = await fetch(`/api/documents/${encodeURIComponent(fileId)}/download`, {
+    headers: { Authorization: `Bearer ${auth.token}` },
+  })
+  if (res.status === 401) {
+    auth.logout()
+    window.location.href = '/login'
+    throw new ApiError('登录已过期', 401)
+  }
+  if (!res.ok) {
+    const data = (await res.json().catch(() => null)) as unknown
+    throw new ApiError(detailMessage(data, res.status), res.status)
+  }
+  const ct = res.headers.get('content-type') ?? ''
+  if (ct.includes('application/json')) {
+    const data = (await res.json()) as { url?: string }
+    const url = data.url
+    if (url && /^https?:\/\//i.test(url)) {
+      window.open(url, '_blank', 'noopener')
+      return
+    }
+    if (url) throw new ApiError('下载链接协议不受支持', 0)
+  }
+  const blob = await res.blob()
+  const objectUrl = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = objectUrl
+  a.download = fileName
+  a.click()
+  URL.revokeObjectURL(objectUrl)
 }
 
 
@@ -264,7 +337,9 @@ export async function changePassword(oldPassword: string, newPassword: string): 
   })
 }
 
-/** 软删除账号：仅标记为已删除，数据与计费记录保留，账号无法登录 */
+/** 请求删除账号（两阶段）：提交后账号立即锁定、公开文档即刻下架；
+ *  宽限期（后端 DELETE_GRACE_DAYS，默认 7 天）后由删除队列彻底清除文档/向量/对话记忆，
+ *  计费与审计记录保留；此操作不可撤销。 */
 export async function deleteAccount(): Promise<{ status: string; message: string }> {
   return api<{ status: string; message: string }>('/api/auth/delete-account', {
     method: 'POST',

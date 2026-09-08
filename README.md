@@ -11,11 +11,12 @@
 - **文件指纹增量入库**：`identity_hash` 判定同名同源，`file_content_hash` 判定内容变化——skip / insert / update / retry 四态分流，只增量更新差集。
 - **跨库一致性**：MySQL 先落期望状态（`pending`）→ Milvus 幂等同步 → `in_sync`/`failed` 状态机；失败重试按 source 重建，可清理孤儿向量。
 - **结构感知切分**：Markdown 标题分节、**表格/公式/问答对原子保护**（占位符 + 还原长度分组）、超长表格自动拆子表并重复表头、图片路径入 metadata。
+- **分层检索（Parent-Child，可选开启）**：250 字子块精准定位 → 命中点动态开窗（±BACK/FWD + 跨父块边界合并）→ Token 预算裁剪 → 整段上下文回填；开启后与单层命中率持平、上下文完整度 +73%（见 `docs/PARENT_CHILD_RETRIEVAL_DESIGN.md`，`RAG_PARENT_CHILD=true`）。
 - **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤（二者互斥，可叠加 `file_ids` 可见性过滤，并可独立调 `fetch_k` 放大召回宽度）；**检索结果 / embedding / 回答三层 Redis 缓存**（相同问题秒回、省 API 调用）。
 - **Agent 问答**：意图识别（规则层 + LLM 查询重构，多轮指代补全）→ 检索 → DeepSeek Agent 生成带来源引用回答；对话记忆按用户隔离。
 - **会话记忆**：Postgres 持久化（跨重启/多 worker），TTL 按"最后活跃时间"自动清理，~20 轮对话自动摘要压缩。
 - **可靠入库队列**：Redis Streams（Consumer Group + PEL 崩溃恢复、持久化延迟重试、死信队列、inflight 竞态防护 409）。
-- **可靠删除队列**：账户删除同样走 Redis Streams，按 Milvus → OSS → 本地文件 → MySQL → 缓存清理顺序执行，失败持久化重试，不卡账号。
+- **可靠删除队列（两阶段账户删除）**：提交删除 → 账号立即锁定（status=deleting）且**公开文档即刻下架**（堵住"已删账号内容仍公开"的漏洞）→ 宽限期（`DELETE_GRACE_DAYS`，默认 7 天）→ 到期由 Redis Streams 队列彻底清除 Milvus 向量 → OSS 原件 → 本地文件 → MySQL 元数据（级联）→ Postgres 对话记忆 → 缓存清理，失败持久化重试、不卡账号；计费/链路/审计记录保留留痕。
 - **权限模型**：普通用户可上传/删除自己的文档；管理员可把共享文档取消为私有；下载仅 owner 或共享文档可访问。
 - **多问题问答**：意图识别支持拆分多个子问题，逐个检索后汇总分点回答，并限制最大子问题数。
 - **精准缓存失效**：维护 `src_idx:{source}` 缓存索引，文档取消共享/删除/账户删除/重新入库时按 source O(1) 定位清理相关检索与回答缓存（入库改为按 source 精准失效，不再全库清空）。
@@ -254,7 +255,7 @@ curl -X POST http://localhost:8010/api/documents/upload \
 ```
 
 - `ingest:inflight` 集合标记"正在入库"，上传/删除接口返回 **409**，防"上传后立刻删除"的孤儿向量竞态；
-- Redis 不可用 → 上传、删除、账户删除等写操作返回 **503**，避免进程内任务因崩溃丢失。
+- Redis 不可用 → 上传 / 文档删除返回 **503**；**账户删除仍可提交**（账号先在 DB 锁定并下架公开文档，宽限期到期扫描待 Redis 恢复后执行彻底删除），避免进程内任务因崩溃丢失。
 
 ### 会话记忆（Postgres + TTL + 摘要）
 
@@ -269,7 +270,6 @@ curl -X POST http://localhost:8010/api/documents/upload \
 | `sess:list:{user_id}` | 会话列表（问答侧边栏） | 1h | 问答结束 / 重命名 / 删除会话 |
 | `sess:detail:{user_id}:{session_id}` | 单会话完整记录（含消息） | 1h | 该会话有新问答 / 被删除 |
 | `sess:detail_idx:{user_id}` | 已缓存详情的 session_id 集合 | 1h | 删除账号时整批清理 |
-| `usr:{user_id}` | 鉴权用户行（`get_current_user`） | 1h | 登出 / 改密 / 删除账号 |
 | `docs:{user_id}:{limit}:{offset}` | 文档列表分页 | 60s | 上传 / 删除 / 共享 / 入库完成 |
 | `users:{viewer}:{limit}:{q}` | 用户搜索（指定用户多选器） | 5min | 注册 / 删除账号 |
 
@@ -352,7 +352,7 @@ python -m pytest tests/
 | POST | `/api/documents/{id}/revoke` | owner/管理员 | 把共享文档取消为私有（管理员可审核他人） |
 | POST | `/api/documents/{id}/share` | owner/管理员 | 把文档设为公开共享 |
 | GET | `/api/documents/{id}/download` | owner 或共享 | 下载文档原件（私有他人文档返回 404） |
-| POST | `/api/auth/delete-account` | 登录 | 提交账户删除（状态 deleting，进入删除队列） |
+| POST | `/api/auth/delete-account` | 登录 | 提交账户删除（两阶段：立即锁定+下架公开文档，宽限期后入队列彻底删除） |
 | POST | `/api/auth/logout` | 登录 | 登出并清除该用户的鉴权缓存 |
 | POST | `/api/chat` | 登录 | 知识库问答（多问题拆分 + 多轮记忆） |
 | POST | `/api/chat/stream` | 登录 | **SSE 流式问答**（meta → token×N → done） |
@@ -403,7 +403,7 @@ rag_project/
 - [x] docker-compose 一键编排（MySQL/Milvus/Redis/Postgres/API）
 - [x] SSE 流式输出 + Vue 3 + TypeScript 前端
 - [x] 文档归属/共享/取消共享/下载权限
-- [x] 账户删除队列（Milvus → OSS → 本地 → MySQL → 缓存清理）
+- [x] 账户删除队列（两阶段：软锁+下架公开文档 → 宽限期 → Milvus → OSS → 本地 → MySQL → 对话记忆 → 缓存清理）
 - [x] 多问题问答编排
 - [x] 精准缓存失效（src_idx 索引）
 - [x] 多人共享知识库 + 会话检索范围（4 选，首问锁定）

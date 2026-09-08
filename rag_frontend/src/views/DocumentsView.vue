@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, type Ref } from 'vue'
-import { api, type BatchUploadResult, type DocItem, type QueueDeadItem, type QueueInflightItem, type QueuePendingItem, type QueueStats } from '../api/client'
+import { api, downloadDocument, type BatchUploadResult, type DocItem, type QueueDeadItem, type QueueInflightItem, type QueuePendingItem, type QueueStats } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import { useFeedback } from '../composables/feedback'
 import StatusBadge from '../components/StatusBadge.vue'
@@ -202,32 +202,12 @@ async function share(d: DocItem) {
   }
 }
 
-function download(d: DocItem) {
-  const token = auth.token
-  fetch(`/api/documents/${d.id}/download`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const ct = res.headers.get('content-type') ?? ''
-      if (ct.includes('application/json')) {
-        const data = (await res.json()) as { url?: string }
-        if (data.url) {
-          window.open(data.url, '_blank', 'noopener')
-          return
-        }
-      }
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = d.file_name
-      a.click()
-      URL.revokeObjectURL(url)
-    })
-    .catch((e) => {
-      error.value = e instanceof Error ? e.message : String(e)
-    })
+async function download(d: DocItem) {
+  try {
+    await downloadDocument(d.id, d.file_name)
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  }
 }
 
 async function retryDead(item: QueueDeadItem) {
@@ -286,15 +266,24 @@ async function clearDead() {
 const QUEUE_POLL_MS = 5000
 let pollTimer: number | undefined
 
+function onVisibility() {
+  // M22：标签页切回前台时立即刷新一次（后台暂停期间的遗漏）
+  if (!document.hidden && isLoggedIn.value) load()
+}
+
 onMounted(() => {
   if (isLoggedIn.value) load()
   pollTimer = window.setInterval(() => {
-    if (isLoggedIn.value) load()
+    // M22：后台标签页暂停轮询 + 防重入（上一次 load 未结束时跳过，避免重叠堆积）
+    if (!isLoggedIn.value || document.hidden || loading.value) return
+    load()
   }, QUEUE_POLL_MS)
+  document.addEventListener('visibilitychange', onVisibility)
 })
 
 onUnmounted(() => {
   if (pollTimer !== undefined) window.clearInterval(pollTimer)
+  document.removeEventListener('visibilitychange', onVisibility)
 })
 </script>
 

@@ -13,7 +13,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from rag个人知识库.agent.ai_assist import load_thread_messages
 from rag个人知识库.config.db_config import async_session
@@ -97,37 +98,31 @@ async def upsert_chat_session(
     now = datetime.now()
     target_ids = sorted({t for t in (retrieve_owner_ids or []) if t is not None})
     async with async_session() as db:
-        result = await db.execute(
-            select(ChatSession).where(
-                ChatSession.user_id == user_id,
-                ChatSession.session_id == session_id,
-            )
+        # M12：原子 upsert——并发两轮同会话不再「SELECT 后 INSERT 撞唯一键丢历史」；
+        # message_count 用 SQL 自增表达式（message_count = message_count + 2）避免读改写丢更新；
+        # 标题：仅当现行为默认「新会话」时才用首问标题覆盖（用户重命名/已有标题保持不变）
+        ins = mysql_insert(ChatSession).values(
+            user_id=user_id,
+            session_id=session_id,
+            title=title,
+            message_count=2,  # 首轮已含 user + assistant 两条
+            last_message_preview=preview,
+            last_message_at=now,
+            retrieve_own_private=bool(retrieve_own_private),
+            retrieve_own_public=bool(retrieve_own_public),
+            retrieve_kb_public=bool(retrieve_kb_public),
         )
-        session = result.scalar_one_or_none()
-        if session is None:
-            session = ChatSession(
-                user_id=user_id,
-                session_id=session_id,
-                title=title,
-                message_count=2,  # 首轮已含 user + assistant 两条
-                last_message_preview=preview,
-                last_message_at=now,
-                retrieve_own_private=bool(retrieve_own_private),
-                retrieve_own_public=bool(retrieve_own_public),
-                retrieve_kb_public=bool(retrieve_kb_public),
-            )
-            db.add(session)
-        else:
-            if not session.title or session.title == "新会话":
-                session.title = title
-            session.message_count = (session.message_count or 0) + 2
-            session.last_message_preview = preview
-            session.last_message_at = now
-            session.retrieve_own_private = bool(retrieve_own_private)
-            session.retrieve_own_public = bool(retrieve_own_public)
-            session.retrieve_kb_public = bool(retrieve_kb_public)
-        await db.flush()
-        # 指定用户范围：先删后插，保证与传入集合一致
+        ins = ins.on_duplicate_key_update(
+            title=func.if_(ChatSession.title == "新会话", ins.inserted.title, ChatSession.title),
+            message_count=ChatSession.message_count + 2,
+            last_message_preview=preview,
+            last_message_at=now,
+            retrieve_own_private=bool(retrieve_own_private),
+            retrieve_own_public=bool(retrieve_own_public),
+            retrieve_kb_public=bool(retrieve_kb_public),
+        )
+        await db.execute(ins)
+        # 指定用户范围：先删后插，保证与传入集合一致（幂等，不影响已锁定的范围语义）
         await db.execute(
             delete(ChatSessionScopeUser).where(
                 ChatSessionScopeUser.user_id == user_id,

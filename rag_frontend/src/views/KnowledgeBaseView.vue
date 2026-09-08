@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { api, type DocItem } from '../api/client'
+import { api, downloadDocument, type DocItem } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import { useFeedback } from '../composables/feedback'
 import StatusBadge from '../components/StatusBadge.vue'
@@ -94,32 +94,12 @@ function fmtTime(iso?: string) {
   })
 }
 
-function download(d: DocItem) {
-  const token = auth.token
-  fetch(`/api/documents/${d.id}/download`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const ct = res.headers.get('content-type') ?? ''
-      if (ct.includes('application/json')) {
-        const data = (await res.json()) as { url?: string }
-        if (data.url) {
-          window.open(data.url, '_blank', 'noopener')
-          return
-        }
-      }
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = d.file_name
-      a.click()
-      URL.revokeObjectURL(url)
-    })
-    .catch((e) => {
-      feedback.notify(e instanceof Error ? e.message : String(e), 'error')
-    })
+async function download(d: DocItem) {
+  try {
+    await downloadDocument(d.id, d.file_name)
+  } catch (e) {
+    feedback.notify(e instanceof Error ? e.message : String(e), 'error')
+  }
 }
 
 async function revoke(d: DocItem) {

@@ -15,13 +15,14 @@ import logging
 import os
 from decimal import Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from typing import Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.config.db_config import async_session as session_factory
+from rag个人知识库.config.redis import get_redis
 from rag个人知识库.crud.vector import (
     SYNC_FAILED,
     SYNC_IN_SYNC,
@@ -43,8 +44,8 @@ from rag个人知识库.loader.load_file import (
 )
 from rag个人知识库.loader.parser.mineru_parser import minerU_files_ordered
 from rag个人知识库.models.user import User
-from rag个人知识库.models.vector import VectorFile
-from rag个人知识库.splitter.spliter import split_documents
+from rag个人知识库.models.vector import ParentChunk, VectorFile
+from rag个人知识库.splitter.spliter import split_documents, split_documents_parent_child
 from rag个人知识库.service.oss_archive import rel_source_from_local
 from rag个人知识库.utils.hash_utils import compute_chunk_fingerprint, compute_file_hash
 from rag个人知识库.vector_store.milvus_store import (
@@ -56,6 +57,9 @@ from rag个人知识库.vector_store.milvus_store import (
 # 版本号步进：1.0 -> 1.1 -> ... -> 1.9 -> 2.0（Numeric(5,1) 保留一位小数）
 VERSION_STEP = Decimal("0.1")
 INITIAL_VERSION = Decimal("1.0")
+
+# 分层检索（Parent-Child）开关：与 spliter.RAG_PARENT_CHILD 保持一致（默认关，保持现状）
+RAG_PARENT_CHILD = os.getenv("RAG_PARENT_CHILD", "false").strip().lower() in ("1", "true", "yes", "on")
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +84,44 @@ async def _drop_staged_insert(file_id: int) -> None:
         logger.info("[Ingest] 已清理未同步 Milvus 的新入库记录：file_id=%s", file_id)
     except Exception:
         logger.exception("[Ingest] 清理未同步新入库记录失败：file_id=%s", file_id)
+
+
+async def _cancel_staged_update(file_id: int, source: str) -> None:
+    """入库取消（update/retry）：stage-1 已提交新期望状态(pending)而 Milvus 仍是旧向量。
+
+    M9：账号中途失活时，update/retry 分支若什么都不做会留下「永久 pending + 旧向量」的不一致状态。
+    这里按 source 清空 Milvus 向量并标记 failed，保证元数据与向量一致；本地原件保留，可人工重试。
+    """
+    try:
+        await adelete_chunks_by_source(source)
+    except Exception as e:
+        logger.warning("[Ingest] 取消入库清理向量失败（不影响标记 failed）：%s（%s）", source, e)
+    try:
+        async with session_factory() as db:
+            await set_sync_status(db, file_id, SYNC_FAILED, "账号已删除/禁用，入库取消")
+            await db.commit()
+        logger.info("[Ingest] 取消入库已按 source 清向量并标记 failed：file_id=%s source=%s", file_id, source)
+    except Exception:
+        logger.exception("[Ingest] 取消入库标记 failed 失败：file_id=%s", file_id)
+
+
+async def _register_parent_sources(source: str, parent_ids: List[str]) -> None:
+    """父块缓存登记：**重建** parent_src:{source} 集合（删除旧集 + 写入当前父块 id）。
+
+    每次入库/更新用当前 parent_id 集合整体替换，避免文件改版后旧 parent_id 残留、
+    集合随版本数无限增长（P3）。best-effort，失败不影响入库。
+    """
+    try:
+        r = get_redis()
+        key = f"parent_src:{source}"
+        await r.delete(key)
+        if parent_ids:
+            pipe = r.pipeline(transaction=False)
+            for pid in parent_ids:
+                pipe.sadd(key, pid)
+            await pipe.execute()
+    except Exception:
+        pass
 
 
 async def precheck(
@@ -126,9 +168,11 @@ async def _stage_insert(
     chunks: List[Document],
     owner_id: int,
     is_public: bool = False,
+    parents: Optional[List[dict]] = None,
 ) -> Tuple[int, Decimal, Dict[str, int]]:
     """阶段一（仅 MySQL）：全新入库，落库期望状态（status=pending）。
 
+    parents：分层检索父块列表（RAG_PARENT_CHILD 开启时非空），同事务写入 parent_chunks。
     返回 (file_id, version, summary)。Milvus 写入由调用方在阶段二执行。
     """
     file_name = os.path.basename(file_path)
@@ -141,10 +185,21 @@ async def _stage_insert(
     )
     fingerprints = _unique_fingerprints(chunks, source)
     await insert_chunks(db, file.id, fingerprints, INITIAL_VERSION)
+    if parents:
+        db.add_all(
+            ParentChunk(
+                parent_id=p["parent_id"], file_id=file.id, source=source,
+                parent_index=p["parent_index"], parent_title=p.get("parent_title"),
+                parent_text=p["parent_text"], char_len=p["char_len"],
+                version=INITIAL_VERSION,
+            )
+            for p in parents
+        )
     await update_chunk_count(db, file.id)
 
     summary = {"added": len(fingerprints), "unchanged": 0, "removed": 0}
-    logger.info("[Ingest] 全新入库 v%s：%s，chunk 数 %d", INITIAL_VERSION, file_path, len(fingerprints))
+    logger.info("[Ingest] 全新入库 v%s：%s，chunk 数 %d，父块数 %d",
+                INITIAL_VERSION, file_path, len(fingerprints), len(parents or []))
     return file.id, INITIAL_VERSION, summary
 
 
@@ -154,10 +209,13 @@ async def _stage_update(
     content_hash: str,
     chunks: List[Document],
     is_public: Optional[bool] = None,
+    parents: Optional[List[dict]] = None,
 ) -> Tuple[int, Decimal, List[Document], List[str], Dict[str, int]]:
     """阶段一（仅 MySQL）：内容已变，先升文件版本，再按指纹差集更新 chunk 记录。
 
     is_public 非 None 时同步更新共享状态（同名重新上传时 is_public 生效）。
+    parents：分层父块（RAG_PARENT_CHILD 开启时非空）；按 parent_id 差集——未变刷版本、
+    新增插入、消失删除（parent_id 内容派生，未变父块 id 不变）。
     返回 (file_id, new_version, added_chunks, removed_ids, summary)。
     Milvus 写入/删除由调用方在阶段二执行。
     """
@@ -193,6 +251,36 @@ async def _stage_update(
     if removed:
         await delete_chunks_by_fingerprints(db, removed)
 
+    # 5.5 父块差集（分层模式）：未变刷版本 / 新增插入 / 消失删除；
+    #    update/delete 一律限定 file_id，避免依赖 parent_id 全局唯一的隐式前提
+    if parents is not None:
+        old_pids = set((await db.execute(
+            select(ParentChunk.parent_id).where(ParentChunk.file_id == file_id)
+        )).scalars().all())
+        new_pids = {p["parent_id"] for p in parents}
+        for p in parents:
+            if p["parent_id"] in old_pids:
+                # 内容派生的 id 未变 ⇒ 父块未变，只刷版本
+                await db.execute(
+                    update(ParentChunk)
+                    .where(ParentChunk.parent_id == p["parent_id"], ParentChunk.file_id == file_id)
+                    .values(version=new_version)
+                )
+            else:
+                db.add(ParentChunk(
+                    parent_id=p["parent_id"], file_id=file_id, source=source,
+                    parent_index=p["parent_index"], parent_title=p.get("parent_title"),
+                    parent_text=p["parent_text"], char_len=p["char_len"],
+                    version=new_version,
+                ))
+        gone = old_pids - new_pids
+        if gone:
+            await db.execute(
+                delete(ParentChunk).where(
+                    ParentChunk.parent_id.in_(gone), ParentChunk.file_id == file_id
+                )
+            )
+
     # 6. 刷新 chunk_count
     await update_chunk_count(db, file_id)
 
@@ -209,6 +297,7 @@ async def _sync_milvus(
     added_chunks: List[Document],
     removed_ids: List[str],
     rebuild_source: Optional[str] = None,
+    source: Optional[str] = None,
 ) -> None:
     """阶段二：同步 Milvus（幂等可重放）。成功置 in_sync，失败置 failed + last_error。
 
@@ -218,6 +307,7 @@ async def _sync_milvus(
 
     rebuild_source: 非 None 时先按 source 删除该文件全部向量再全量插入
     （retry 重建用，清理上次更新失败残留的旧 chunk 孤儿向量）。
+    source: 更新场景下删除旧 chunk 失败时，回滚刚新增向量用（M19）。
     """
     try:
         if rebuild_source:
@@ -225,7 +315,17 @@ async def _sync_milvus(
         if added_chunks:
             await aadd_chunks(added_chunks)
         if removed_ids:
-            await adelete_chunks_by_ids(removed_ids)
+            try:
+                await adelete_chunks_by_ids(removed_ids)
+            except Exception:
+                # M19：删除旧 chunk 失败时回滚刚新增的向量，避免新旧版本混合检索窗口；
+                # 整源清空（幂等），标记 failed 后由 retry 按 source 重建
+                if source:
+                    try:
+                        await adelete_chunks_by_source(source)
+                    except Exception as e2:
+                        logger.warning("[Ingest] 删除失败回滚整源向量也失败：%s（%s）", source, e2)
+                raise
         async with session_factory() as db:
             await set_sync_status(db, file_id, SYNC_IN_SYNC)
             await db.commit()
@@ -319,8 +419,12 @@ async def process_file(
     for doc in docs:
         doc.metadata["source"] = upload_source
 
-    # 4. 切分
-    chunks = await asyncio.to_thread(split_documents, docs)
+    # 4. 切分（分层模式：子块 + 父块；默认单层保持现状）
+    parents: Optional[List[dict]] = None
+    if RAG_PARENT_CHILD:
+        chunks, parents = await asyncio.to_thread(split_documents_parent_child, docs)
+    else:
+        chunks = await asyncio.to_thread(split_documents, docs)
     if not chunks:
         return {"file_path": file_path, "status": "error", "message": "切分结果为空"}
 
@@ -340,16 +444,19 @@ async def process_file(
             if action == "insert":
                 file_id, version, summary = await _stage_insert(
                     db, file_path, content_hash, chunks,
-                    owner_id=owner_id, is_public=bool(is_public),
+                    owner_id=owner_id, is_public=bool(is_public), parents=parents,
                 )
                 added_chunks = chunks
                 removed_ids = []
             else:
                 file_id, version, added_chunks, removed_ids, summary = await _stage_update(
-                    db, record, content_hash, chunks, is_public=is_public,
+                    db, record, content_hash, chunks, is_public=is_public, parents=parents,
                 )
                 owner_id = owner_id or record.owner_id  # 更新沿用已有 owner
             await db.commit()
+            # 父块缓存登记（best-effort：供删除/下架时按 source 显式失效）
+            if parents:
+                await _register_parent_sources(upload_source, [p["parent_id"] for p in parents])
         except Exception:
             await db.rollback()
             logger.exception("[Ingest] 元数据落库失败，已回滚（Milvus 未改动）：%s", file_path)
@@ -373,8 +480,15 @@ async def process_file(
             logger.info("[Ingest] 用户 %s 在 Milvus 同步前已非 active，取消入库：%s", owner_id, file_path)
             if action == "insert":
                 await _drop_staged_insert(file_id)
+            else:
+                # M9：update/retry 取消——stage-1 已提交新期望状态(pending)而 Milvus 还是旧向量，
+                # 清空该 source 向量并置 failed，保证元数据与向量一致，不再永久 pending
+                await _cancel_staged_update(file_id, record.source)
             return {"file_path": file_path, "status": "cancelled", "message": "账号当前不可入库"}
-        await _sync_milvus(file_id, added_chunks, removed_ids, rebuild_source)
+        await _sync_milvus(
+            file_id, added_chunks, removed_ids, rebuild_source,
+            source=record.source if record is not None else None,
+        )
         logger.info("[Ingest] %s 处理完成：%s", file_path, summary)
         return {
             "file_path": file_path,

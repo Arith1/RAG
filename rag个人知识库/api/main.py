@@ -14,7 +14,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -27,6 +27,8 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.api.auth import (
+    DUMMY_PASSWORD_HASH,
+    LOGIN_MAX_ATTEMPTS_PER_IP,
     allow_request,
     audit, check_allowed, clear_key, create_access_token, get_current_user,
     hash_password, record_failure, require_admin, seed_admin, verify_password,
@@ -34,10 +36,10 @@ from rag个人知识库.api.auth import (
 )
 from rag个人知识库.config.db_config import async_session, engine, get_db
 from rag个人知识库.config.redis import cache_clear_prefix, cache_clear_source, redis_available
-from rag个人知识库.models.user import User
+from rag个人知识库.models.user import AccountDeletion, User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.chat import chat, chat_stream
-from rag个人知识库.agent.ai_assist import clear_thread
+from rag个人知识库.agent.ai_assist import clear_thread, close_memory
 from rag个人知识库.service.chat_history import (
     build_session_detail,
     delete_session as delete_chat_session,
@@ -68,6 +70,10 @@ from rag个人知识库.utils.sanitize import (
     sanitize_source_paths,
 )
 from rag个人知识库.service.delete_queue import (
+    is_delete_inflight,
+    list_delete_dead,
+    retry_all_delete_dead,
+    retry_delete_dead,
     run_worker as run_delete_worker,
 )
 from rag个人知识库.service.billing import (
@@ -103,7 +109,9 @@ from rag个人知识库.service.memory_maintenance import (
 from rag个人知识库.service.oss_archive import (
     UPLOAD_DIR, build_download_url, local_source_exists,
 )
+from rag个人知识库.service.parent_child import invalidate_parent_cache_by_source
 from rag个人知识库.service.service import ingest_files, list_documents, search_documents
+from rag个人知识库.splitter.spliter import RAG_PARENT_CHILD
 from rag个人知识库.vector_store.milvus_store import get_vector_store
 
 logger = logging.getLogger(__name__)
@@ -117,6 +125,9 @@ ALLOWED_EXT = {".pdf", ".docx", ".txt", ".md"}
 # 一次最多 5 个子问题，属于最贵的接口；检索次之。0 或负数表示不限流。
 CHAT_MAX_REQUESTS_PER_MINUTE = int(os.getenv("CHAT_MAX_REQUESTS_PER_MINUTE", "10"))
 SEARCH_MAX_REQUESTS_PER_MINUTE = int(os.getenv("SEARCH_MAX_REQUESTS_PER_MINUTE", "30"))
+# 账号删除宽限期（天）：用户请求删除后账号立即锁定、公开文档立即下架，
+# 到期（delete_after）后由 Redis Streams 删除队列彻底清除；宽限期内不可恢复。
+DELETE_GRACE_DAYS = int(os.getenv("DELETE_GRACE_DAYS", "7"))
 
 
 # ── 请求/响应模型 ──
@@ -389,6 +400,7 @@ async def lifespan(_app: FastAPI):
         ingest_worker_task.cancel()
     if delete_worker_task is not None:
         delete_worker_task.cancel()
+    close_memory()  # 关闭对话记忆连接池（Postgres），释放连接与后台线程
     await engine.dispose()
 
 
@@ -399,13 +411,33 @@ async def _check_business_tables() -> None:
             await conn.execute(text("SELECT 1 FROM users LIMIT 1"))
             await conn.execute(text("SELECT 1 FROM vector_files LIMIT 1"))
             await conn.execute(text("SELECT 1 FROM audit_logs LIMIT 1"))
+            # 分层检索开启时：parent_chunks 表缺失 → 快速失败，避免入库任务进死信
+            if RAG_PARENT_CHILD:
+                await conn.execute(text("SELECT 1 FROM parent_chunks LIMIT 1"))
     except Exception as e:
         logger.error("[api] 业务表缺失或数据库未就绪，请先执行表结构初始化：")
         logger.error("      mysql -u root -p rag_demo < rag个人知识库/models/vector.sql")
+        if RAG_PARENT_CHILD:
+            logger.error("      （分层检索已开启：还需 models/vector.sql §8 的 parent_chunks 表）")
         raise RuntimeError(f"业务表检查失败：{e}") from e
 
 
-app = FastAPI(title="RAG 个人知识库", version="0.2.0", lifespan=lifespan)
+# M4：生产环境关闭 Swagger/OpenAPI 暴露（APP_ENV=production|prod 或 DISABLE_DOCS=true 时关闭），
+# 避免端点签名/参数约束/响应模型对外泄露、降低攻击面；开发环境保持默认开启。
+_ENV = os.getenv("APP_ENV", "development").strip().lower()
+_DOCS_ENABLED = not (
+    _ENV in ("production", "prod")
+    or os.getenv("DISABLE_DOCS", "").strip().lower() in ("1", "true", "yes", "on")
+)
+
+app = FastAPI(
+    title="RAG 个人知识库",
+    version="0.2.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+    redoc_url=None,
+)
 
 # CORS：允许 Vue 开发服务器（Vite 默认 5173）跨域调用
 app.add_middleware(
@@ -606,18 +638,33 @@ async def login(
     db: AsyncSession = Depends(get_db),
     background_tasks: BackgroundTasks = None,
 ):
-    """OAuth2 密码流登录，返回 JWT。滑动窗口限流（5 次/分钟），失败写入审计。"""
-    key = f"login|{form.username}|{_client_ip(request)}"
-    if not await check_allowed(key):
+    """OAuth2 密码流登录，返回 JWT；失败写入审计。
+
+    M3：登录硬锁只按 IP（`login_ip|{ip}`，跨用户名共享阈值）——攻击者无法用
+    自己的 IP 跨 IP 锁死指定用户名；按「用户名+IP」的失败计数仅作记录，不作硬锁。
+    M2：无论用户是否存在/状态如何都执行一次 bcrypt（不存在/非 active 用假哈希），
+    消除用户名枚举的时序侧信道；401 文案统一不暴露账号状态。
+    """
+    ip = _client_ip(request)
+    ip_key = f"login_ip|{ip}"
+    if not await check_allowed(ip_key, LOGIN_MAX_ATTEMPTS_PER_IP):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "尝试过于频繁，请 1 分钟后再试")
+    user_key = f"login|{form.username}|{ip}"
     result = await db.execute(select(User).where(User.username == form.username))
     user = result.scalar_one_or_none()
+    # M2：恒执行一次 bcrypt（不存在/非 active 对假哈希校验，耗时与真实用户一致）
+    password_ok = verify_password(
+        form.password,
+        user.password_hash if user is not None else DUMMY_PASSWORD_HASH,
+    )
     # 非 active 账号与不存在/密码错误统一返回 401，避免暴露账号状态
-    if user is None or user.status != "active" or not verify_password(form.password, user.password_hash):
-        await record_failure(key)
-        await write_audit("login_failed", username=form.username, detail=f"ip={_client_ip(request)}")
+    if user is None or user.status != "active" or not password_ok:
+        await record_failure(ip_key)
+        await record_failure(user_key)
+        await write_audit("login_failed", username=form.username, detail=f"ip={ip}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")
-    await clear_key(key)
+    await clear_key(ip_key)
+    await clear_key(user_key)
     # 登录后后台预热会话列表 + 最近 10 个会话记录（不阻塞登录响应）
     if background_tasks is not None:
         background_tasks.add_task(warmup_user_sessions, user.id)
@@ -643,38 +690,74 @@ async def delete_account(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """软删除账号：仅把 status 置为 deleted，不真正删除任何数据。
+    """请求删除账号（两阶段删除）：立即锁定 + 下架公开文档 → 宽限期后彻底清除。
 
-    用户行、文档、向量、计费记录（llm_usage）全部保留；
-    账号从用户搜索 / 资料可见性中消失，现有 token 立即失效
-    （get_current_user 每个请求回源 DB 校验 status）。
+    1) 把 status 置为 deleting：get_current_user 对非 active 状态返回 403，
+       账号即刻不可登录/不可操作（现有 token 立即失效）。
+    2) 把该用户全部公开文档置为私有（is_public=0）：owner 已离开后，
+       内容不再被他人检索/列表/下载，堵住"已删账号公开文档永久可见"的漏洞。
+    3) 写入 account_deletions 记录宽限期（DELETE_GRACE_DAYS 天，默认 7）；
+       到期后由 Redis Streams 删除队列彻底清除 Milvus 向量 / OSS 原件 / 本地文件
+       / MySQL 元数据（级联 vector_files/chunk_records/chat_sessions）/ Postgres 对话记忆。
+    4) 计费(llm_usage)/链路(rag_traces)/审计(audit_logs) 记录保留（无外键，留痕）。
     """
     if user.status != "active":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "当前账号状态不可删除")
     # 管理员不能删除自己的账号（防止误删唯一管理员导致系统失控）
     if user.role == "admin":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "管理员账号不能删除自己，请联系系统管理员处理")
+    if await is_delete_inflight(user.id):
+        raise HTTPException(status.HTTP_409_CONFLICT, "账号删除任务已在进行中，请勿重复操作")
 
-    # 显式 UPDATE 落库：user 可能来自 Redis 缓存（游离对象），直接改属性 + commit 不会生效
+    now = datetime.now()
+    delete_after = now + timedelta(days=max(0, DELETE_GRACE_DAYS))
+
+    # 1) 锁定账号（显式 UPDATE 落库：user 可能来自 Redis 缓存，直接改属性 + commit 不会生效）
     update_result = await db.execute(
         update(User)
         .where(User.id == user.id, User.status == "active")
-        .values(status="deleted")
+        .values(status="deleting")
     )
     if update_result.rowcount != 1:
         await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "账号删除状态已发生变化，请稍后重试")
-    audit(db, user, "delete_account", target=user.username, detail="status=deleted (soft delete, 数据保留)")
+
+    # 2) 立即下架该用户全部公开文档（is_public 置 0），堵住"已删账号内容仍公开"的隐私漏洞
+    await db.execute(
+        update(VectorFile)
+        .where(VectorFile.owner_id == user.id, VectorFile.is_public.is_(True))
+        .values(is_public=False)
+    )
+
+    # 3) 记录宽限期调度（幂等：已存在请求则刷新时间并回到 pending）
+    existing = await db.get(AccountDeletion, user.id)
+    if existing is None:
+        db.add(AccountDeletion(user_id=user.id, delete_after=delete_after))
+    else:
+        existing.status = "pending"
+        existing.delete_after = delete_after
+        existing.requested_at = now
+    audit(
+        db, user, "delete_account", target=user.username,
+        detail=f"status=deleting, grace={DELETE_GRACE_DAYS}d, delete_after={delete_after:%Y-%m-%d %H:%M:%S}",
+    )
     await db.commit()
 
-    # 软删除后立即清缓存：会话列表/详情、文档列表、用户搜索均失效
+    # 4) 立即清缓存：会话列表/详情、文档列表、用户搜索，以及引用该用户文档的检索/回答缓存
     await invalidate_user_sessions(user.id)
     await invalidate_docs()
     await invalidate_user_search()
+    rows = await db.execute(select(VectorFile.source).where(VectorFile.owner_id == user.id))
+    for src in rows.scalars().all():
+        await cache_clear_source(src)
+        await invalidate_parent_cache_by_source(src)  # 父块切片缓存随账号删除显式失效
 
     return {
-        "status": "deleted",
-        "message": "账号已删除（软删除），数据与计费记录保留",
+        "status": "deleting",
+        "message": (
+            f"删除请求已受理：账号已锁定，公开文档已下架；"
+            f"将在 {max(0, DELETE_GRACE_DAYS)} 天后彻底删除（不可恢复），计费与审计记录将保留"
+        ),
     }
 
 
@@ -855,7 +938,9 @@ async def remove_document(
     """删除自己的文档：Milvus 向量 + MySQL 元数据（级联 chunk）+ 磁盘文件 + 审计。
 
     普通用户和管理员都只能删除自己的文档；他人文档不可删除。
-    若文档正在入库队列中处理，返回 409，避免"删除先执行、入库后写完向量"的孤儿向量竞态。
+    若文档正在入库队列中处理（source 处于 inflight），返回 409 快速失败；
+    删除本身在 delete_document 内部持有 owner 级分布式锁（与入库 worker 串行化），
+    消除"删除按 source 清向量"与"并发重传写向量"的交错（H6）。
     """
     result = await db.execute(select(VectorFile).where(VectorFile.id == file_id))
     record = result.scalar_one_or_none()
@@ -876,6 +961,7 @@ async def remove_document(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
     # 删除后只清理包含该文档 source 的检索/回答缓存，避免 TTL 内继续返回已删文档的旧结果
     await cache_clear_source(record.source)
+    await invalidate_parent_cache_by_source(record.source)  # 父块切片缓存按 source 显式失效
     await invalidate_docs()  # 文档列表：该文档从所有可见者的列表中移除
     return {"status": "deleted", "file_id": file_id}
 @app.post("/api/documents/{file_id}/revoke")
@@ -945,10 +1031,14 @@ async def download_document(
 
     优先返回 OSS 签名/公有 URL；OSS 未启用且本地原件还在时直接回文件。
     服务器环境下原始文件已归档到 OSS，此接口提供可下载的链接（或直接流式返回本地副本）。
+    P2：owner 非 active 的文档（含历史软删除账号的公开文档）一律 404，与列表/检索的幽灵数据口径一致。
     """
     result = await db.execute(select(VectorFile).where(VectorFile.id == file_id))
     record = result.scalar_one_or_none()
     if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
+    owner_status = await db.scalar(select(User.status).where(User.id == record.owner_id))
+    if owner_status != "active":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "文档不存在")
 
     # 下载权限：仅 owner 或共享文档（is_public=1）可下载；无权限与不存在统一 404，避免探测 file_id
@@ -1034,6 +1124,31 @@ async def ingest_dead_retry(msg_id: str, admin: User = Depends(require_admin)):
 async def ingest_dead_clear(admin: User = Depends(require_admin)):
     """入库队列：清空死信队列（管理员）。"""
     return await clear_dead()
+
+
+# ══ 账户删除队列：死信管理（管理员）——P2：删除任务失败进死信后提供重放路径 ══
+@app.get("/api/delete-queue/dead")
+async def delete_dead_list(
+    limit: int = Query(100, ge=1, le=500),
+    admin: User = Depends(require_admin),
+):
+    """账户删除队列：列出死信任务（含失败原因与原始消息 ID）。"""
+    return await list_delete_dead(limit)
+
+
+@app.post("/api/delete-queue/dead/retry-all")
+async def delete_dead_retry_all(admin: User = Depends(require_admin)):
+    """账户删除队列：全部死信任务重新入队（管理员）。"""
+    return await retry_all_delete_dead()
+
+
+@app.post("/api/delete-queue/dead/{msg_id}/retry")
+async def delete_dead_retry(msg_id: str, admin: User = Depends(require_admin)):
+    """账户删除队列：单条死信任务重新入队（管理员）。"""
+    new_id = await retry_delete_dead(msg_id)
+    if new_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "死信任务不存在或缺少必要字段，无法重试")
+    return {"status": "retried", "msg_id": msg_id, "new_msg_id": new_id}
 
 
 # ══ 问答 / 检索（所有登录用户）══

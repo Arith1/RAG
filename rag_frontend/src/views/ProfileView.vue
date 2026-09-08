@@ -5,6 +5,7 @@ import {
   api,
   changePassword,
   deleteAccount,
+  downloadDocument,
   getUserProfile,
   listChatSessions,
   type ChatSessionInfo,
@@ -144,32 +145,12 @@ async function loadProfile() {
   }
 }
 
-function download(d: DocItem) {
-  const token = auth.token
-  fetch(`/api/documents/${d.id}/download`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const ct = res.headers.get('content-type') ?? ''
-      if (ct.includes('application/json')) {
-        const data = (await res.json()) as { url?: string }
-        if (data.url) {
-          window.open(data.url, '_blank', 'noopener')
-          return
-        }
-      }
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = d.file_name
-      a.click()
-      URL.revokeObjectURL(url)
-    })
-    .catch((e) => {
-      feedback.notify(e instanceof Error ? e.message : String(e), 'error')
-    })
+async function download(d: DocItem) {
+  try {
+    await downloadDocument(d.id, d.file_name)
+  } catch (e) {
+    feedback.notify(e instanceof Error ? e.message : String(e), 'error')
+  }
 }
 
 function openSession(id: string) {
@@ -233,7 +214,7 @@ async function changePwd() {
 async function requestDeleteAccount() {
   const ok = await feedback.confirm({
     message: '确认删除账号？',
-    detail: '账号将被标记为已删除，无法再登录；文档与计费记录均保留，此操作不可撤销。',
+    detail: '提交后账号将立即锁定且无法再登录，公开文档即刻下架；宽限期（默认 7 天）后将彻底删除你的文档、向量与对话记忆，计费与审计记录保留。此操作不可撤销。',
     confirmText: '确认删除',
     danger: true,
   })
@@ -456,7 +437,7 @@ onMounted(loadProfile)
             <div class="mgmt-block danger">
               <h4>删除账号</h4>
               <p class="danger-desc">
-                删除后你的全部文档与向量将被清理，账号将无法登录，且此操作不可撤销。请谨慎操作。
+                提交后账号将立即锁定、公开文档即刻下架；宽限期（默认 7 天）内不可恢复，到期将彻底删除你的文档、向量与对话记忆（计费与审计记录保留）。请谨慎操作。
               </p>
               <template v-if="auth.isAdmin">
                 <p class="danger-desc">管理员账号不支持自助删除，请联系系统管理员处理。</p>

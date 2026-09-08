@@ -135,6 +135,15 @@ async def write_audit(
 # Redis 不可用时自动回退进程内 dict，系统不中断。
 LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
 LOGIN_WINDOW_SECONDS = 60
+# M3：登录硬锁只按 IP（跨用户名共享，默认 20 次/60s）——攻击者无法用自己 IP 的
+# 失败尝试跨 IP 锁死指定用户名（同 NAT/代理共享 IP 的用户间仍互相影响，属固有）。
+# 按「用户名+IP」的失败计数保留作审计/观察，但不再作为硬锁依据。
+LOGIN_MAX_ATTEMPTS_PER_IP = int(os.getenv("LOGIN_MAX_ATTEMPTS_PER_IP", "20"))
+# M6：Redis 宕机期间进程内限流 dict 的 key 上限，超限逐出最早插入项，防内存无限增长
+MAX_LOCAL_ATTEMPTS_KEYS = int(os.getenv("MAX_LOCAL_ATTEMPTS_KEYS", "10000"))
+# M2：登录时序侧信道防护用假哈希——用户不存在/非 active 时也执行一次 bcrypt，
+# 与真实用户耗时一致（cost 12），封死「按响应时间差枚举用户名」。
+DUMMY_PASSWORD_HASH = hash_password("not-a-real-password-for-timing-equalization")
 
 # 进程内兜底（Redis 不可用时）
 _attempts: dict = {}  # key -> deque[时间戳]
@@ -158,6 +167,10 @@ def _local_check_allowed(key: str, max_requests: int = LOGIN_MAX_ATTEMPTS) -> bo
 
 def _local_record_failure(key: str) -> None:
     _attempts.setdefault(key, deque()).append(time.time())
+    # M6：Redis 宕机期间防内存 DoS——dict 保插入序，超上限逐出最早插入的 key
+    # （未被再次访问的 key 永不触发 _local_prune，只有这里能兜住无限增长）
+    while len(_attempts) > MAX_LOCAL_ATTEMPTS_KEYS:
+        _attempts.pop(next(iter(_attempts)), None)
 
 
 def _local_clear_key(key: str) -> None:
@@ -210,18 +223,28 @@ async def _redis_record(key: str, window_seconds: int = LOGIN_WINDOW_SECONDS) ->
         return False
 
 
-async def check_allowed(key: str) -> bool:
+async def _record_attempt(key: str, window_seconds: int = LOGIN_WINDOW_SECONDS) -> None:
+    """记录一次计数（登录失败 / 成本限流共用）：Redis 优先，不可用回退进程内。
+
+    这是 M1 修复的关键原语：allow_request 之前只记 Redis、不记本地——Redis 宕机时
+    进程内 dict 永远为空，`_local_check_allowed` 恒 True，chat/search 成本限流被
+    完全绕过（可无限调用最贵接口）。统一走这里，两路径语义严格一致。
+    """
+    if not await _redis_record(key, window_seconds):
+        _local_record_failure(key)
+
+
+async def check_allowed(key: str, max_attempts: int = LOGIN_MAX_ATTEMPTS) -> bool:
     """窗口内失败次数未超限返回 True（Redis 优先，不可用回退进程内）。"""
-    result = await _redis_check(key)
+    result = await _redis_check(key, max_attempts)
     if result is not None:
         return result
-    return _local_check_allowed(key)
+    return _local_check_allowed(key, max_attempts)
 
 
 async def record_failure(key: str) -> None:
     """记录一次失败（Redis 优先，不可用回退进程内）。"""
-    if not await _redis_record(key):
-        _local_record_failure(key)
+    await _record_attempt(key)
 
 
 async def clear_key(key: str) -> None:
@@ -239,6 +262,11 @@ async def allow_request(key: str, max_requests: int, window_seconds: int = LOGIN
     与登录限流共用 ZSET + Lua 实现（多 worker 共享、重启不清零），
     Redis 不可用时回退进程内 dict。名额在进入昂贵流程前先占下，
     简单且不会低估并发成本；max_requests <= 0 表示不限流。
+
+    M1 修复：通过检查后必须经 `_record_attempt` 记账——Redis 宕机时
+    本地兜底同样要写进程内 dict，否则本地检查永远为空、限流形同虚设。
+    （临界窗口内本地与 Redis 是两个独立计数器，极端情况下单窗口最多放行约
+    2× 上限，属本地兜底方案的固有有界偏差，远好于宕机期间完全不限流。）
     """
     if max_requests <= 0:
         return True
@@ -247,7 +275,7 @@ async def allow_request(key: str, max_requests: int, window_seconds: int = LOGIN
         ok = _local_check_allowed(key, max_requests)
     if not ok:
         return False
-    await _redis_record(key, window_seconds)
+    await _record_attempt(key, window_seconds)
     return True
 
 

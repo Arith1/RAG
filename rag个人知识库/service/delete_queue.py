@@ -1,12 +1,19 @@
-"""基于 Redis Streams 的账户删除队列。
+"""基于 Redis Streams 的账户删除队列（两阶段删除的执行端）。
 
-删除顺序（重要，保证不产生孤儿向量/不可下载原件）：
-  1. 用户提交删除请求时：users.status='deleting'，所有该用户文档 is_public=0
-  2. 进入 delete_queue 后：
-     a. 删除 Milvus 中该用户全部向量（按 owner_id 过滤）
-     b. 删除阿里云 OSS 中该用户的文档原件（逐个 source）
-     c. 只有 Milvus 和 OSS 都成功后，才删除 MySQL users 行
-        （vector_files/chunk_records 由外键 ON DELETE CASCADE 级联清理）
+调度：
+  1. 用户请求删除（/api/auth/delete-account）：users.status='deleting'，
+     该用户全部文档 is_public=0（立即锁定账号、下架公开内容），
+     并写入 account_deletions（delete_after = 请求时间 + 宽限期）。
+  2. 本 worker 周期性扫描 account_deletions，宽限期到期者 enqueue_delete 入队。
+
+执行顺序（重要，保证不产生孤儿向量/不可下载原件）：
+  a. 删除 Milvus 中该用户全部向量（按 owner_id 过滤）
+  b. 删除阿里云 OSS 中该用户的文档原件（逐个 source）
+  c. 只有 Milvus 和 OSS 都成功后，才删除 MySQL users 行
+     （vector_files/chunk_records/chat_sessions/scope_users 由外键级联清理）
+  d. 清理 Postgres 对话记忆（checkpoint，thread_id={user_id}:{session_id}）
+  e. 清检索/回答缓存（按 source）与 Redis 会话缓存，标记 account_deletions=done
+     计费(llm_usage)/链路(rag_traces)/审计(audit_logs) 记录保留（无外键，留痕）。
 
 失败重试与 ingest_queue 保持一致：Consumer Group + PEL 崩溃恢复、指数退避、死信队列。
 """
@@ -16,15 +23,20 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
+from rag个人知识库.agent.ai_assist import clear_thread
 from rag个人知识库.config.db_config import async_session
 from rag个人知识库.config.redis import cache_clear_source, get_redis, redis_available
-from rag个人知识库.models.user import AuditLog, User
+from rag个人知识库.models.chat import ChatSession
+from rag个人知识库.models.user import AccountDeletion, AuditLog, User
 from rag个人知识库.models.vector import VectorFile
 from rag个人知识库.service.oss_archive import delete_source_artifact, local_source_exists
 from rag个人知识库.service.operation_lock import owner_operation_lock
+from rag个人知识库.service.parent_child import invalidate_parent_cache_by_source
+from rag个人知识库.service.session_cache import invalidate_user_sessions
 from rag个人知识库.vector_store.milvus_store import adelete_chunks_by_owner
 
 logger = logging.getLogger(__name__)
@@ -146,6 +158,46 @@ async def _flush_due_retries() -> None:
         logger.warning("[delete_queue] 扫描延迟重试队列失败：%s", e)
 
 
+async def _flush_due_deletions() -> None:
+    """扫描已过宽限期的账号删除请求，到期者加入 delete_queue 彻底删除。
+
+    两阶段删除调度：delete-account 接口置 status='deleting' 并写入 account_deletions
+    （delete_after = 请求时间 + 宽限期）；本函数周期性扫描，到期后 enqueue_delete。
+    Redis 不可用或入队失败时保留 pending，等待下次扫描重试。
+    """
+    try:
+        async with async_session() as db:
+            due_ids = list((await db.execute(
+                select(AccountDeletion.user_id).where(
+                    AccountDeletion.status == "pending",
+                    AccountDeletion.delete_after <= datetime.now(),
+                )
+            )).scalars().all())
+        for user_id in due_ids:
+            msg_id = await enqueue_delete(user_id)
+            if msg_id is None:
+                # P3：入队失败可能是 Redis 不可用，也可能是该用户已有删除任务在飞（锁占用）；
+                # 统一文案避免误导排障。保留 pending，下次扫描再试。
+                logger.warning(
+                    "[delete_queue] 账号 %s 宽限期到期但入队失败（Redis 不可用或该用户已有删除任务在飞），"
+                    "保留 pending 等待下次扫描", user_id,
+                )
+                continue
+            try:
+                async with async_session() as db:
+                    await db.execute(
+                        update(AccountDeletion)
+                        .where(AccountDeletion.user_id == user_id, AccountDeletion.status == "pending")
+                        .values(status="enqueued")
+                    )
+                    await db.commit()
+            except Exception as e:
+                logger.warning("[delete_queue] 标记账号 %s 删除请求为 enqueued 失败（不影响入队）：%s", user_id, e)
+            logger.info("[delete_queue] 账号 %s 宽限期到期，已加入删除队列（彻底删除）", user_id)
+    except Exception as e:
+        logger.warning("[delete_queue] 扫描到期删除请求失败：%s", e)
+
+
 async def _recover_pending() -> None:
     """回收上次崩溃未 ACK 的账户删除任务并立即重新处理。"""
     r = get_redis()
@@ -249,7 +301,8 @@ async def _process_delete_message_unlocked(msg_id: str, fields: dict) -> bool:
                     )
                     return False
 
-        # 第三步：Milvus + OSS 都成功后才删 MySQL 用户（vector_files/chunks 级联删除）
+        # 第三步：Milvus + OSS 都成功后才删 MySQL 用户（vector_files/chunks/chat_sessions 级联删除）
+        session_ids: list = []
         async with async_session() as db:
             # 再次确认用户仍处于 deleting，避免误删已被恢复/重新激活的账号
             result = await db.execute(select(User).where(User.id == user_id))
@@ -263,22 +316,49 @@ async def _process_delete_message_unlocked(msg_id: str, fields: dict) -> bool:
                     msg_id, user_id, user.status,
                 )
                 return True
+            # 删除前先取该用户的会话 id 列表：chat_sessions 会随用户行级联删除，
+            # 但 Postgres 里的对话记忆（checkpoint，thread_id={user_id}:{session_id}）
+            # 不会级联，必须在删行前记住 id、删行后逐个清理，否则孤儿记忆永久泄漏。
+            session_ids = list((await db.execute(
+                select(ChatSession.session_id).where(ChatSession.user_id == user_id)
+            )).scalars().all())
             db.add(AuditLog(
                 user_id=user_id,
                 username=username,
                 action="delete_account",
                 target=username,
-                detail="delete_queue completed: milvus+oss+mysql",
+                detail="delete_queue completed: milvus+oss+mysql+memory",
             ))
             await db.execute(delete(User).where(User.id == user_id))
             await db.commit()
 
-            # 账户删除后清理该用户所有文档的检索/回答缓存，避免他人仍命中旧共享结果
-            for source in sources:
-                await cache_clear_source(source)
+        # 账户删除后的清理（不占用 DB 会话连接）：
+        # 1) 按 source 清检索/回答缓存，避免他人仍命中已删账号的旧共享结果
+        for source in sources:
+            await cache_clear_source(source)
+            await invalidate_parent_cache_by_source(source)  # 父块切片缓存随账号删除显式失效
+        # 2) 清该用户 Redis 会话列表/详情缓存
+        await invalidate_user_sessions(user_id)
+        # 3) 清 Postgres 对话记忆（best-effort，失败不影响删除结果）
+        for sid in session_ids:
+            try:
+                await asyncio.to_thread(clear_thread, f"{user_id}:{sid}")
+            except Exception as e:
+                logger.warning("[delete_queue] 清理用户 %s 会话 %s 的对话记忆失败：%s", user_id, sid, e)
+        # 4) 标记删除调度记录完成（留痕：本行不随用户行级联，user_id 无外键）
+        try:
+            async with async_session() as db:
+                await db.execute(
+                    update(AccountDeletion)
+                    .where(AccountDeletion.user_id == user_id)
+                    .values(status="done")
+                )
+                await db.commit()
+        except Exception as e:
+            logger.warning("[delete_queue] 标记账号 %s 删除调度记录完成失败（不影响删除结果）：%s", user_id, e)
 
-            logger.info("[delete_queue] 用户 %s 已删除（Milvus+OSS+MySQL 完成）", user_id)
-            return True
+        logger.info("[delete_queue] 用户 %s 已彻底删除（Milvus+OSS+MySQL+记忆 完成）", user_id)
+        return True
     except Exception as e:
         logger.warning("[delete_queue] 任务 %s 处理失败：%s", msg_id, e)
         return False
@@ -310,13 +390,19 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
     await _ensure_group()
     await _recover_pending()
     await _flush_due_retries()
+    await _flush_due_deletions()  # 启动时先处理已过宽限期的删除请求
     r = get_redis()
     logger.info("[delete_queue] worker 启动（consumer=%s）", CONSUMER)
     last_recover = time.monotonic()
+    last_delete_scan = time.monotonic()
     while not (stop is not None and stop.is_set()):
         try:
             # 先处理 Redis ZSET 中的到期延迟重试，再消费新消息
             await _flush_due_retries()
+            # 周期性扫描 MySQL 中已过宽限期的账号删除请求（避免每 2s 空转查询 DB）
+            if time.monotonic() - last_delete_scan > 60:
+                await _flush_due_deletions()
+                last_delete_scan = time.monotonic()
             resp = await r.xreadgroup(GROUP, CONSUMER, {STREAM: ">"}, count=1, block=2000)
             if not resp:
                 if time.monotonic() - last_recover > 60:
@@ -371,6 +457,85 @@ async def queue_stats() -> dict:
     except Exception:
         logger.exception("[delete_queue] 队列统计失败")
         return {"enabled": True, "error": "queue_unavailable"}
+
+
+# ── 删除队列死信管理（P2：删除任务失败进死信后提供管理员重放路径，避免账号永久卡在 deleting）──
+
+async def list_delete_dead(limit: int = 100) -> list[dict]:
+    """列出账户删除死信队列条目（含失败原因与原始消息 ID）。"""
+    if not await redis_available():
+        return []
+    r = get_redis()
+    try:
+        entries = await r.xrevrange(DEAD_LETTER, "+", "-", count=limit)
+    except Exception as e:
+        logger.warning("[delete_queue] 读取删除死信队列失败：%s", e)
+        return []
+    result = []
+    for msg_id, fields in entries:
+        raw = fields.get("user_id", "")
+        result.append({
+            "msg_id": msg_id,
+            "user_id": int(raw) if str(raw).isdigit() else None,
+            "error": fields.get("error", ""),
+            "origin": fields.get("origin", ""),
+        })
+    return result
+
+
+async def retry_delete_dead(msg_id: str) -> str | None:
+    """重放单条删除死信：重新入队（保留 user_id），成功后清死信条目并重置重试计数。"""
+    if not await redis_available():
+        return None
+    r = get_redis()
+    try:
+        entries = await r.xrange(DEAD_LETTER, msg_id, msg_id)
+    except Exception as e:
+        logger.warning("[delete_queue] 读取删除死信条目失败：%s（%s）", msg_id, e)
+        return None
+    if not entries:
+        return None
+    fields = entries[0][1]
+    raw = fields.get("user_id", "")
+    if not str(raw).isdigit():
+        logger.warning("[delete_queue] 删除死信条目缺少有效 user_id，删除：%s", msg_id)
+        await r.xdel(DEAD_LETTER, msg_id)
+        return None
+    new_id = await enqueue_delete(int(raw))
+    if new_id is None:
+        logger.warning("[delete_queue] 删除死信重试入队失败（Redis 不可用或锁占用）：%s", msg_id)
+        return None
+    await r.xdel(DEAD_LETTER, msg_id)
+    await r.hdel(RETRY_HASH, str(raw))  # 重置重试计数，重新从 0 开始
+    logger.info("[delete_queue] 删除死信 %s 已重新入队（user_id=%s）", msg_id, raw)
+    return new_id
+
+
+async def retry_all_delete_dead() -> dict:
+    """重放全部删除死信，返回成功/失败计数。"""
+    if not await redis_available():
+        return {"retried": 0, "failed": 0}
+    r = get_redis()
+    try:
+        entries = await r.xrange(DEAD_LETTER, "-", "+")
+    except Exception as e:
+        logger.warning("[delete_queue] 读取删除死信队列失败：%s", e)
+        return {"retried": 0, "failed": 0}
+    retried = failed = 0
+    for msg_id, fields in entries:
+        raw = fields.get("user_id", "")
+        if not str(raw).isdigit():
+            await r.xdel(DEAD_LETTER, msg_id)
+            failed += 1
+            continue
+        new_id = await enqueue_delete(int(raw))
+        if new_id is not None:
+            await r.xdel(DEAD_LETTER, msg_id)
+            await r.hdel(RETRY_HASH, str(raw))
+            retried += 1
+        else:
+            failed += 1
+    return {"retried": retried, "failed": failed}
 
 
 if __name__ == "__main__":

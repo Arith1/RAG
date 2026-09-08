@@ -118,13 +118,17 @@ def _normalize_rule_text(text: str) -> str:
 
 
 def classify_by_rules(text: str) -> Optional[str]:
-    """规则快速通道：命中返回意图名，未命中返回 None 交给 LLM。"""
+    """规则快速通道：命中返回意图名，未命中返回 None 交给 LLM。
+
+    M17：META/SMALL_TALK 用 match() 锚定**句首**——避免长句中部出现「你记得/你叫什么名字」
+    等子串被误判为 chat 而跳过检索（如「…里的你记得…」「之前讨论的你记得吗」）。
+    """
     normalized = _normalize_rule_text(text)
     if _GREETING_RE.match(normalized):
         return "chat"
-    if _META_CONVO_RE.search(normalized):
+    if _META_CONVO_RE.match(normalized):
         return "chat"
-    if _SMALL_TALK_RE.search(normalized):
+    if _SMALL_TALK_RE.match(normalized):
         return "chat"
     return None
 

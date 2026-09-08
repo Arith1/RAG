@@ -14,7 +14,8 @@ onMounted(async () => {
     try {
       await auth.fetchMe()
     } catch {
-      auth.logout()
+      // M24：api() 内部已处理 401（登出并跳转登录）；网络抖动/5xx 属瞬时错误，
+      // 保留 token 不清登录态，避免断网刷新即被登出
     }
   }
   restoring.value = false

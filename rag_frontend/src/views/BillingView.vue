@@ -110,14 +110,19 @@ function fmtLatency(ms: number): string {
 }
 
 async function loadSummary() {
+  const r = range.value
   loading.value = true
   error.value = ''
   try {
-    summary.value = await getBillingSummary(range.value)
+    const data = await getBillingSummary(r)
+    // M29：快速切换 range 时，旧周期的慢响应后到必须丢弃，避免覆盖新周期数据
+    if (range.value !== r) return
+    summary.value = data
   } catch (e) {
+    if (range.value !== r) return
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
-    loading.value = false
+    if (range.value === r) loading.value = false
   }
 }
 
@@ -143,14 +148,19 @@ function switchType(t: string) {
 }
 
 async function loadAdmin() {
+  const r = range.value
   adminLoading.value = true
   try {
-    adminOverview.value = await getAdminBillingOverview(range.value)
+    const data = await getAdminBillingOverview(r)
+    // M29：快速切换 range 时丢弃旧周期的慢响应
+    if (range.value !== r) return
+    adminOverview.value = data
     await loadAdminUsers()
   } catch (e) {
+    if (range.value !== r) return
     feedback.notify(e instanceof Error ? e.message : String(e), 'error')
   } finally {
-    adminLoading.value = false
+    if (range.value === r) adminLoading.value = false
   }
 }
 
