@@ -6,7 +6,7 @@
 from datetime import datetime
 from typing import List, Optional
 
-from sqlalchemy import BigInteger, DateTime, String, Text, func, text
+from sqlalchemy import BigInteger, DateTime, Integer, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from rag个人知识库.models.vector import Base, VectorFile
@@ -32,6 +32,12 @@ class User(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active",
         comment="账号状态: active(正常)/deleting(删除处理中)/deleted(已删除-软删除，数据保留)/disabled(禁用)"
+    )
+    # L1：token 版本号——改密/登出全部设备时 +1，旧 token 校验失败（吊销），
+    # 解决「JWT 无 jti/token_version，改密后旧 token 仍有效」的吊销缺口
+    token_version: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=1, server_default="1",
+        comment="JWT 版本号：改密时 +1，旧 token 立即失效（吊销）"
     )
 
     created_at: Mapped[Optional[datetime]] = mapped_column(

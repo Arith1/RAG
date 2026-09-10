@@ -14,6 +14,7 @@ CREATE TABLE `users` (
     `password_hash` VARCHAR(128) NOT NULL COMMENT 'bcrypt 密码哈希',
     `role` VARCHAR(16) NOT NULL DEFAULT 'user' COMMENT '角色: admin(管理员)/user(普通用户)/guest(访客,暂未开放注册)',
     `status` VARCHAR(16) NOT NULL DEFAULT 'active' COMMENT '账号状态: active(正常)/deleting(删除处理中)/deleted(已删除-软删除，数据保留)/disabled(禁用)',
+    `token_version` INT NOT NULL DEFAULT 1 COMMENT 'L1：JWT 版本号——改密时+1，旧 token 立即失效（吊销）',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
@@ -228,6 +229,7 @@ CREATE TABLE `rag_traces` (
 
     `intent` VARCHAR(32) NULL COMMENT '意图识别结果: rag_ask/chat/other 等',
     `query` VARCHAR(1024) NULL COMMENT '用户提问/检索文本（便于排查）',
+    `questions` JSON NULL COMMENT '拆分后的子问题列表（多问题问答；单问题=[query]，chat=[]）',
     `status` VARCHAR(20) NOT NULL DEFAULT 'success' COMMENT '状态: success/failed',
     `error_type` VARCHAR(64) NULL COMMENT '错误类型',
     `error_message` VARCHAR(512) NULL COMMENT '错误信息',

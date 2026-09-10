@@ -11,17 +11,18 @@ if TYPE_CHECKING:
 
 
 class Base(DeclarativeBase):
+    # L9：时间统一由 DB 生成（CURRENT_TIMESTAMP / ON UPDATE CURRENT_TIMESTAMP）——
+    # 不再用 Python datetime.now()，避免应用服务器本地时间与 DB 时间混用
+    # （时钟/时区不一致会导致 TTL 误删、列表排序错乱）。DDL 均已带 DEFAULT。
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False,
-        default=datetime.now,          # ← Python层：ORM插入时有值，无需flush
-        server_default=func.now(),     # ← 数据库层：纯SQL插入也有兜底
+        server_default=func.now(),
         comment="创建时间"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False,
-        default=datetime.now,          # ← Python层
-        onupdate=datetime.now,         # ← Python层：ORM update时自动刷新
-        server_default=func.now(),     # ← 数据库层兜底
+        onupdate=func.now(),  # UPDATE 时由 DB 刷新（ON UPDATE CURRENT_TIMESTAMP）
+        server_default=func.now(),
         comment="更新时间"
     )
 

@@ -55,7 +55,7 @@ class TraceContext:
     user_id: int
     session_id: Optional[str]
     intent: Optional[str] = None
-    query: Optional[str] = None
+    questions: Optional[List[str]] = None
     status: str = "success"
     error_type: Optional[str] = None
     error_message: Optional[str] = None
@@ -101,19 +101,24 @@ def get_trace_ctx() -> Optional[TraceContext]:
 
 def trace_set_intent(
     intent: Optional[str],
-    query: Optional[str],
     intent_ms: int = 0,
     query_raw: Optional[str] = None,
+    questions: Optional[List[str]] = None,
 ) -> None:
-    """记录意图识别阶段：意图、提炼后查询与耗时；query_raw 为原始输入。"""
+    """记录意图识别阶段：意图、耗时、原始输入与拆分出的子问题列表。
+
+    说明：不再单独记录提炼后的单值 query——rag 路径 query ≡ questions[0]、
+    search/chat 路径 query ≡ query_raw，均由 questions / query_raw 推导，避免冗余。
+    """
     ctx = _trace_ctx.get()
     if ctx is None:
         return
     ctx.intent = intent
-    ctx.query = query
     ctx.intent_ms = int(intent_ms)
     if query_raw is not None:
         ctx.query_raw = query_raw
+    if questions is not None:
+        ctx.questions = questions or []
 
 
 def trace_set_retrieval(
@@ -180,7 +185,7 @@ async def flush_trace(ctx: TraceContext) -> None:
                     user_id=ctx.user_id,
                     session_id=ctx.session_id,
                     intent=ctx.intent,
-                    query=ctx.query,
+                    questions=ctx.questions,
                     status=ctx.status,
                     error_type=ctx.error_type,
                     error_message=ctx.error_message,
@@ -235,6 +240,7 @@ def _trace_to_dict(t: RagTrace) -> dict:
         "session_id": t.session_id,
         "intent": t.intent,
         "query": t.query,
+        "questions": t.questions,
         "status": t.status,
         "error_type": t.error_type,
         "error_message": t.error_message,

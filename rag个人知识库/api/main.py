@@ -625,7 +625,10 @@ async def change_password(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "新密码不能与原密码相同")
     # 显式 UPDATE 落库：user 可能来自 Redis 缓存（游离对象），直接改属性 + commit 不会生效
     new_hash = hash_password(body.new_password)
-    await db.execute(update(User).where(User.id == user.id).values(password_hash=new_hash))
+    # L1：改密同时 token_version+1，吊销该用户所有已签发旧 token（必须重新登录）
+    await db.execute(update(User).where(User.id == user.id).values(
+        password_hash=new_hash, token_version=User.token_version + 1,
+    ))
     await db.commit()
     audit(db, user, "change_password", target=user.username)
     return {"message": "密码修改成功，请重新登录"}
@@ -837,15 +840,30 @@ async def upload_documents(
         temp_path = f"{path}.uploading-{uuid.uuid4().hex}"
         try:
             size = 0
-            with open(temp_path, "wb") as f:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > MAX_UPLOAD_SIZE:
-                        raise ValueError(f"文件超过 {MAX_UPLOAD_SIZE // (1024 * 1024)}MB 上限")
-                    f.write(chunk)
+            buf = []
+            buf_len = 0
+
+            async def _flush_bytes(data: bytes) -> None:
+                # L7：磁盘写放到线程池——大文件上传不再同步阻塞事件循环
+                with open(temp_path, "ab") as f:
+                    f.write(data)
+
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_SIZE:
+                    raise ValueError(f"文件超过 {MAX_UPLOAD_SIZE // (1024 * 1024)}MB 上限")
+                buf.append(chunk)
+                buf_len += len(chunk)
+                # 内存有界：每攒 ~4MB 经线程池落一次盘
+                if buf_len >= 4 * 1024 * 1024:
+                    await asyncio.to_thread(_flush_bytes, b"".join(buf))
+                    buf = []
+                    buf_len = 0
+            if buf:
+                await asyncio.to_thread(_flush_bytes, b"".join(buf))
             if size == 0:
                 raise ValueError("文件为空")
             # 同目录 rename 是原子的，worker 不会看到半写入文件。
@@ -1426,7 +1444,7 @@ async def search_api(body: SearchIn, user: User = Depends(get_current_user)):
                 body.query, k=body.k, source=body.source, user_id=user.id, return_metrics=True,
             )
             retrieval_ms = int((time.monotonic() - t0) * 1000)
-            trace_set_intent("search", body.query, 0, query_raw=body.query)
+            trace_set_intent("search", 0, query_raw=body.query)
             trace_set_retrieval(
                 retrieval_ms=retrieval_ms,
                 cache_hit=bool(metrics.get("cache_hit")),

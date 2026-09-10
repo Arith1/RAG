@@ -18,6 +18,10 @@ from typing import List
 
 import os
 
+# L8：流式中断后等待后台 LLM 线程收尾的时限（秒）——太短会丢「已耗 token 计费」，
+# 太长会拉长生成器关闭（客户端断连清理阻塞 ≤该值）。默认 10s，可按需调整。
+STREAM_FINALIZE_TIMEOUT = int(os.getenv("STREAM_FINALIZE_TIMEOUT", "10"))
+
 from langchain.agents import create_agent
 from langchain.agents.middleware.summarization import SummarizationMiddleware
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -223,14 +227,28 @@ async def astream(messages: List[BaseMessage], thread_id: str = "default"):
 
     loop = asyncio.get_running_loop()
     # 后台线程执行，不阻塞消费；显式复制上下文，让计费 contextvar（request 上下文/阶段）在流线程可见
-    loop.run_in_executor(None, contextvars.copy_context().run, _run)
-    while True:
-        item = await queue.get()
-        if item is None:
-            break
-        if isinstance(item, Exception):
-            raise item
-        yield item
+    fut = loop.run_in_executor(None, contextvars.copy_context().run, _run)
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        # L8：消费方中断（客户端断连/取消）时，等后台 LLM 线程收尾——
+        # TokenUsageCallback 的 on_llm_end 在线程结束时才把用量写进计费上下文，
+        # 不等会丢「已耗 token 不计费」；最长等 10s（线程本身无法中途杀死，
+        # 但至少保证已生成的 token 全部入账，不再白跑）。正常走完时 fut 已 done，无等待。
+        if fut is not None and not fut.done():
+            try:
+                await asyncio.wait_for(asyncio.wrap_future(fut), timeout=STREAM_FINALIZE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("[ai_assist] 流式中断后 LLM 线程 %ss 未收尾，用量可能未完整入账",
+                               STREAM_FINALIZE_TIMEOUT)
+            except Exception:
+                logger.debug("[ai_assist] 等待流式 LLM 线程收尾时忽略异常", exc_info=True)
 
 
 def clear_thread(thread_id: str = "default") -> None:

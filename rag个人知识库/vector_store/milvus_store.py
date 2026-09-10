@@ -88,7 +88,8 @@ class CachedEmbeddings(OpenAIEmbeddings):
     def embed_query(self, text: str):
         t0 = time.monotonic()
         try:
-            key = cache_key("emb", text)
+            # L4：缓存 key 带模型名——更换 embedding 模型后旧缓存自动失效，不串用陈旧向量
+            key = cache_key("emb", EMBEDDING_MODEL, text)
             cached = cache_get_sync(key)
             if cached is not None:
                 return cached
@@ -101,7 +102,7 @@ class CachedEmbeddings(OpenAIEmbeddings):
     async def aembed_query(self, text: str):
         t0 = time.monotonic()
         try:
-            key = cache_key("emb", text)
+            key = cache_key("emb", EMBEDDING_MODEL, text)
             cached = await cache_get(key)
             if cached is not None:
                 return cached
@@ -172,16 +173,39 @@ def _invalidate_vector_store() -> None:
     _build_vector_store.cache_clear()
 
 
+def _is_milvus_conn_error(e: Exception) -> bool:
+    """判断异常是否属于「Milvus 连接/服务不可用」——只有这类才需要重建客户端单例。
+
+    L3：embedding/rerank 抖动、参数错误、数据校验失败等业务异常不应触发客户端重建
+    （重建代价高且无意义，还可能掩盖真正的问题）。
+    """
+    try:
+        from pymilvus.exceptions import (
+            ConnectionConfigException, ConnectionNotExistException, MilvusUnavailableException,
+        )
+        if isinstance(e, (MilvusUnavailableException, ConnectionConfigException, ConnectionNotExistException)):
+            return True
+    except Exception:
+        pass
+    text = str(e).lower()
+    return any(k in text for k in (
+        "connection refused", "connection reset", "connection closed", "connect failed",
+        "unavailable", "deadline exceeded", "end of file", "transport is closing",
+        "broken pipe", "connection is not established",
+    ))
+
+
 def _milvus_op(fn, *args, **kwargs):
-    """执行 Milvus 操作；异常时丢弃单例以便下次重建连接，然后向上抛出。
+    """执行 Milvus 操作；**仅连接/服务类异常**丢弃单例以便下次重建连接，然后向上抛出。
 
     只做"下次自愈"、不自动重试当前操作：写入类操作（insert/delete）重试可能
     产生重复数据，保守起见让调用方决定是否重试。
     """
     try:
         return fn(*args, **kwargs)
-    except Exception:
-        _invalidate_vector_store()
+    except Exception as e:
+        if _is_milvus_conn_error(e):
+            _invalidate_vector_store()
         raise
 
 

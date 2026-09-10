@@ -131,6 +131,11 @@ async def search_documents(
         metrics["cache_ms"] = cache_ms
         # 缓存命中时无法拿到召回数，仅记录最终命中条数
         metrics["rerank_count"] = len(cached)
+        # 缓存命中无法重算窗口指标：按结果元数据推断是否分层（窗口段/退化段都带 parent_id）
+        metrics["parent_child"] = any(h.get("metadata", {}).get("parent_id") for h in cached)
+        metrics["window_count"] = 0
+        metrics["legacy_count"] = 0
+        metrics["window_tokens"] = 0
         return (cached, metrics) if return_metrics else cached
 
     # M13：单飞计算——多个并发 miss 只让一个真正检索，其余等待其写入缓存
@@ -213,7 +218,7 @@ async def search_documents(
         await cache_index_sources(cache_key_, [h.get("source") for h in result])
         return result
 
-    result, from_cache = await cache_singleflight(cache_key_, _compute, SEARCH_CACHE_TTL, wait_ms=300)
+    result, from_cache = await cache_singleflight(cache_key_, _compute, SEARCH_CACHE_TTL, wait_ms=800)
     if from_cache:
         # 单飞等待者：他人已计算结果并写入缓存
         record_retrieval_cache(True)

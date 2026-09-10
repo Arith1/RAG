@@ -387,10 +387,18 @@ async def _handle_failure(msg_id: str, fields: dict) -> None:
 
 async def run_worker(stop: "asyncio.Event | None" = None) -> None:
     """账户删除队列消费循环，可由 FastAPI lifespan 内嵌或独立进程启动。"""
-    await _ensure_group()
-    await _recover_pending()
-    await _flush_due_retries()
-    await _flush_due_deletions()  # 启动时先处理已过宽限期的删除请求
+    # L6：启动段（建消费组/回收 PEL/刷新延迟重试/宽限期扫描）依赖 Redis——
+    # 瞬时故障不得让 worker 停摆，带退避重试直到就绪
+    while not (stop is not None and stop.is_set()):
+        try:
+            await _ensure_group()
+            await _recover_pending()
+            await _flush_due_retries()
+            await _flush_due_deletions()  # 启动时先处理已过宽限期的删除请求
+            break
+        except Exception as e:
+            logger.warning("[delete_queue] 启动初始化失败（Redis 未就绪？），5s 后重试：%s", e)
+            await asyncio.sleep(5)
     r = get_redis()
     logger.info("[delete_queue] worker 启动（consumer=%s）", CONSUMER)
     last_recover = time.monotonic()

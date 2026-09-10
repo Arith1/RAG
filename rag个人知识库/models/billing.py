@@ -69,8 +69,7 @@ class LlmUsage(_BillingBase):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
-        default=datetime.now,
-        server_default=func.now(),
+        server_default=func.now(),  # L9：时间统一由 DB 生成，不再用 Python datetime.now()
         comment="创建时间",
     )
 

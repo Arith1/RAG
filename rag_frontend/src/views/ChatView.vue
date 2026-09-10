@@ -36,6 +36,8 @@ const waitStart = ref(0)
 const waitSeconds = ref(0)
 const waitPhase = ref<'retrieving' | 'generating'>('retrieving')
 let waitTimer: number | undefined
+// L10：删除确认 3s 自动收起计时器——卸载时清理，避免卸载后触发 setState
+let confirmTimer: number | undefined
 // H8：当前流式请求的中止控制器——组件卸载/登出时 abort，避免 token 浪费与写已卸载组件
 let streamAbort: AbortController | null = null
 const box = ref<HTMLElement | null>(null)
@@ -322,8 +324,11 @@ async function commitRename(s: ChatSessionInfo) {
 
 function askDelete(s: ChatSessionInfo) {
   confirmDeleteId.value = s.session_id
-  window.setTimeout(() => {
+  // L10：重入时先清旧计时器；卸载时也要清理（见 onUnmounted）
+  if (confirmTimer !== undefined) window.clearTimeout(confirmTimer)
+  confirmTimer = window.setTimeout(() => {
     if (confirmDeleteId.value === s.session_id) confirmDeleteId.value = null
+    confirmTimer = undefined
   }, 3000)
 }
 async function removeSession(s: ChatSessionInfo, confirmed = false) {
@@ -485,6 +490,15 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('resize', onResize)
   stopWaitTimer()
+  // L10：清理全部遗留定时器（用户搜索防抖 / 删除确认自动收起），卸载后不再触发
+  if (userSearchTimer !== undefined) {
+    window.clearTimeout(userSearchTimer)
+    userSearchTimer = undefined
+  }
+  if (confirmTimer !== undefined) {
+    window.clearTimeout(confirmTimer)
+    confirmTimer = undefined
+  }
   // H8：组件卸载时中止在途流式请求（切路由/离开问答页）
   streamAbort?.abort()
 })
@@ -518,7 +532,12 @@ onUnmounted(() => {
             :key="s.session_id"
             class="session-item"
             :class="{ active: s.session_id === sessionId }"
+            role="button"
+            tabindex="0"
+            :aria-pressed="s.session_id === sessionId ? 'true' : 'false'"
             @click="openSession(s.session_id)"
+            @keydown.enter.prevent="openSession(s.session_id)"
+            @keydown.space.prevent="openSession(s.session_id)"
           >
             <span class="session-mark" aria-hidden="true">
               <svg viewBox="0 0 16 16" width="14" height="14">

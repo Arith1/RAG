@@ -77,6 +77,25 @@ function intentLabel(i: string | null): string {
   return i ? (INTENT_LABELS[i] ?? i) : '—'
 }
 
+/** 取一条 trace 的拆分后子问题列表（多问题问答；单问题/无拆分为空数组）。 */
+function traceQuestions(t: any): string[] {
+  return Array.isArray(t?.questions) ? t.questions : []
+}
+
+/** 列表单元格：questions 有则显示第一个（多问题另有「N 问」徽标），否则回退 query_raw/query。 */
+function traceFirstQuestion(t: any): string {
+  const qs = traceQuestions(t)
+  if (qs.length) return qs[0]
+  return t.query_raw || t.query || '—'
+}
+
+/** hover 完整文本：多问题显示全部子问题，否则回退原始输入。 */
+function traceQueryText(t: any): string {
+  const qs = traceQuestions(t)
+  if (qs.length) return qs.join(' / ')
+  return t.query_raw || t.query || ''
+}
+
 function syncLabel(s: string): string {
   return SYNC_LABELS[s] ?? s
 }
@@ -338,7 +357,10 @@ onMounted(() => {
                 <td class="time">{{ fmtDateTime(t.created_at) }}</td>
                 <td><span class="type-tag">{{ intentLabel(t.intent) }}</span></td>
                 <td><span class="status-dot" :class="t.status">{{ t.status === 'success' ? '成功' : '失败' }}</span></td>
-                <td class="query-cell" :title="t.query ?? ''">{{ t.query || '—' }}</td>
+                <td class="query-cell" :title="traceQueryText(t)">
+                  {{ traceFirstQuestion(t) }}
+                  <span v-if="traceQuestions(t).length > 1" class="multi-badge" :title="traceQuestions(t).join('；')">{{ traceQuestions(t).length }} 问</span>
+                </td>
                 <td class="num">{{ fmtMs(t.total_ms) }}</td>
                 <td class="num">{{ fmtMs(t.retrieval_ms) }}</td>
                 <td class="num">{{ fmtMs(t.generation_ms) }}</td>
@@ -437,9 +459,15 @@ onMounted(() => {
               <span class="detail-label">原始输入</span>
               <span class="detail-value">{{ selected.query_raw || '—' }}</span>
             </div>
-            <div class="detail-cell">
-              <span class="detail-label">提炼后查询</span>
-              <span class="detail-value">{{ selected.query || '—' }}</span>
+            <div v-if="traceQuestions(selected).length" class="detail-cell">
+              <span class="detail-label">检索问题{{ traceQuestions(selected).length > 1 ? `（${traceQuestions(selected).length} 个子问题）` : '' }}</span>
+              <span class="detail-value">
+                <span v-for="(q, i) in traceQuestions(selected)" :key="i" class="question-chip">{{ i + 1 }}. {{ q }}</span>
+              </span>
+            </div>
+            <div v-else class="detail-cell">
+              <span class="detail-label">检索问题</span>
+              <span class="detail-value">{{ selected.query_raw || selected.query || '—' }}</span>
             </div>
           </div>
 
@@ -673,6 +701,26 @@ onMounted(() => {
   border-radius: var(--radius-pill);
   padding: 3px 9px;
   white-space: nowrap;
+}
+.multi-badge {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: var(--radius-pill);
+  padding: 1px 7px;
+  margin-left: 6px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.question-chip {
+  display: inline-block;
+  font-size: 12.5px;
+  background: var(--accent-soft, rgba(127, 127, 127, 0.12));
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  border-radius: 6px;
+  padding: 2px 8px;
+  margin: 2px 6px 2px 0;
 }
 .status-dot { font-size: 12px; }
 .status-dot.success { color: var(--ok); }

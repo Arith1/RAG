@@ -53,7 +53,14 @@ def poll_batch_result(batch_id, header, interval=5, timeout=600, expected_data_i
     start = time.time()
     # 在 timeout 时限内每隔 interval 秒查一次，避免无限等待
     while time.time() - start < timeout:
-        res = requests.get(result_url, headers=header, timeout=30)
+        try:
+            res = requests.get(result_url, headers=header, timeout=30)
+        except requests.RequestException as e:
+            # L5：单次网络错误（连接重置/超时/代理异常等）不整批失败——
+            # 记录后休眠重试，整体超时仍由 while 的 timeout 兜底
+            logger.warning("poll network error, retry in %ss: %s", interval, e)
+            time.sleep(interval)
+            continue
         if res.status_code != 200:
             # 接口偶发非 200 不直接退出，休眠后继续重试
             logger.warning("poll failed. status:%s", res.status_code)

@@ -146,12 +146,12 @@ def jitter_ttl(ttl: int, ratio: float = 0.1) -> int:
     return max(1, int(ttl * random.uniform(1 - ratio, 1 + ratio)))
 
 
-async def cache_singleflight(cache_key_: str, compute, ttl: int, wait_ms: int = 300):
+async def cache_singleflight(cache_key_: str, compute, ttl: int, wait_ms: int = 800):
     """缓存单飞（M13）：多个并发 miss 只让一个执行 compute，其余等待其写入缓存。
 
     compute 内需自行 cache_set（可按结果选择 TTL/抖动）并返回值；
     返回 (value, from_cache)。锁用 SETNX + 持有者校验释放；获得锁者算完即释放，
-    等待者轮询缓存至多 wait_ms，超时兜底自行计算（不重复加锁）。
+    等待者轮询缓存至多 wait_ms（默认 800ms，覆盖多数检索耗时；超时兜底自行计算）。
     """
     r = get_redis()
     lock_key = f"{cache_key_}:lock"

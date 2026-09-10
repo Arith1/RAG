@@ -11,12 +11,12 @@
 - **文件指纹增量入库**：`identity_hash` 判定同名同源，`file_content_hash` 判定内容变化——skip / insert / update / retry 四态分流，只增量更新差集。
 - **跨库一致性**：MySQL 先落期望状态（`pending`）→ Milvus 幂等同步 → `in_sync`/`failed` 状态机；失败重试按 source 重建，可清理孤儿向量。
 - **结构感知切分**：Markdown 标题分节、**表格/公式/问答对原子保护**（占位符 + 还原长度分组）、超长表格自动拆子表并重复表头、图片路径入 metadata。
-- **分层检索（Parent-Child，可选开启）**：250 字子块精准定位 → 命中点动态开窗（±BACK/FWD + 跨父块边界合并）→ Token 预算裁剪 → 整段上下文回填；开启后与单层命中率持平、上下文完整度 +73%（见 `docs/PARENT_CHILD_RETRIEVAL_DESIGN.md`，`RAG_PARENT_CHILD=true`）。
-- **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤（二者互斥，可叠加 `file_ids` 可见性过滤，并可独立调 `fetch_k` 放大召回宽度）；**检索结果 / embedding / 回答三层 Redis 缓存**（相同问题秒回、省 API 调用）。
+- **分层检索（Parent-Child，可选开启）**：250 字子块精准定位 → 命中点动态开窗（±BACK/FWD + 跨父块边界合并）→ Token 预算裁剪 → 整段上下文回填；子块带所属节 Header/images 溯源元数据、公式/表格/问答对原子保护、超长原子块自动截断；开启后与单层命中率持平、上下文完整度 +73%（见 `docs/PARENT_CHILD_RETRIEVAL_DESIGN.md`，`RAG_PARENT_CHILD=true`）。
+- **高质量检索**：dense（bge-m3）+ BM25（jieba 中文分词）双路召回 → RRF 融合 → bge-reranker-v2-m3 精排 → 阈值过滤；支持 `source` / 原生表达式过滤（二者互斥，可叠加 `file_ids` 可见性过滤，并可独立调 `fetch_k` 放大召回宽度）；**检索结果 / embedding / 回答三层 Redis 缓存**（相同问题秒回、省 API 调用；并发单飞 + TTL 抖动防击穿/雪崩，空结果短 TTL 保证新文档快速可见）。
 - **Agent 问答**：意图识别（规则层 + LLM 查询重构，多轮指代补全）→ 检索 → DeepSeek Agent 生成带来源引用回答；对话记忆按用户隔离。
 - **会话记忆**：Postgres 持久化（跨重启/多 worker），TTL 按"最后活跃时间"自动清理，~20 轮对话自动摘要压缩。
 - **可靠入库队列**：Redis Streams（Consumer Group + PEL 崩溃恢复、持久化延迟重试、死信队列、inflight 竞态防护 409）。
-- **可靠删除队列（两阶段账户删除）**：提交删除 → 账号立即锁定（status=deleting）且**公开文档即刻下架**（堵住"已删账号内容仍公开"的漏洞）→ 宽限期（`DELETE_GRACE_DAYS`，默认 7 天）→ 到期由 Redis Streams 队列彻底清除 Milvus 向量 → OSS 原件 → 本地文件 → MySQL 元数据（级联）→ Postgres 对话记忆 → 缓存清理，失败持久化重试、不卡账号；计费/链路/审计记录保留留痕。
+- **可靠删除队列（两阶段账户删除）**：提交删除 → 账号立即锁定（status=deleting）且**公开文档即刻下架**（堵住"已删账号内容仍公开"的漏洞）→ 宽限期（`DELETE_GRACE_DAYS`，默认 7 天）→ 到期由 Redis Streams 队列彻底清除 Milvus 向量 → OSS 原件 → 本地文件 → MySQL 元数据（级联）→ Postgres 对话记忆 → 缓存清理，失败持久化重试、不卡账号，死信可经 `/api/delete-queue/dead/*` 管理员重放；计费/链路/审计记录保留留痕。
 - **权限模型**：普通用户可上传/删除自己的文档；管理员可把共享文档取消为私有；下载仅 owner 或共享文档可访问。
 - **多问题问答**：意图识别支持拆分多个子问题，逐个检索后汇总分点回答，并限制最大子问题数。
 - **精准缓存失效**：维护 `src_idx:{source}` 缓存索引，文档取消共享/删除/账户删除/重新入库时按 source O(1) 定位清理相关检索与回答缓存（入库改为按 source 精准失效，不再全库清空）。
@@ -27,7 +27,9 @@
 - **高频访问缓存**：鉴权用户行（登出/改密/删号失效）、文档列表、用户搜索均缓存到 Redis，显著减少高频接口 DB 查询。
 - **前端定时轮询**：文档管理页每 5s 自动刷新文档列表与入库队列状态（入库中/失败实时可见）。
 - **Web 服务**：FastAPI + JWT 认证 + RBAC + 操作审计 + 登录/注册失败限流 + 路径脱敏。
-- **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索对比实验、DeepEval 端到端评测（Faithfulness / AnswerRelevancy / 上下文精度召回）、52 个 pytest 用例。
+- **RAG 全链路可视化（监控 /obs，管理员）**：每次 chat/search 请求写一条 `rag_traces`（意图识别 → 检索 → 精排 → 生成），监控页提供时间范围聚合（请求量 / 成功率 / 检索缓存命中 / 各阶段耗时）、意图分布、Top 慢请求、失败分布、单条 trace **链路瀑布图**、存储概览（文档 / Milvus 行数 / 缓存判定）与文档同步状态。
+- **用量与费用（/billing）**：每次 LLM 调用（意图 / 检索 / 回答）记录 token 消耗与**预估费用**（`llm_usage`），按请求汇总——我的用量（总费用 / 请求数 / tokens，按调用类型与模型分布）+ 管理员全站概览与 Top 用户；**回答缓存命中**单独记一条 `answer_cached`（tokens=0 / cost=0），直观展示省下的生成费用。
+- **可度量**：25 题 golden 评测集（hit@3 = 100%）、分层检索开启/关闭端到端对比（命中率持平、上下文 +73%，`evaluation/eval_onoff_report.md`）、DeepEval 端到端评测（Faithfulness / AnswerRelevancy / 上下文精度召回）、**175 个 pytest 用例**。
 
 ## 系统架构
 
@@ -89,7 +91,7 @@ stateDiagram-v2
 | Embedding / Rerank | SiliconFlow：`BAAI/bge-m3`、`BAAI/bge-reranker-v2-m3` |
 | 文档解析 | MinerU（复杂文档）+ Unstructured（简单文档）+ python-docx |
 | LLM / Agent | DeepSeek + langchain 1.x（create_agent / LangGraph checkpointer） |
-| 测试 | pytest（52 用例） |
+| 测试 | pytest（175 用例，本地开发/CI 用，不参与 git 版本管理） |
 
 ## 快速开始
 
@@ -102,7 +104,8 @@ cp .env.example .env
 
 # 2. 一键启动全部服务（MySQL / Milvus(含 etcd+minio) / Redis / Postgres / API）
 #    安全说明：数据服务端口仅绑定 127.0.0.1；Redis/MySQL/Postgres 口令取自 .env（缺失拒绝启动）；
-#    Milvus 已开启认证（docker/milvus.yaml，root/Milvus，启动后建议立即改密）
+#    Milvus/MinIO 凭据可经 MILVUS_USERNAME/MILVUS_PASSWORD/MINIO_ACCESS_KEY/MINIO_SECRET_KEY 覆盖
+#    （默认 root/Milvus、minioadmin/minioadmin，改密需同时改 docker/milvus.yaml）
 docker compose up -d --build
 
 # 3. 访问
@@ -134,7 +137,7 @@ docker run -d --name pg-mem -e POSTGRES_USER=root -e POSTGRES_PASSWORD=root \
 ```bash
 git clone https://github.com/Arith1/RAG.git
 cd rag_project
-uv sync
+uv sync --frozen   # uv.lock 已入库，--frozen 锁定依赖版本，保证构建可复现
 cp .env.example .env   # 填写各密钥（见下表）
 ```
 
@@ -151,6 +154,12 @@ cp .env.example .env   # 填写各密钥（见下表）
 | `DEEPSEEK_API_KEY` | DeepSeek 密钥（问答生成） |
 | `JWT_SECRET` | JWT 签名密钥（必填，且长度至少 32 位） |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 首次启动播种的管理员账号 |
+| `RAG_PARENT_CHILD` | 分层检索开关（默认 `false` 保持兼容；**评测推荐开启**：命中率与单层持平、上下文 +73%，见 `docs/PARENT_CHILD_RETRIEVAL_DESIGN.md`；开启需先建 `parent_chunks` 表，见 `models/vector.sql` §8） |
+
+> 可选调参（均有默认值）：`CHILD_CHUNK_SIZE/CHILD_OVERLAP/PARENT_MAX_CHARS/PARENT_OVERLAP`（分层切分）、
+> `BACK_EXPAND_CHARS/FWD_EXPAND_CHARS/CONTEXT_MAX_TOKENS/PARENT_BOUNDARY_MARGIN`（开窗）、
+> `EMPTY_SEARCH_CACHE_TTL`（空结果缓存 30s）、`MAX_ATOMIC_CHARS`（超长原子块截断 2000）、
+> `SOURCE_INDEX_TTL`（src_idx 索引集合过期 2h）。
 
 ### 初始化数据库
 
@@ -185,7 +194,7 @@ npm run dev          # http://localhost:5173（/api 自动代理到 8010）
 npm run build        # 类型检查 + 产物构建
 ```
 
-前端功能：登录/注册（JWT）、**SSE 流式问答**（打字机效果 + 来源引用 + 历史会话侧边栏 + 检索范围选择）、知识库（公开文档搜索/排序/下载）、文档管理（私有/共享分区 + 上传队列 5s 轮询）、个人详情页。
+前端功能：登录/注册（JWT）、**SSE 流式问答**（打字机效果 + 来源引用 + 历史会话侧边栏 + 检索范围选择）、知识库（公开文档搜索/排序/下载）、文档管理（私有/共享分区 + 上传队列 5s 轮询）、**监控页 /obs**（管理员：链路聚合 + Top 慢请求 + 瀑布图 + 存储概览）、**用量页 /billing**（我的用量 + 管理员全站概览）、个人详情页。
 
 ### 入库文档（API 上传）
 
@@ -280,11 +289,20 @@ curl -X POST http://localhost:8010/api/documents/upload \
 
 **每次请求（chat 或 search）写一条 `rag_traces`**，覆盖「入口 → 意图 → 检索 → 精排 → 生成 → 落库」每一跳：
 
-- **入口**：chat 与 `/api/search` 都写 trace（`trace_type=chat/search`）；记录 `query_raw`（原始输入）与 `query`（提炼后），可定位「相同问题缓存 miss」是否为意图提炼漂移。
+- **入口**：chat 与 `/api/search` 都写 trace（`trace_type=chat/search`）；记录 `query_raw`（原始输入）与 `questions`（意图拆分出的子问题列表，单问题=[query]、多问题=全部子问题），可定位「相同问题缓存 miss」是否为意图提炼漂移；单值 `query` 字段已停写（可由 `questions[0]`/`query_raw` 推导，历史行仍保留）。
 - **检索分跳计时**：`embedding_ms` / `milvus_ms` / `rerank_ms` / `cache_ms` 分开统计（`retrieval_ms` 为整段，含前三者）。
-- **监控页（ObsView）**：时间范围聚合（请求量 / 成功率 / 各阶段均耗时 / 零命中率 / 降级率 / **缓存命中率**，聚合 chat+search）、**Top 慢请求**、**失败分布**、意图分布、单条 trace **瀑布图**。
-- **缓存命中计费**：回答命中 `ans:` 缓存时，用量记录一条 `type=answer_cached`（tokens=0 / cost=0，`status=cached`），「最近用量」可看到省下的生成费用；检索缓存命中率以 trace 聚合为准，进程内计数标注「本进程实时」。
+- **监控接口（管理员）**：`/api/obs/summary`（时间范围聚合：请求量 / 成功率 / 各阶段均耗时 / 零命中率 / 降级率 / **缓存命中率**，聚合 chat+search；含意图分布 / Top 慢请求 / 失败分布）、`/api/obs/traces`（分页请求追踪，可按成功/失败过滤）、`/api/obs/traces/{request_id}`（单条 trace **瀑布图** + 来源列表）、`/api/obs/storage`（文档数 / Milvus 行数 / 缓存判定 / 文档同步状态）。
 - **写记忆异步**：`append_thread_exchange`（Postgres 对话记忆）改为后台异步写入，不阻塞回答返回，避免未计时的写库拖慢总耗时。
+
+### 用量与费用（计费）
+
+每次 LLM 调用经 `TokenUsageCallback` 记录一条 `llm_usage`，含 `provider/model/type/input·cached·uncached·output tokens/estimated_cost/latency/status`：
+
+- **计费口径**：成本按 `estimate_cost(model, uncached, cached, output)` 用**预估单价**计算（仅记账展示，非真实扣费）；`input_tokens` 细分为缓存命中（cached）/未缓存（uncached），体现 DeepSeek 缓存折扣。
+- **我的用量**（`/api/billing/summary`、`/api/billing/usage`）：总预估费用 / 请求数 / 总 tokens / 平均费用，按**调用类型**（意图 / 检索 / 回答…）与**模型**双维度分布，明细分页到每次调用。
+- **缓存命中省费**：回答命中 `ans:` 缓存时记 `type=answer_cached`（tokens=0 / cost=0，`status=cached`），用量页可直观看到省下的生成费用。
+- **管理员全站**（`/api/admin/billing/overview`、`/api/admin/billing/users`）：全站费用/请求/tokens 概览 + 按预估费用 Top 10 用户。
+- **容错**：billing 上下文为空（如启动连通性 ping）或写库失败时静默跳过，不影响问答。
 
 ## 评测与测试
 
@@ -303,6 +321,10 @@ python -m evaluation.evaluate_rag_deepeval --limit 3            # 冒烟：只�
 
 # 分层检索对比实验（普通块 vs 子→父）
 python -m evaluation.experiment_parent_child
+
+# 分层检索开启 vs 关闭（真实链路端到端对比，11 题黄金集 → hit@k + 上下文规模）
+#   RAG_PARENT_CHILD=true/false 分别跑一次，结果与对比报告见 evaluation/eval_onoff_*.json / eval_onoff_report.md
+python -m evaluation.eval_onoff
 
 # 单元测试
 python -m pytest tests/
@@ -368,6 +390,17 @@ python -m pytest tests/
 | POST | `/api/ingest/dead/{msg_id}/retry` | 管理员 | 死信单条重新入库 |
 | POST | `/api/ingest/dead/retry-all` | 管理员 | 死信全部重新入库 |
 | DELETE | `/api/ingest/dead` | 管理员 | 清空死信队列 |
+| GET | `/api/delete-queue/dead` | 管理员 | 账户删除队列：死信（失败）任务 |
+| POST | `/api/delete-queue/dead/retry-all` | 管理员 | 账户删除死信全部重新入队 |
+| POST | `/api/delete-queue/dead/{msg_id}/retry` | 管理员 | 账户删除死信单条重新入队（避免删除任务失败后账号永久卡 `deleting`） |
+| GET | `/api/billing/summary` | 登录 | 我的用量汇总（预估费用/请求数/tokens，按调用类型与模型分布） |
+| GET | `/api/billing/usage` | 登录 | 我的用量明细（分页：每次 LLM 调用的 tokens/费用/耗时/状态） |
+| GET | `/api/admin/billing/overview` | 管理员 | 全站用量概览（总费用/请求量/tokens） |
+| GET | `/api/admin/billing/users` | 管理员 | 按用户用量列表（按预估费用 Top 10） |
+| GET | `/api/obs/summary` | 管理员 | RAG 链路聚合（请求量/成功率/缓存命中/各阶段耗时/意图分布/慢请求/失败分布） |
+| GET | `/api/obs/traces` | 管理员 | 请求追踪分页列表（可按成功/失败过滤） |
+| GET | `/api/obs/traces/{request_id}` | 管理员 | 单条 trace 链路详情（瀑布图 + 来源列表） |
+| GET | `/api/obs/storage` | 管理员 | 存储概览（文档数 / Milvus 行数 / 检索缓存判定 / 文档同步状态） |
 | GET | `/docs` | 公开 | Swagger |
 
 ## 项目结构
@@ -380,16 +413,17 @@ rag_project/
 │  ├─ service/              # ingest(入库编排) / chat(问答编排) / chat_history(会话元信息)
 │  │                        # session_cache(会话/用户/文档缓存) / ingest_queue(入库队列)
 │  │                        # delete_queue(账户删除队列) / memory_maintenance(TTL清理)
+│  │                        # parent_child(分层窗口组装：开窗/合并/Token 预算)
 │  ├─ loader/               # 文档加载（docx/pdf/md/txt，复杂度评估 + MinerU 分流）
-│  ├─ spliter/              # 结构感知切分（标题分节 + 原子块保护）
+│  ├─ spliter/              # 结构感知切分（标题分节 + 原子块保护 + 分层子/父块偏移）
 │  ├─ vector_store/         # Milvus 存取 + 双路召回 + rerank（断线自愈）
 │  ├─ crud/                 # MySQL 数据访问
-│  ├─ models/               # SQLAlchemy 模型 + 建表 SQL（vector.sql）
-│  ├─ config/               # db_config(MySQL) / redis(Redis)
+│  ├─ models/               # SQLAlchemy 模型 + 建表 SQL（vector.sql，含 parent_chunks/account_deletions）
+│  ├─ config/               # db_config(MySQL) / redis(Redis：缓存助手+单飞+TTL 抖动)
 │  └─ utils/                # 指纹哈希 / sanitize(路径脱敏)
 ├─ rag_frontend/            # Vue 3 前端（问答/知识库/文档管理/个人详情/登录注册）
-├─ evaluation/              # golden 评测集 + 检索评测 + DeepEval 端到端评测 + 报告
-├─ tests/                   # pytest 单元测试（52 用例）
+├─ evaluation/              # golden 评测集 + 检索评测 + DeepEval 端到端评测 + 分层开/关对比 + 报告
+├─ tests/                   # pytest 单元测试（175 用例；有意不入库，本地/CI 跑）
 └─ .env.example             # 环境变量模板
 ```
 
@@ -409,5 +443,5 @@ rag_project/
 - [x] 多人共享知识库 + 会话检索范围（4 选，首问锁定）
 - [x] 历史会话侧边栏 + Redis 会话/用户/文档缓存 + 登出清理
 - [x] 前端定时轮询队列状态（5s）
-- [ ] 分层检索（Parent-Child）落地（实验结论已具备）
+- [x] 分层检索（Parent-Child）落地（设计 v6 → 里程碑 1-5 → 冒烟/迁移/端到端评测；`RAG_PARENT_CHILD=true` 推荐开启）
 - [ ] Agentic RAG（检索工具化，多轮反思检索）

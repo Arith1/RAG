@@ -154,9 +154,24 @@ async def build_download_url(source: str, ttl: int = 3600) -> str:
 def local_source_exists(source: str) -> str:
     """按相对 source 反查本地原件是否存在，存在返回本地绝对路径，否则空串。
     用于 OSS 未启用时仍能从本地提供下载。
+
+    L2（纵深防御）：source 是入库时登记的相对路径（uploads/...），但下载/删除接口
+    可能透传任意 source 字符串——这里做多重校验，任何可疑路径一律视为不存在，
+    防止拼路径逃逸出 UPLOAD_DIR 读写任意文件。
     """
     if not source or not source.startswith("uploads/"):
         return ""
     rel = source[len("uploads/"):]
-    local = os.path.join(UPLOAD_DIR, rel.replace("/", os.sep))
+    # 拒绝空段、绝对路径、盘符（Windows）、.. 段
+    rel_norm = rel.replace("/", os.sep)
+    if not rel_norm or os.path.isabs(rel_norm) or ".." in rel_norm.split(os.sep):
+        return ""
+    if len(rel_norm) >= 2 and rel_norm[1] == ":":
+        return ""
+    local = os.path.join(UPLOAD_DIR, rel_norm)
+    # 归一化后再校验一次：最终绝对路径必须严格位于 UPLOAD_DIR 之下
+    upload_root = os.path.abspath(UPLOAD_DIR)
+    real_local = os.path.abspath(local)
+    if not real_local.startswith(upload_root.rstrip(os.sep) + os.sep):
+        return ""
     return local if os.path.isfile(local) else ""

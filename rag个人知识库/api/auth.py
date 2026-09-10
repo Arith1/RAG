@@ -52,10 +52,18 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ── JWT ──
 def create_access_token(user: User) -> str:
+    """签发访问令牌：携带 iat/jti/token_version（L1）。
+
+    - iat/jti：签发时间与唯一 ID，供审计/吊销追踪；
+    - token_version：改密时 +1，旧 token 校验时与用户当前版本比对，不一致即吊销。
+    """
     payload = {
         "sub": str(user.id),
         "username": user.username,
         "role": user.role,
+        "token_version": getattr(user, "token_version", 1),
+        "iat": datetime.now(timezone.utc),
+        "jti": uuid.uuid4().hex,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -94,6 +102,10 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="账号已删除/删除中/禁用，无法继续访问",
         )
+    # L1：token 版本校验——改密后 token_version 已 +1，旧 token 携带的版本号落后则吊销（401）。
+    # 无 token_version 声明的旧 token（本修复前签发）视为已吊销，需重新登录。
+    if payload.get("token_version") != getattr(user, "token_version", 1):
+        raise credentials_error
     return user
 
 

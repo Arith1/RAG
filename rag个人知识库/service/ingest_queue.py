@@ -348,9 +348,17 @@ async def run_worker(stop: "asyncio.Event | None" = None) -> None:
     而不是只有启动时才恢复）。FastAPI lifespan 内嵌运行，或独立进程执行：
       python -m rag个人知识库.service.ingest_queue
     """
-    await _ensure_group()
-    await _recover_pending()
-    await _flush_due_retries()
+    # L6：启动段（建消费组/回收 PEL/刷新延迟重试）依赖 Redis——瞬时故障不得让 worker 停摆，
+    # 放进带退避的重试循环，Redis 恢复后自动完成初始化
+    while not (stop is not None and stop.is_set()):
+        try:
+            await _ensure_group()
+            await _recover_pending()
+            await _flush_due_retries()
+            break
+        except Exception as e:
+            logger.warning("[ingest_queue] 启动初始化失败（Redis 未就绪？），5s 后重试：%s", e)
+            await asyncio.sleep(5)
     r = get_redis()
     logger.info("[ingest_queue] worker 启动（consumer=%s）", CONSUMER)
     last_recover = time.monotonic()

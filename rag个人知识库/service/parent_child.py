@@ -186,33 +186,23 @@ def assemble_context(child_hits: List[dict], parents: Dict[str, dict]) -> Tuple[
             else:
                 continue  # 连核心都放不下：跳过，不 break
 
-    # 组装：跨 source 按该 source 最高分降序；文档内按 (parent_index, start)；保留标题边界
-    by_src: Dict[str, List[Tuple[dict, str]]] = {}
-    for seg, text in chosen:
-        src = seg["members"][0]["source"]
-        by_src.setdefault(src, []).append((seg, text))
-    src_order = sorted(by_src.keys(),
-                       key=lambda s: -max(seg["score"] for seg, _t in by_src[s]))
-
+    # 组装：chosen 已按 segs 分数降序追加，直接输出；
+    # 最终顺序由 service 层统一按 score 降序（P3），此处不再做 source 分组重排（冗余）
     result: List[dict] = []
-    for src in src_order:
-        for seg, text in sorted(
-            by_src[src],
-            key=lambda x: (x[0]["members"][0]["parent_index"], x[0]["members"][0]["start"]),
-        ):
-            first = seg["members"][0]
-            result.append({
-                "content": text,
-                "score": seg["score"],
-                "source": first["source"],
-                "metadata": {
-                    "parent_id": first["parent_id"],
-                    "parent_title": first["title"],
-                    "parent_index": first["parent_index"],
-                    "rerank_score": seg["score"],
-                    "hit_count": seg["hit_count"],
-                },
-            })
+    for seg, text in chosen:
+        first = seg["members"][0]
+        result.append({
+            "content": text,
+            "score": seg["score"],
+            "source": first["source"],
+            "metadata": {
+                "parent_id": first["parent_id"],
+                "parent_title": first["title"],
+                "parent_index": first["parent_index"],
+                "rerank_score": seg["score"],
+                "hit_count": seg["hit_count"],
+            },
+        })
     return result, used
 
 

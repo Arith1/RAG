@@ -14,7 +14,9 @@
   /* Ink */
   --text: #17203a;
   --text-2: #5b6472;
-  --text-3: #929baa;
+  /* L10：--text-3 原 #929baa 白底对比度仅 ~2.9:1（AA 不达标），加深到 #677082：
+     白底 ~5:1、surface-3 浅灰底 ~4.5:1，均过 WCAG AA 正文对比度 4.5:1 */
+  --text-3: #677082;
   --text-on-accent: #ffffff;
 
   /* Accent (single restrained blue) */

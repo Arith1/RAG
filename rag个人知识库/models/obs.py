@@ -52,6 +52,9 @@ class RagTrace(_ObsBase):
     query: Mapped[Optional[str]] = mapped_column(
         String(1024), nullable=True, comment="用户提问/检索文本（便于排查）"
     )
+    questions: Mapped[Optional[List[str]]] = mapped_column(
+        JSON, nullable=True, comment="拆分后的子问题列表（多问题问答；单问题=[query]，chat=[]）"
+    )
     status: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -125,8 +128,7 @@ class RagTrace(_ObsBase):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
-        default=datetime.now,
-        server_default=func.now(),
+        server_default=func.now(),  # L9：时间统一由 DB 生成，不再用 Python datetime.now()
         comment="创建时间",
     )
 

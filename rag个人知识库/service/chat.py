@@ -213,7 +213,8 @@ async def chat(
     intent_t0 = time.monotonic()
     analysis = await asyncio.to_thread(analyze, content, history)
     intent_ms = int((time.monotonic() - intent_t0) * 1000)
-    trace_set_intent(analysis.intent, analysis.query or content, intent_ms, query_raw=content)
+    trace_set_intent(analysis.intent, intent_ms, query_raw=content,
+                     questions=(analysis.questions or []))
 
     # 闲聊：只进入 LLM 对话，不做检索
     if analysis.intent == "chat":
@@ -356,7 +357,7 @@ async def chat(
         for s in sources
         if s.get("source")
     ]
-    trace_set_intent(analysis.intent, query, intent_ms, query_raw=content)
+    trace_set_intent(analysis.intent, intent_ms, query_raw=content, questions=questions)
     trace_set_retrieval(
         retrieval_ms,
         cache_hit=cache_hit,
@@ -416,7 +417,7 @@ async def chat(
                 await cache_index_sources(ans_key, [hit.get("source") for hit in all_hits])
                 return ans
 
-            answer, from_cache = await cache_singleflight(ans_key, _gen, ANSWER_CACHE_TTL, wait_ms=500)
+            answer, from_cache = await cache_singleflight(ans_key, _gen, ANSWER_CACHE_TTL, wait_ms=800)
             if from_cache:
                 # 单飞等待者：他人已生成并缓存
                 record_cached_answer()
@@ -474,7 +475,8 @@ async def chat_stream(
     intent_t0 = time.monotonic()
     analysis = await asyncio.to_thread(analyze, content, history)
     intent_ms = int((time.monotonic() - intent_t0) * 1000)
-    trace_set_intent(analysis.intent, analysis.query or content, intent_ms, query_raw=content)
+    trace_set_intent(analysis.intent, intent_ms, query_raw=content,
+                     questions=(analysis.questions or []))
 
     # 闲聊：不走检索，直接完整回答
     if analysis.intent == "chat":
@@ -609,7 +611,7 @@ async def chat_stream(
         for s in sources
         if s.get("source")
     ]
-    trace_set_intent(analysis.intent, query, intent_ms, query_raw=content)
+    trace_set_intent(analysis.intent, intent_ms, query_raw=content, questions=questions)
     trace_set_retrieval(
         retrieval_ms,
         cache_hit=cache_hit,
