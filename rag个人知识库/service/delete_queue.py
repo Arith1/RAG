@@ -29,7 +29,12 @@ from sqlalchemy import delete, select, update
 
 from rag个人知识库.agent.ai_assist import clear_thread
 from rag个人知识库.config.db_config import async_session
-from rag个人知识库.config.redis import cache_clear_source, get_redis, redis_available
+from rag个人知识库.config.redis import (
+    bump_cache_generation,
+    cache_clear_source,
+    get_redis,
+    redis_available,
+)
 from rag个人知识库.models.chat import ChatSession
 from rag个人知识库.models.user import AccountDeletion, AuditLog, User
 from rag个人知识库.models.vector import VectorFile
@@ -337,6 +342,7 @@ async def _process_delete_message_unlocked(msg_id: str, fields: dict) -> bool:
         for source in sources:
             await cache_clear_source(source)
             await invalidate_parent_cache_by_source(source)  # 父块切片缓存随账号删除显式失效
+        await bump_cache_generation()
         # 2) 清该用户 Redis 会话列表/详情缓存
         await invalidate_user_sessions(user_id)
         # 3) 清 Postgres 对话记忆（best-effort，失败不影响删除结果）

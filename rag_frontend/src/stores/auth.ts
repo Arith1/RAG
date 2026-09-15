@@ -51,18 +51,25 @@ export const useAuthStore = defineStore('auth', {
     async fetchMe() {
       this.user = await api<UserInfo>('/api/auth/me')
     },
-    async logout() {
-      // 通知后端清除鉴权缓存（fire-and-forget：M30——不 await，慢响应/失败都不卡退出按钮）
+    async logout(revoke = true) {
       const token = this.token
-      if (token) {
-        fetch('/api/auth/logout', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-        }).catch(() => { /* 网络异常忽略，本地照常退出 */ })
+      try {
+        if (token && revoke) {
+          // keepalive + 短超时：优先让服务端吊销 token，同时避免退出按钮长时间卡住。
+          await fetch('/api/auth/logout', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+            keepalive: true,
+            signal: AbortSignal.timeout(3000),
+          })
+        }
+      } catch {
+        // 网络异常仍执行本地退出；未成功吊销时 token 最迟在自身过期时间失效。
+      } finally {
+        this.token = ''
+        this.user = null
+        localStorage.removeItem(TOKEN_KEY)
       }
-      this.token = ''
-      this.user = null
-      localStorage.removeItem(TOKEN_KEY)
     },
   },
 })

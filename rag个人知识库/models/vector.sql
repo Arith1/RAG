@@ -228,7 +228,6 @@ CREATE TABLE `rag_traces` (
     `session_id` VARCHAR(64) NULL COMMENT '会话id',
 
     `intent` VARCHAR(32) NULL COMMENT '意图识别结果: rag_ask/chat/other 等',
-    `query` VARCHAR(1024) NULL COMMENT '用户提问/检索文本（便于排查）',
     `questions` JSON NULL COMMENT '拆分后的子问题列表（多问题问答；单问题=[query]，chat=[]）',
     `status` VARCHAR(20) NOT NULL DEFAULT 'success' COMMENT '状态: success/failed',
     `error_type` VARCHAR(64) NULL COMMENT '错误类型',
@@ -248,6 +247,12 @@ CREATE TABLE `rag_traces` (
     `answer_len` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '回答字符数',
 
     `sources` JSON NULL COMMENT '来源列表 [{source, score}]',
+    `trace_type` VARCHAR(16) NULL COMMENT '来源类型: chat/search',
+    `query_raw` VARCHAR(1024) NULL COMMENT '原始输入（未提炼）',
+    `embedding_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'embedding 耗时(毫秒)',
+    `milvus_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Milvus 召回耗时(毫秒)',
+    `rerank_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'rerank 耗时(毫秒)',
+    `cache_ms` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '缓存读写耗时(毫秒)',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
 
     PRIMARY KEY (`id`),

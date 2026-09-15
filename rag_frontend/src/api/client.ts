@@ -30,6 +30,7 @@ export class ApiError extends Error {
 
 /** 普通 API 请求超时（毫秒）：防挂起请求无限等待；流式问答走 streamChat 不受此限。 */
 const API_TIMEOUT_MS = 60_000
+const SSE_CONNECT_TIMEOUT_MS = 15_000
 
 export interface SourceItem {
   index: number
@@ -111,7 +112,7 @@ export interface BatchUploadResult {
 
 /** SSE 流式事件（与后端 /api/chat/stream 产出的 JSON 一一对应） */
 export type ChatStreamEvent =
-  | { type: 'meta'; session_id: string | null; intent: string; query: string; sources: SourceItem[] }
+  | { type: 'meta'; session_id: string | null; intent: string; query: string; questions: string[]; sources: SourceItem[] }
   | { type: 'token'; text: string }
   | { type: 'done'; answer: string }
   | { type: 'answer'; session_id: string | null; intent: string; query: string | null; answer: string; sources: SourceItem[] }
@@ -137,7 +138,7 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
     throw e
   }
   if (res.status === 401) {
-    auth.logout()
+    auth.logout(false)
     window.location.href = '/login'
     throw new ApiError('登录已过期', 401)
   }
@@ -175,17 +176,34 @@ export async function streamChat(
   opts: { signal?: AbortSignal } = {},
 ): Promise<void> {
   const auth = useAuthStore()
-  const res = await fetch('/api/chat/stream', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${auth.token}`,
-    },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  })
+  const connectController = new AbortController()
+  let connectTimedOut = false
+  const connectTimer = window.setTimeout(() => {
+    connectTimedOut = true
+    connectController.abort()
+  }, SSE_CONNECT_TIMEOUT_MS)
+  const signal = opts.signal
+    ? AbortSignal.any([opts.signal, connectController.signal])
+    : connectController.signal
+  let res: Response
+  try {
+    res = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${auth.token}`,
+      },
+      body: JSON.stringify(body),
+      signal,
+    })
+  } catch (e) {
+    if (connectTimedOut) throw new ApiError('连接问答服务超时，请稍后重试', 0)
+    throw e
+  } finally {
+    window.clearTimeout(connectTimer)
+  }
   if (res.status === 401) {
-    auth.logout()
+    auth.logout(false)
     window.location.href = '/login'
     throw new ApiError('登录已过期', 401)
   }
@@ -222,7 +240,7 @@ export async function downloadDocument(fileId: number | string, fileName: string
     headers: { Authorization: `Bearer ${auth.token}` },
   })
   if (res.status === 401) {
-    auth.logout()
+    auth.logout(false)
     window.location.href = '/login'
     throw new ApiError('登录已过期', 401)
   }
@@ -275,6 +293,8 @@ export interface ChatMessageItem {
   role: 'user' | 'assistant'
   content: string
   sources?: SourceItem[]
+  /** 历史消息恢复的多子问题列表；旧数据可能缺失 */
+  questions?: string[]
   intent?: string | null
   created_at?: string | null
 }

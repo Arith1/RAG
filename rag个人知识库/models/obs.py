@@ -49,9 +49,6 @@ class RagTrace(_ObsBase):
     intent: Mapped[Optional[str]] = mapped_column(
         String(32), nullable=True, comment="意图识别结果: rag_ask/chat/other 等"
     )
-    query: Mapped[Optional[str]] = mapped_column(
-        String(1024), nullable=True, comment="用户提问/检索文本（便于排查）"
-    )
     questions: Mapped[Optional[List[str]]] = mapped_column(
         JSON, nullable=True, comment="拆分后的子问题列表（多问题问答；单问题=[query]，chat=[]）"
     )

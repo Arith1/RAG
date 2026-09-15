@@ -71,6 +71,26 @@ async def cache_set(key: str, value, ttl: int) -> bool:
         return False
 
 
+_RETRIEVAL_GENERATION_KEY = "cachegen:retrieval"
+
+
+async def get_cache_generation() -> int:
+    """读取检索/回答缓存代际；Redis 不可用时返回 0（缓存本身也不可用）。"""
+    try:
+        raw = await get_redis().get(_RETRIEVAL_GENERATION_KEY)
+        return int(raw or 0)
+    except Exception:
+        return 0
+
+
+async def bump_cache_generation() -> int:
+    """文档新增/可见性变化后递增代际，使旧 search/ans 缓存自然失效。"""
+    try:
+        return int(await get_redis().incr(_RETRIEVAL_GENERATION_KEY))
+    except Exception:
+        return 0
+
+
 def cache_get_sync(key: str):
     """同步读缓存（供同步代码路径，如 embed_query 内）。"""
     try:
@@ -160,7 +180,8 @@ async def cache_singleflight(cache_key_: str, compute, ttl: int, wait_ms: int = 
     try:
         acquired = await r.set(lock_key, token, nx=True, ex=min(ttl, 60))
     except Exception:
-        acquired = False
+        # Redis 故障不是锁竞争：此时缓存读写同样不可用，等待只会纯增延迟。
+        return await compute(), False
     if acquired:
         try:
             return await compute(), False

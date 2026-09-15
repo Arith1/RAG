@@ -28,7 +28,8 @@ from rag个人知识库.agent.ai_assist import (
 from rag个人知识库.agent.intent import analyze
 from rag个人知识库.config.db_config import async_session
 from rag个人知识库.config.redis import (
-    cache_get, cache_index_sources, cache_key, cache_set, cache_singleflight, jitter_ttl,
+    cache_get, cache_index_sources, cache_key, cache_set, cache_singleflight,
+    get_cache_generation, jitter_ttl,
 )
 from rag个人知识库.crud.vector import select_visible_file_ids
 from rag个人知识库.service.billing import billing_stage, record_cached_answer
@@ -174,7 +175,8 @@ def _build_multi_user_prompt(
         "",
         "参考资料：",
     ]
-    ref_no = 1
+    # 以 source+content 去重；同一资料可标记为多个子问题共用，避免重复占用上下文。
+    unique: dict[tuple, dict] = {}
     for q_idx, hits in enumerate(hits_by_question, start=1):
         if not hits:
             lines.append(f"[问题{q_idx}] 没有检索到相关资料")
@@ -182,9 +184,102 @@ def _build_multi_user_prompt(
         for hit in hits:
             source = hit.get("source") or "未知来源"
             content = (hit.get("content") or "").strip()
-            lines.append(f"[{ref_no}] 对应问题{q_idx}；来源：{source}\n{content}")
-            ref_no += 1
+            key = (source, content)
+            if key not in unique:
+                unique[key] = {"source": source, "content": content, "questions": []}
+            if q_idx not in unique[key]["questions"]:
+                unique[key]["questions"].append(q_idx)
+    for ref_no, hit in enumerate(unique.values(), start=1):
+        q_label = "、".join(str(i) for i in hit["questions"])
+        lines.append(
+            f"[{ref_no}] 对应问题{q_label}；来源：{hit['source']}\n{hit['content']}"
+        )
     return "\n\n".join(lines)
+
+
+def _empty_retrieval_metrics(has_scope: bool) -> dict:
+    return {
+        "cache_hit": False,
+        "has_scope": has_scope,
+        "recall_count": 0,
+        "rerank_count": 0,
+        "rerank_avg_score": None,
+        "rerank_max_score": None,
+        "rerank_degraded": False,
+        "embedding_ms": 0,
+        "milvus_ms": 0,
+        "rerank_ms": 0,
+        "cache_ms": 0,
+    }
+
+
+async def _search_many(
+    questions: List[str],
+    *,
+    k: int,
+    source: Optional[str],
+    expr: Optional[str],
+    user_id: Optional[int],
+    file_ids: Optional[List[int]],
+    retrieve_own_private: bool,
+    retrieve_own_public: bool,
+    retrieve_kb_public: bool,
+    retrieve_owner_ids: Optional[List[int]],
+    has_scope: bool,
+) -> tuple[List[List[dict]], List[dict], int, int]:
+    """并行检索多个子问题；单个子问题失败时降级为空命中，保留其他结果。"""
+    t0 = time.monotonic()
+    gathered = await asyncio.gather(
+        *(
+            search_documents(
+                q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
+                retrieve_own_private=retrieve_own_private,
+                retrieve_own_public=retrieve_own_public,
+                retrieve_kb_public=retrieve_kb_public,
+                retrieve_owner_ids=retrieve_owner_ids,
+                return_metrics=True,
+            )
+            for q in questions
+        ),
+        return_exceptions=True,
+    )
+    retrieval_ms = int((time.monotonic() - t0) * 1000)
+    hits_by_question: List[List[dict]] = []
+    metrics_list: List[dict] = []
+    failures = 0
+    for question, item in zip(questions, gathered):
+        if isinstance(item, Exception):
+            failures += 1
+            logger.warning("[chat] 子问题检索失败（已局部降级）：%s（%s）", question, item)
+            hits_by_question.append([])
+            metrics_list.append(_empty_retrieval_metrics(has_scope))
+        else:
+            hits, metrics = item
+            hits_by_question.append(hits)
+            metrics_list.append(metrics)
+    return hits_by_question, metrics_list, retrieval_ms, failures
+
+
+def _build_sources(questions: List[str], hits_by_question: List[List[dict]]) -> List[dict]:
+    """构造前端来源列表，并按 source+content 去除跨子问题重复项。"""
+    sources = []
+    seen = set()
+    index = 1
+    for qi, q_hits in enumerate(hits_by_question, start=1):
+        for hit in q_hits:
+            key = (hit.get("source"), hit.get("content"))
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append({
+                "index": index,
+                "question": questions[qi - 1],
+                "source": hit.get("source"),
+                "score": hit.get("score"),
+                "content": hit.get("content"),
+            })
+            index += 1
+    return sources
 
 
 async def chat(
@@ -308,37 +403,24 @@ async def chat(
         ]
     else:
         # 多问题并行检索，减少整体响应时间
-        retr_t0 = time.monotonic()
-        gathered = list(await asyncio.gather(
-            *(
-                search_documents(
-                    q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
-                    retrieve_own_private=retrieve_own_private,
-                    retrieve_own_public=retrieve_own_public,
-                    retrieve_kb_public=retrieve_kb_public,
-                    retrieve_owner_ids=retrieve_owner_ids,
-                    return_metrics=True,
-                )
-                for q in questions
-            )
-        ))
-        retrieval_ms = int((time.monotonic() - retr_t0) * 1000)
-        hits_by_question = [g[0] for g in gathered]
-        retr_metrics_list = [g[1] for g in gathered]
+        hits_by_question, retr_metrics_list, retrieval_ms, failures = await _search_many(
+            questions,
+            k=k,
+            source=source,
+            expr=expr,
+            user_id=user_id,
+            file_ids=file_ids,
+            retrieve_own_private=retrieve_own_private,
+            retrieve_own_public=retrieve_own_public,
+            retrieve_kb_public=retrieve_kb_public,
+            retrieve_owner_ids=retrieve_owner_ids,
+            has_scope=has_scope,
+        )
+        if failures == len(questions):
+            raise RuntimeError("所有子问题检索均失败")
         all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
         user_prompt = _build_multi_user_prompt(questions, hits_by_question)
-        sources = []
-        index = 1
-        for qi, q_hits in enumerate(hits_by_question, start=1):
-            for hit in q_hits:
-                sources.append({
-                    "index": index,
-                    "question": questions[qi - 1],
-                    "source": hit.get("source"),
-                    "score": hit.get("score"),
-                    "content": hit.get("content"),
-                })
-                index += 1
+        sources = _build_sources(questions, hits_by_question)
 
     # 检索阶段埋点：聚合各子问题指标 + 记录精简来源列表（不落 content）
     recall_count = sum(m["recall_count"] for m in retr_metrics_list)
@@ -389,14 +471,15 @@ async def chat(
     # 回答缓存：同一 user_prompt（query + 相同参考资料）→ 复用 LLM 回答（TTL 1 小时）。
     # 缓存值改为 {answer, source_list}，便于按文档 source 精准失效。
     # 兼容旧缓存：如果缓存还是纯字符串，直接作为 answer 使用。
-    ans_key = cache_key("ans", user_prompt)
+    ans_key = cache_key("ans", await get_cache_generation(), user_prompt)
     cached_answer = await cache_get(ans_key)
     if cached_answer is not None:
         answer = cached_answer.get("answer") if isinstance(cached_answer, dict) else cached_answer
         # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
         trace_set_generation(len(answer), 0)
         record_cached_answer()
-        _write_memory_async(thread_id, content, answer)
+        # 用完整 user_prompt 补写记忆，历史恢复时可还原子问题与来源元数据。
+        _write_memory_async(thread_id, user_prompt, answer)
     else:
         try:
             # M13：回答缓存单飞——同一 user_prompt 并发只让一个调 LLM，其余等待其写入缓存
@@ -421,7 +504,7 @@ async def chat(
             if from_cache:
                 # 单飞等待者：他人已生成并缓存
                 record_cached_answer()
-                _write_memory_async(thread_id, content, answer)
+                _write_memory_async(thread_id, user_prompt, answer)
         except Exception as exc:
             logger.exception("[chat] 问答模型调用失败")
             trace_fail("model_unavailable", _friendly_model_error(exc))
@@ -552,37 +635,24 @@ async def chat_stream(
                 ]
         else:
             # 多问题并行检索，减少整体响应时间
-            retr_t0 = time.monotonic()
-            gathered = list(await asyncio.gather(
-                *(
-                    search_documents(
-                        q, k=k, source=source, expr=expr, user_id=user_id, file_ids=file_ids,
-                        retrieve_own_private=retrieve_own_private,
-                        retrieve_own_public=retrieve_own_public,
-                        retrieve_kb_public=retrieve_kb_public,
-                        retrieve_owner_ids=retrieve_owner_ids,
-                        return_metrics=True,
-                    )
-                    for q in questions
-                )
-            ))
-            retrieval_ms = int((time.monotonic() - retr_t0) * 1000)
-            hits_by_question = [g[0] for g in gathered]
-            retr_metrics_list = [g[1] for g in gathered]
+            hits_by_question, retr_metrics_list, retrieval_ms, failures = await _search_many(
+                questions,
+                k=k,
+                source=source,
+                expr=expr,
+                user_id=user_id,
+                file_ids=file_ids,
+                retrieve_own_private=retrieve_own_private,
+                retrieve_own_public=retrieve_own_public,
+                retrieve_kb_public=retrieve_kb_public,
+                retrieve_owner_ids=retrieve_owner_ids,
+                has_scope=has_scope,
+            )
+            if failures == len(questions):
+                raise RuntimeError("所有子问题检索均失败")
             all_hits = [hit for q_hits in hits_by_question for hit in q_hits]
             user_prompt = _build_multi_user_prompt(questions, hits_by_question)
-            sources = []
-            index = 1
-            for qi, q_hits in enumerate(hits_by_question, start=1):
-                for hit in q_hits:
-                    sources.append({
-                        "index": index,
-                        "question": questions[qi - 1],
-                        "source": hit.get("source"),
-                        "score": hit.get("score"),
-                        "content": hit.get("content"),
-                    })
-                    index += 1
+            sources = _build_sources(questions, hits_by_question)
     except Exception:
         # 检索失败（如 Milvus 不可用）：发固定提示，详细异常只写服务端日志。
         logger.exception("[chat] 流式检索失败")
@@ -643,12 +713,13 @@ async def chat_stream(
 
     # 回答缓存命中：直接回放完整答案（仍走 token 事件，前端体验一致）
     # 缓存值为 {answer, source_list}；兼容旧纯字符串缓存。
-    ans_key = cache_key("ans", user_prompt)
+    ans_key = cache_key("ans", await get_cache_generation(), user_prompt)
     cached = await cache_get(ans_key)
     if cached is not None:
         cached_answer = cached.get("answer") if isinstance(cached, dict) else cached
         # 缓存命中未经过 LLM，手动补写对话记忆，保证会话历史完整
-        _write_memory_async(thread_id, content, cached_answer)
+        # 用完整 user_prompt 补写记忆，历史恢复时可还原子问题与来源元数据。
+        _write_memory_async(thread_id, user_prompt, cached_answer)
         trace_set_generation(len(cached_answer), 0)
         record_cached_answer()
         yield {"type": "token", "text": cached_answer}

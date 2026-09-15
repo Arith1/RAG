@@ -21,6 +21,8 @@ interface MessageItem {
   content: string
   sources: SourceItem[]
   intent?: string
+  /** 意图拆分出的子问题列表（多问题问答；单问题/闲聊无）——用于展示"拆分为 N 个子问题" */
+  questions?: string[]
   error?: boolean
 }
 
@@ -220,6 +222,13 @@ function onResize() {
   isMobile.value = window.innerWidth <= 768
 }
 
+/** 实际拆分的子问题个数：优先后端 meta 的 questions 列表；缺失时按来源去重（回退）。 */
+function subQuestionCount(m: MessageItem): number {
+  if (Array.isArray(m.questions) && m.questions.length) return m.questions.length
+  const distinct = new Set((m.sources || []).map((s) => s.question).filter(Boolean))
+  return distinct.size
+}
+
 function formatTime(iso: string | null): string {
   if (!iso) return ''
   const t = new Date(iso.replace(' ', 'T'))
@@ -286,6 +295,7 @@ async function openSession(id: string) {
       role: m.role,
       content: m.content,
       sources: m.sources ?? [],
+      questions: m.questions ?? [],
       intent: m.intent ?? undefined,
       error: false,
     }))
@@ -310,6 +320,7 @@ function cancelRename() {
   editingId.value = null
 }
 async function commitRename(s: ChatSessionInfo) {
+  if (streaming.value) return
   if (editingId.value !== s.session_id) return
   const title = editingTitle.value.trim()
   editingId.value = null
@@ -332,6 +343,8 @@ function askDelete(s: ChatSessionInfo) {
   }, 3000)
 }
 async function removeSession(s: ChatSessionInfo, confirmed = false) {
+  // 生成期间禁止删除/改名，避免后端流完成后重新创建已删除会话。
+  if (streaming.value) return
   if (!confirmed) {
     askDelete(s)
     return
@@ -414,6 +427,7 @@ async function send() {
         if (evt.session_id) sessionId.value = evt.session_id
         assistant.sources = evt.sources
         assistant.intent = evt.intent
+        assistant.questions = evt.questions
         waitPhase.value = 'generating'
         scrollToBottom()
       } else if (evt.type === 'token') {
@@ -425,6 +439,7 @@ async function send() {
         assistant.content = evt.answer
         assistant.sources = evt.sources
         assistant.intent = evt.intent
+        assistant.questions = undefined
       } else if (evt.type === 'error') {
         assistant.content = evt.message
         assistant.error = true
@@ -566,16 +581,16 @@ onUnmounted(() => {
             </div>
             <div class="session-actions" @click.stop>
               <template v-if="confirmDeleteId === s.session_id">
-                <button class="mini-btn danger" title="确认删除" @click="removeSession(s, true)">确认</button>
+                <button class="mini-btn danger" title="确认删除" :disabled="streaming" @click="removeSession(s, true)">确认</button>
                 <button class="mini-btn" title="取消" @click="confirmDeleteId = null">取消</button>
               </template>
               <template v-else>
-                <button class="icon-btn" title="重命名" @click="startRename(s)">
+                <button class="icon-btn" title="重命名" :disabled="streaming" @click="startRename(s)">
                   <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
                     <path d="M11.3 2.7a1.6 1.6 0 0 1 2.3 0l-.4-.4a1.6 1.6 0 0 1 0 2.3L5.5 12.3 2 13.3l1-3.5 8.3-7.1Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
                   </svg>
                 </button>
-                <button class="icon-btn danger" title="删除" @click="askDelete(s)">
+                <button class="icon-btn danger" title="删除" :disabled="streaming" @click="askDelete(s)">
                   <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
                     <path d="M3 4.5h10M6.5 4.5V3.2h3v1.3M5 4.5l.5 8.3h5l.5-8.3M6.7 7v3.2M9.3 7v3.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
                   </svg>
@@ -755,8 +770,8 @@ onUnmounted(() => {
             <div v-else class="assistant">
               <div v-if="m.sources.length" class="meta-line">
                 <span class="meta-intent">{{ m.intent === 'chat' ? '闲聊' : m.intent === 'other' ? '提示' : '知识库检索' }}</span>
-                <span v-if="m.sources.some((s) => s.question)" class="meta-split">
-                  已拆分为 {{ m.sources.filter((s) => s.question).length + 1 }} 个子问题分别检索
+                <span v-if="subQuestionCount(m) > 1" class="meta-split">
+                  已拆分为 {{ subQuestionCount(m) }} 个子问题分别检索
                 </span>
                 <span v-else class="meta-count">检索到 {{ m.sources.length }} 条来源</span>
               </div>

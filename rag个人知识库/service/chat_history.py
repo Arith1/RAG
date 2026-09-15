@@ -278,6 +278,13 @@ async def list_expired_sessions(ttl_days: float) -> List[Tuple[int, str]]:
     return [(s.user_id, s.session_id) for s in rows]
 
 
+async def list_all_session_keys() -> set[str]:
+    """返回 MySQL 中全部有效会话的 thread_id 集合（供清理孤儿 Postgres checkpoint）。"""
+    async with async_session() as db:
+        result = await db.execute(select(ChatSession.user_id, ChatSession.session_id))
+    return {f"{user_id}:{session_id}" for user_id, session_id in result.all()}
+
+
 async def delete_by_keys(keys: List[Tuple[int, str]]) -> int:
     """按 (user_id, session_id) 批量删除会话元信息，返回删除条数。"""
     if not keys:

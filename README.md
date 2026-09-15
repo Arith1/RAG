@@ -106,6 +106,7 @@ cp .env.example .env
 #    安全说明：数据服务端口仅绑定 127.0.0.1；Redis/MySQL/Postgres 口令取自 .env（缺失拒绝启动）；
 #    Milvus/MinIO 凭据可经 MILVUS_USERNAME/MILVUS_PASSWORD/MINIO_ACCESS_KEY/MINIO_SECRET_KEY 覆盖
 #    （默认 root/Milvus、minioadmin/minioadmin，改密需同时改 docker/milvus.yaml）
+#    生产默认关闭开放注册；如需开放，设置 REGISTRATION_ENABLED=true（并按需调低注册/上传限额）
 docker compose up -d --build
 
 # 3. 访问
@@ -408,7 +409,7 @@ python -m pytest tests/
 ```
 rag_project/
 ├─ rag个人知识库/
-│  ├─ api/                  # FastAPI：main(路由) / auth(JWT+RBAC+限流) / static(问答页)
+│  ├─ api/                  # FastAPI：main(应用装配) / routers(业务路由) / schemas / lifecycle / auth
 │  ├─ agent/                # ai_assist(Agent+记忆) / intent(意图+查询重构) / model(DeepSeek)
 │  ├─ service/              # ingest(入库编排) / chat(问答编排) / chat_history(会话元信息)
 │  │                        # session_cache(会话/用户/文档缓存) / ingest_queue(入库队列)
@@ -423,7 +424,7 @@ rag_project/
 │  └─ utils/                # 指纹哈希 / sanitize(路径脱敏)
 ├─ rag_frontend/            # Vue 3 前端（问答/知识库/文档管理/个人详情/登录注册）
 ├─ evaluation/              # golden 评测集 + 检索评测 + DeepEval 端到端评测 + 分层开/关对比 + 报告
-├─ tests/                   # pytest 单元测试（175 用例；有意不入库，本地/CI 跑）
+├─ tests/                   # pytest 单元测试（当前 215 用例；有意不入库，本地/CI 跑）
 └─ .env.example             # 环境变量模板
 ```
 

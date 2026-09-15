@@ -11,8 +11,9 @@ from typing import List, Optional
 
 from rag个人知识库.config.db_config import async_session
 from rag个人知识库.config.redis import (
-    cache_clear_prefix, cache_clear_source, cache_get, cache_index_sources, cache_key,
-    cache_set, cache_singleflight, jitter_ttl,
+    bump_cache_generation, cache_clear_prefix, cache_clear_source, cache_get,
+    cache_index_sources, cache_key, cache_set, cache_singleflight,
+    get_cache_generation, jitter_ttl,
 )
 from rag个人知识库.crud.vector import count_file_names, select_file_names, select_visible_file_ids
 from rag个人知识库.service.ingest import ingest_files_batched
@@ -57,6 +58,8 @@ async def ingest_files(
         }
         for source in changed_sources:
             await cache_clear_source(source)
+        if changed_sources:
+            await bump_cache_generation()
         # 文档列表缓存按用户维度缓存、未建立 source 索引，仍需整体失效
         await cache_clear_prefix("docs:")
     return results
@@ -115,8 +118,9 @@ async def search_documents(
         "<auto>" if file_ids is None else
         "<explicit>:" + ",".join(sorted({str(x) for x in file_ids}))
     )
+    generation = await get_cache_generation()
     cache_key_ = cache_key(
-        "search", query, k, source or "", expr or "", recall_k or DEFAULT_RECALL_K,  # M16：recall_k 入 key
+        "search", generation, query, k, source or "", expr or "", recall_k or DEFAULT_RECALL_K,  # M16：recall_k 入 key
         user_id if user_id is not None else "",
         int(bool(retrieve_own_private)), int(bool(retrieve_own_public)),
         int(bool(retrieve_kb_public)), owner_ids_digest, file_ids_digest,

@@ -207,6 +207,16 @@ redis.call('EXPIRE', KEYS[1], ARGV[1])
 return 1
 """
 
+_ALLOW_LUA = """
+-- 原子“检查并占额”：避免 CHECK/RECORD 两次往返之间出现并发超额
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3] - ARGV[1] * 1000)
+local count = redis.call('ZCARD', KEYS[1])
+if count >= tonumber(ARGV[2]) then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
+"""
+
 
 async def _redis_check(
     key: str,
@@ -233,6 +243,24 @@ async def _redis_record(key: str, window_seconds: int = LOGIN_WINDOW_SECONDS) ->
         return True
     except Exception:
         return False
+
+
+async def _redis_allow(
+    key: str,
+    max_requests: int,
+    window_seconds: int = LOGIN_WINDOW_SECONDS,
+) -> "bool | None":
+    """Redis 原子检查并记账；Redis 不可用返回 None。"""
+    try:
+        r = get_redis()
+        member = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        ok = await r.eval(
+            _ALLOW_LUA, 1, key, window_seconds, max_requests,
+            int(time.time() * 1000), member,
+        )
+        return bool(ok)
+    except Exception:
+        return None
 
 
 async def _record_attempt(key: str, window_seconds: int = LOGIN_WINDOW_SECONDS) -> None:
@@ -275,19 +303,18 @@ async def allow_request(key: str, max_requests: int, window_seconds: int = LOGIN
     Redis 不可用时回退进程内 dict。名额在进入昂贵流程前先占下，
     简单且不会低估并发成本；max_requests <= 0 表示不限流。
 
-    M1 修复：通过检查后必须经 `_record_attempt` 记账——Redis 宕机时
-    本地兜底同样要写进程内 dict，否则本地检查永远为空、限流形同虚设。
-    （临界窗口内本地与 Redis 是两个独立计数器，极端情况下单窗口最多放行约
-    2× 上限，属本地兜底方案的固有有界偏差，远好于宕机期间完全不限流。）
+    Redis 路径使用单条 Lua 原子检查并记账，避免并发请求同时读到旧计数；
+    Redis 宕机时退回进程内检查+记账，本地检查与写入之间没有 await。
     """
     if max_requests <= 0:
         return True
-    ok = await _redis_check(key, max_requests, window_seconds)
-    if ok is None:
-        ok = _local_check_allowed(key, max_requests)
-    if not ok:
+    allowed = await _redis_allow(key, max_requests, window_seconds)
+    if allowed is not None:
+        return allowed
+    # Redis 不可用时退回进程内检查+记账；两者之间没有 await，单进程内是原子的。
+    if not _local_check_allowed(key, max_requests):
         return False
-    await _record_attempt(key, window_seconds)
+    _local_record_failure(key)
     return True
 
 

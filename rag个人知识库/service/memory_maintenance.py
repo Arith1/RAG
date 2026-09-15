@@ -17,12 +17,18 @@
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 
-from rag个人知识库.service.chat_history import delete_by_keys, list_expired_sessions
+from rag个人知识库.service.chat_history import (
+    delete_by_keys,
+    list_all_session_keys,
+    list_expired_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,38 +43,77 @@ def _connect():
     return psycopg.connect(url, connect_timeout=5)
 
 
-def _purge_postgres(thread_ids: list) -> None:
-    """在线程池中删除 Postgres checkpoints（M10：psycopg 是同步阻塞调用，移到 asyncio.to_thread）。"""
+def _delete_threads(cur, thread_ids: list) -> None:
+    """删除指定 thread_id 在三张 checkpoint 表中的全部数据。"""
+    if not thread_ids:
+        return
+    for table in ("checkpoint_blobs", "checkpoint_writes", "checkpoints"):
+        cur.execute(f"DELETE FROM {table} WHERE thread_id = ANY(%s)", (thread_ids,))
+
+
+def _purge_postgres(
+    thread_ids: list,
+    known_threads: set[str] | None = None,
+    orphan_before: datetime | None = None,
+) -> int:
+    """删除过期 checkpoint，并清理 MySQL 中已无元信息且超过 TTL 的孤儿线程。"""
     conn = _connect()
     if conn is None:
-        return
+        return 0
+    orphan_count = 0
     try:
         conn.autocommit = True
         cur = conn.cursor()
-        for table in ("checkpoint_blobs", "checkpoint_writes", "checkpoints"):
-            cur.execute(f"DELETE FROM {table} WHERE thread_id = ANY(%s)", (thread_ids,))
+        _delete_threads(cur, thread_ids)
+        if known_threads is not None and orphan_before is not None:
+            # checkpoint JSONB 内的 ts 是 LangGraph 写入时间；仅清理超过 TTL 的线程，
+            # 避免误删正在进行首轮写库、MySQL 元信息尚未落下的新会话。
+            cur.execute(
+                """
+                SELECT thread_id
+                FROM checkpoints
+                GROUP BY thread_id
+                HAVING MAX((checkpoint->>'ts')::timestamptz) < %s
+                """,
+                (orphan_before,),
+            )
+            # 只扫描本项目的 {user_id}:{session_id} 线程，避免误删其他 LangGraph 调用方。
+            orphan_ids = [
+                row[0]
+                for row in cur.fetchall()
+                if re.match(r"^\d+:", row[0]) and row[0] not in known_threads
+            ]
+            _delete_threads(cur, orphan_ids)
+            orphan_count = len(orphan_ids)
     finally:
         conn.close()
+    return orphan_count
 
 
 async def cleanup_expired_memory(ttl_days: float = MEMORY_TTL_DAYS) -> int:
     """清理超过 ttl_days 未活动的会话，返回清理的会话数。
 
-    流程：先查 MySQL 过期会话 → 删 Postgres checkpoint → 删 MySQL 记录。
+    流程：先查 MySQL 过期会话/全部会话 key → 删 Postgres checkpoint/孤儿 →
+    删 MySQL 记录。
 
     删除顺序经过权衡：Postgres 在前。若先删 MySQL，Postgres 删除失败会留下
     永久孤儿 checkpoint（清理列表按 MySQL 扫描，行已删便不再重试）；改为
     Postgres 在前且失败时本轮不删 MySQL，失败会随下轮清理自动重试（幂等）。
     """
     keys = await list_expired_sessions(ttl_days)
-    if not keys:
-        logger.info("[memory_maintenance] 无过期会话（TTL %s 天）", ttl_days)
-        return 0
+    orphan_count = 0
 
     # M10：同步 psycopg 阻塞调用放到线程池，避免卡住事件循环（过期会话多时 DELETE 会阻塞全站）
     if os.getenv("MEMORY_DATABASE_URL"):
         try:
-            await asyncio.to_thread(_purge_postgres, [f"{uid}:{sid}" for uid, sid in keys])
+            known_threads = await list_all_session_keys()
+            orphan_before = datetime.now(timezone.utc) - timedelta(days=ttl_days)
+            orphan_count = await asyncio.to_thread(
+                _purge_postgres,
+                [f"{uid}:{sid}" for uid, sid in keys],
+                known_threads,
+                orphan_before,
+            )
         except Exception as e:
             logger.warning("[memory_maintenance] 删除 Postgres 记忆失败（本轮跳过，下轮重试）：%s", e)
             return 0
@@ -76,8 +121,13 @@ async def cleanup_expired_memory(ttl_days: float = MEMORY_TTL_DAYS) -> int:
         logger.info("[memory_maintenance] 未配置 MEMORY_DATABASE_URL，仅清理 MySQL 会话元信息")
 
     # 2) 删 MySQL 会话元信息（此后这些会话不再出现在清理列表）
-    deleted = await delete_by_keys(keys)
-    logger.info("[memory_maintenance] 已清理 %d 个过期会话（TTL %s 天）", deleted, ttl_days)
+    deleted = await delete_by_keys(keys) if keys else 0
+    logger.info(
+        "[memory_maintenance] 已清理 %d 个过期会话、%d 个孤儿 checkpoint（TTL %s 天）",
+        deleted,
+        orphan_count,
+        ttl_days,
+    )
     return deleted
 
 

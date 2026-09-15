@@ -10,7 +10,9 @@
     get_trace_summary（1h/24h/7d 聚合）。
 """
 import asyncio
+import copy
 import logging
+import os
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -18,15 +20,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from rag个人知识库.config.db_config import async_session
 from rag个人知识库.models.obs import RagTrace
 from rag个人知识库.models.vector import VectorFile
+from rag个人知识库.utils.sanitize import sanitize_source_paths
 from rag个人知识库.vector_store.milvus_store import COLLECTION_NAME, get_collection_row_count
 
 logger = logging.getLogger(__name__)
+
+TRACE_RETENTION_DAYS = float(os.getenv("TRACE_RETENTION_DAYS", "30"))
+TRACE_DELETE_BATCH = max(1, int(os.getenv("TRACE_DELETE_BATCH", "1000")))
 
 # ── 进程内检索缓存计数（重启清零；仅本进程可见，用于存储概览）──
 _retrieval_cache_hits = 0
@@ -174,9 +180,17 @@ def trace_fail(error_type: str, error_message: Optional[str] = None) -> None:
     ctx.error_message = (error_message or "")[:512]
 
 
+def _sanitize_trace_sources(sources: Optional[List[dict]]) -> List[dict]:
+    """复制并脱敏来源路径，避免服务器绝对路径进入长期 trace 存储。"""
+    items = copy.deepcopy(sources or [])
+    sanitize_source_paths(items)
+    return items
+
+
 async def flush_trace(ctx: TraceContext) -> None:
     """把请求收集到的链路指标写入 rag_traces；失败只记日志。"""
     total_ms = int((time.monotonic() - ctx._started_at) * 1000)
+    trace_sources = _sanitize_trace_sources(ctx.sources)
     try:
         async with async_session() as db:
             db.add(
@@ -201,7 +215,7 @@ async def flush_trace(ctx: TraceContext) -> None:
                     rerank_degraded=ctx.rerank_degraded,
                     generation_ms=ctx.generation_ms,
                     answer_len=ctx.answer_len,
-                    sources=ctx.sources,
+                    sources=trace_sources,
                     trace_type=ctx.trace_type,
                     query_raw=ctx.query_raw,
                     embedding_ms=ctx.embedding_ms,
@@ -219,6 +233,30 @@ async def flush_trace(ctx: TraceContext) -> None:
         logger.warning("[obs] 写入 rag_traces 失败（不影响问答）：%s", e)
 
 
+async def cleanup_expired_traces(
+    retention_days: float = TRACE_RETENTION_DAYS,
+) -> int:
+    """分批删除超过保留期的 trace，返回删除行数；0/负数表示永久保留。"""
+    if retention_days <= 0:
+        return 0
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    total = 0
+    while True:
+        async with async_session() as db:
+            result = await db.execute(
+                text(
+                    "DELETE FROM rag_traces "
+                    "WHERE created_at < :cutoff LIMIT :batch_size"
+                ),
+                {"cutoff": cutoff, "batch_size": TRACE_DELETE_BATCH},
+            )
+            await db.commit()
+            deleted = int(result.rowcount or 0)
+        total += deleted
+        if deleted < TRACE_DELETE_BATCH:
+            return total
+
+
 # ── 链路查询（只读，不改表结构；前端「监控」页与管理员视角共用）──
 def _range_start(range_key: str) -> Optional[datetime]:
     """把 range 参数换算成起始时间；all 返回 None（不限时间）。"""
@@ -232,6 +270,19 @@ def _range_start(range_key: str) -> Optional[datetime]:
     return None
 
 
+def _derive_query(questions: Optional[List[str]], query_raw: Optional[str]) -> Optional[str]:
+    """从 questions/query_raw 派生对外展示的单值 query。"""
+    if isinstance(questions, list) and questions:
+        first = questions[0]
+        if isinstance(first, str) and first.strip():
+            return first
+    return query_raw
+
+
+def _trace_query(t: RagTrace) -> Optional[str]:
+    return _derive_query(t.questions, t.query_raw)
+
+
 def _trace_to_dict(t: RagTrace) -> dict:
     return {
         "id": t.id,
@@ -239,7 +290,7 @@ def _trace_to_dict(t: RagTrace) -> dict:
         "user_id": t.user_id,
         "session_id": t.session_id,
         "intent": t.intent,
-        "query": t.query,
+        "query": _trace_query(t),
         "questions": t.questions,
         "status": t.status,
         "error_type": t.error_type,
@@ -397,8 +448,8 @@ async def get_trace_summary(db: AsyncSession, range_key: str = "1h") -> dict:
     slow_rows = (
         await db.execute(
             select(
-                RagTrace.request_id, RagTrace.query, RagTrace.intent,
-                RagTrace.total_ms, RagTrace.status,
+                RagTrace.request_id, RagTrace.questions, RagTrace.query_raw,
+                RagTrace.intent, RagTrace.total_ms, RagTrace.status,
             )
             .where(*cond)
             .order_by(RagTrace.total_ms.desc())
@@ -407,8 +458,11 @@ async def get_trace_summary(db: AsyncSession, range_key: str = "1h") -> dict:
     ).all()
     slowest = [
         {
-            "request_id": r[0], "query": r[1], "intent": r[2],
-            "total_ms": int(r[3] or 0), "status": r[4],
+            "request_id": r[0],
+            "query": _derive_query(r[1], r[2]),
+            "intent": r[3],
+            "total_ms": int(r[4] or 0),
+            "status": r[5],
         }
         for r in slow_rows
     ]
